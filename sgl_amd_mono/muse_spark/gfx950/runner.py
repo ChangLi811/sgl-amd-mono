@@ -9,6 +9,10 @@ backend and the KV pool the kernels will read, at the first routed forward.
 
 from __future__ import annotations
 
+import inspect
+import os
+from pathlib import Path
+
 import torch
 
 from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, PAGE, WINDOW
@@ -36,6 +40,40 @@ SGLANG_READS = {
 }
 
 FP8_CACHE = torch.float8_e4m3fn
+
+
+def no_capture(what: str) -> None:
+    """Raise inside a CUDA graph capture: builds, binds and allocations run eagerly."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(f"Muse Spark monokernels: {what} inside a graph capture")
+
+
+def compile_only(launch) -> None:
+    """Compile a launch for this process without running it (FlyDSL's compile-only
+    mode, for the one call); the first real call then only loads the code."""
+    from flydsl.utils.env import CompileEnvManager
+
+    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
+    var = CompileEnvManager.options["compile_only"].env_var
+    old = os.environ.get(var)
+    os.environ[var] = "1"
+    try:
+        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
+    finally:
+        if old is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = old
+
+
+def _ensure_writable_flydsl_cache() -> None:
+    """Point FlyDSL at a writable cache (aiter sets a read-only one)."""
+    cur = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
+    if cur and os.access(cur, os.W_OK):
+        return
+    path = Path.home() / ".flydsl" / "cache"
+    path.mkdir(parents=True, exist_ok=True)
+    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = str(path)
 
 
 class MuseMonoRunner:

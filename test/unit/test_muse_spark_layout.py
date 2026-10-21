@@ -1,0 +1,35 @@
+"""The Muse Spark gfx950 layouts on CPU: the CTA map of K1's stages does not
+overlap, the scratch regions do not overlap, and the LDS fits at every width."""
+
+import pytest
+
+from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.muse_spark.gfx950 import layout as L
+from sgl_amd_mono.muse_spark.gfx950.config import HIDDEN, MAX_TOKENS, QKVG_ROWS, WIDTHS
+
+LDS_BYTES = 160 * 1024
+
+
+def test_k1_tasks_fit_the_grid():
+    # 144 row groups x 2 halves: a task a CTA plus a second on the first 32
+    assert L.SPLIT_TASKS == 2 * (QKVG_ROWS // L.ROWS) == 288
+    assert L.HT0 == L.SPLIT_TASKS - BLOCKS
+    assert L.GT0 == L.HT0 + L.HEAD_TASKS
+    assert L.GT0 + L.GATE_TASKS <= BLOCKS
+    assert L.HALVES * L.K_PER_WAVE * 8 == HIDDEN
+
+
+@pytest.mark.parametrize("s", list(WIDTHS) + [1, 5, 24, 63])
+def test_k1_lds_fits(s):
+    assert L.k1_lds_bytes(s) <= LDS_BYTES
+    assert L.token_tiles(s) * L.TILE >= s
+    assert L.token_passes(s) * L.TOKENS_PER_PASS >= s
+
+
+def test_k1_scratch_regions_do_not_overlap():
+    lay = L.k1_scratch_layout()
+    spans = sorted((off, off + n) for off, n in lay.values())
+    for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+        assert a1 <= b0
+    assert lay["k1_part"][1] == L.HALVES * MAX_TOKENS * QKVG_ROWS * 8
+    assert L.scratch_bytes(lay) == spans[-1][1]
