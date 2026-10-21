@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Muse Spark's device helpers that ``sgl_amd_mono.common`` does not hold: the
-step's mailbox tag and the fences of a plain-words hand-off (the same ones the
-MiniMax-M3 family carries)."""
+step's mailbox tag and the fences of a plain-words hand-off (on the llvm dialect
+directly, which every FlyDSL this family runs on provides)."""
 
-import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T
 
@@ -25,13 +25,9 @@ def release_stores():
     poll: wait for them (a workgroup release fence alone does not wait for global
     stores), then the fence."""
     rocdl.s_waitcnt(vmcnt=0)
-    fx.memory_fence(
-        syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release
-    )
+    llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
 
 
 def acquire_loads():
     """Order this thread's later loads after a flag it polled."""
-    fx.memory_fence(
-        syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
-    )
+    llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
