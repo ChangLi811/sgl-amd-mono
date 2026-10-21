@@ -18,7 +18,14 @@ from __future__ import annotations
 import math
 
 import msgspec
+import os
+
 import torch
+
+# SGLANG_AMD_MONO_MUSE_QUANT_BF16=0: the bf16-expert layers (0 and 61 of the Quark
+# checkpoint) stay on SGLang's modules instead of running the kernels on an online
+# MXFP4 quantization of their experts (aiter's rule, see mxfp4_quant.py)
+QUANT_BF16 = os.environ.get("SGLANG_AMD_MONO_MUSE_QUANT_BF16", "1") == "1"
 
 from sgl_amd_mono.muse_spark import TP
 from sgl_amd_mono.muse_spark.gfx950.config import (
@@ -270,6 +277,20 @@ def _gate_coefficients(gate, i: int, what: str, copies: dict) -> tuple[torch.Ten
     return copies[key]
 
 
+def _quantized_experts(experts, i: int, copies: dict) -> tuple:
+    """A bf16-expert layer's experts as Quark-layout MXFP4 copies (w13, s13, w2, s2),
+    quantized once at the build by aiter's rule and kept in ``copies``."""
+    from sgl_amd_mono.muse_spark.mxfp4_quant import quantize_mxfp4
+
+    key = f"layer {i} experts: online MXFP4 (w13 + w2 codes and scales)"
+    if key not in copies:
+        with torch.no_grad():
+            w13, s13 = quantize_mxfp4(experts.w13_weight.data)
+            w2, s2 = quantize_mxfp4(experts.w2_weight.data)
+            copies[key] = (w13, s13, w2, s2)
+    return copies[key]
+
+
 def _router_hi_lo(moe, i: int, copies: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """The fp32 router as bf16 hi + lo [EXPERTS, HIDDEN]: the model's packed weight
     (rows 4096 .. 4352 and 4352 .. 4608 next to the pooler) when it prepared one,
@@ -314,11 +335,20 @@ class LayerViews(msgspec.Struct, frozen=True):
     alpha2: torch.Tensor  # fp32 [HIDDEN]: the post-FFN residual gate
     beta2: torch.Tensor
     npw: torch.Tensor  # bf16 [HIDDEN]: the next layer's pre_attn_norm (+1), or the final norm's
+    quantized: bool = False  # bf16 experts quantized online (kind is then "mxfp4")
 
     @staticmethod
     def build(layer, i: int, next_pre_norm, copies: dict) -> "LayerViews":
         attn, moe, experts = layer.self_attn, layer.mlp, layer.mlp.experts
         kind = expert_kind(layer)
+        quantized = kind == "bf16" and QUANT_BF16
+        if quantized:
+            w13, s13, w2, s2 = _quantized_experts(experts, i, copies)
+            kind = "mxfp4"
+        elif kind == "mxfp4":
+            w13, s13, w2, s2 = experts.w13_weight.data, experts.w13_weight_scale.data, experts.w2_weight.data, experts.w2_weight_scale.data  # fmt: skip
+        else:
+            w13 = s13 = w2 = s2 = None
         alpha, beta = _gate_coefficients(layer.post_attention_residual_gate, i, "post_attention", copies)
         alpha2, beta2 = _gate_coefficients(layer.post_feedforward_residual_gate, i, "post_feedforward", copies)
         hi, lo = _router_hi_lo(moe, i, copies)
@@ -338,14 +368,15 @@ class LayerViews(msgspec.Struct, frozen=True):
             bias=moe.expert_bias.data,
             w_pool=moe.pre_expert_proj.weight.data,
             xn_w=_effective_norm_weight(moe.pre_expert_norm, i, "pre_expert_norm", copies),
-            w13=experts.w13_weight.data if kind == "mxfp4" else None,
-            s13=experts.w13_weight_scale.data if kind == "mxfp4" else None,
-            w2=experts.w2_weight.data if kind == "mxfp4" else None,
-            s2=experts.w2_weight_scale.data if kind == "mxfp4" else None,
+            w13=w13,
+            s13=s13,
+            w2=w2,
+            s2=s2,
             pen_w=_effective_norm_weight(moe.post_expert_norm, i, "post_expert_norm", copies),
             w_unpool=moe.post_expert_proj.weight.data,
             pfw=_effective_norm_weight(layer.post_feedforward_layernorm, i, "post_feedforward_layernorm", copies),
             alpha2=alpha2,
             beta2=beta2,
             npw=_effective_norm_weight(next_pre_norm, i, "next pre_attn_norm", copies),
+            quantized=quantized,
         )
