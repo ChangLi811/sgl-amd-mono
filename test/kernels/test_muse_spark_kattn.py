@@ -17,8 +17,8 @@ pytestmark = pytest.mark.skipif(
     reason="needs a gfx950 GPU",
 )
 
-PAGES = 8192  # cache pages of the test's K / V planes (131k keys)
-MAX_BLOCKS = 8192  # the page table's row
+PAGES = 16384  # cache pages of the test's K / V planes (262k keys)
+MAX_BLOCKS = 16384  # the page table's row
 
 
 def _epoch(device, deadline_s=20.0):
@@ -70,7 +70,7 @@ def _reference(q, k_cache, v_cache, table, seq_lens, ql, window, scale):
         (8, 2, 2047, 256, [3000, 2200]),
         (8, 4, 0, 1024, [5000, 17, 700, 2049]),
         (8, 8, 2047, 0, None),  # the kernel sizes the partition
-        (8, 8, 0, 0, [20000, 300, 1, 95000, 4096, 2048, 2047, 9]),  # C8 at the AgentX context
+        (8, 8, 0, 0, [20000, 300, 8, 95000, 4096, 2048, 2047, 9]),  # C8 at the AgentX context (a request holds >= its 8 rows)
         (8, 2, 2047, 0, [95000, 60000]),
         (1, 16, 2047, 256, None),
     ],
@@ -85,7 +85,7 @@ def test_kattn_matches_the_verify_attention(ql, R, window, part, lens):
     bf = torch.bfloat16
     S = ql * R
     if lens is None:
-        lens = [int(x) for x in torch.randint(ql, 2600, (R,))]
+        lens = [int(x) for x in torch.randint(ql, 2600, (R,))]  # keys include the step's ql rows
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     q = (torch.randn(S, Q_K, device=dev) * 5.47).to(bf)  # K1 hands q scaled by qk_scale_factor
     k_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev) * 2).to(torch.float8_e4m3fn)
