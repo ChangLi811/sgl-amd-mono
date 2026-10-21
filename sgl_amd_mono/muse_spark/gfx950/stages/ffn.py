@@ -118,7 +118,6 @@ UNP_ROWS = 16  # unpooler rows an unpool task: the MFMA's M
 UNP_TASKS = HIDDEN // UNP_ROWS  # 512 row tiles, 1 / npes of them a rank
 UNP_STEPS = MOE_HIDDEN // WAVES // 32  # 16 bf16 MFMA steps a wave
 BND_ELEMS = HIDDEN // THREADS  # 16 elements a thread of a token's row
-UNP_DIRECT = False  # the unpool passes load the summed rows into VGPRs (else LDS DMA; measured the same)
 assert XQW == THREADS and INTER == MOE_HIDDEN and UG_CHUNKS == 4 and DN_CHUNKS == 4
 assert TILE_COLS * (XQW + XSW) <= XS_LDS_MAX * MOE_HIDDEN // 2  # a staged tile fits ``xcol``
 assert MOE_HIDDEN == 8 * THREADS and HIDDEN == 16 * THREADS and TOP_K == 8
@@ -834,70 +833,48 @@ def stage_unpool(c, first_w):
         cur = first_w
         for k in range_constexpr(KU):
             task, gtask, job_ps = unp_gtask(c, k)
-            if task < b["unp_jobs"]:
-                if const_expr(True):  # the job's token pass (every served width is whole passes)
-                    t0 = job_ps * XS_LDS_MAX
-                    nt = XS_LDS_MAX
-                    tl = fx.min(l16, nt - 1)
-                    if const_expr(UNP_DIRECT):
-                        # the pass's rows straight into the B operands: lane (token tl, k
-                        # eighth of its wave) loads its 16 B a step, the 16 steps in flight
-                        # (64 VGPRs beside the weights); the DMA path costs ~4.5 us a pass
-                        fbs = [
-                            fx.Vector(
-                                bo.buffer_load(
-                                    r_f,
-                                    ((t0 + tl) * MOE_HIDDEN + wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4) // 2,
-                                    vec_width=4, dtype=T.i32, cache_modifier=CM_DEV,
-                                )  # fmt: skip
-                            )
-                            for kc in range(UNP_STEPS)
-                        ]
-                        if const_expr(k + 1 < KU):
-                            nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
-                    else:
-                        # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane
-                        for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
-                            v = tid + THREADS * i
-                            rocdl.raw_ptr_buffer_load_lds(
-                                r_f, (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr, 16, t0 * (MOE_HIDDEN * 2) + v * 16, fx.Int32(0), 0, CM_DEV  # fmt: skip
-                            )
-                        # the next job's weights go out behind this job's rows (loads
-                        # complete in order: issued before them, they would delay the rows)
-                        if const_expr(k + 1 < KU):
-                            nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
-                        rocdl.s_waitcnt(vmcnt=0)  # FIXME: also waits for ``nxt``; a counted wait would not
-                        gpu.barrier()
-                    if const_expr(k == 0):
-                        stamp(c, 9)  # the first pass's rows issued / landed in LDS
-                    acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for kc in range_constexpr(UNP_STEPS):
-                        if const_expr(UNP_DIRECT):
-                            fbv = fbs[kc]
-                        else:
-                            k0 = wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4
-                            fbv = fx.Vector(fx.ptr_load(xcol + (tl * (MOE_HIDDEN // 2) + k0 // 2), result_type=V4F))
-                        acc = mfma_bf16(cur[kc].bitcast(fx.BFloat16), fbv.bitcast(fx.BFloat16), acc)
-                    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-                    gpu.barrier()
-                    if const_expr(k == 0):
-                        stamp(c, 10)  # the first pass's MFMAs done
-                    # branch = bf16(the fp32 sum over the waves, in wave order)
-                    if tid < UNP_ROWS * nt:
-                        fx.ptr_store(bf16_round(row_sum(red, tid % UNP_ROWS, tid // UNP_ROWS)), misc + tid)
-                    gpu.barrier()
-                    if tid < (UNP_ROWS // 2) * nt:
-                        tk = tid // (UNP_ROWS // 2)
-                        rr = (tid % (UNP_ROWS // 2)) * 2
-                        vals = [fx.ptr_load(misc + (tk * UNP_ROWS + rr)), fx.ptr_load(misc + (tk * UNP_ROWS + rr + 1))]  # fmt: skip
-                        for pe in range_constexpr(W):
-                            put_bf(c["peer_unp"][pe], (t0 + tk) * HIDDEN + gtask * UNP_ROWS + rr, vals)
-                    gpu.barrier()
-                    if const_expr(k == 0):
-                        stamp(c, 11)  # the first pass's rows pushed
+            live_k = (task >= 0) & (task < b["unp_jobs"])  # a dead job computes on a clamped pass, publishes nothing
+            t0 = fx.min(job_ps, b["unp_passes"] - 1) * XS_LDS_MAX
+            nt = XS_LDS_MAX  # every served width is whole passes
+            tl = fx.min(l16, nt - 1)
+            # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane
+            for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
+                v = tid + THREADS * i
+                rocdl.raw_ptr_buffer_load_lds(
+                    r_f, (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr, 16, t0 * (MOE_HIDDEN * 2) + v * 16, fx.Int32(0), 0, CM_DEV  # fmt: skip
+                )
+            # the next job's weights go out behind this job's rows: loads complete in
+            # order, so the wait below counts them out (UNP_STEPS a lane still in flight)
+            if const_expr(k + 1 < KU):
+                nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
+                rocdl.s_waitcnt(vmcnt=UNP_STEPS)
             else:
-                if const_expr(k + 1 < KU):
-                    nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
+                rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            if const_expr(k == 0):
+                stamp(c, 9)  # the first job's rows landed in LDS
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for kc in range_constexpr(UNP_STEPS):
+                k0 = wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4
+                fbv = fx.Vector(fx.ptr_load(xcol + (tl * (MOE_HIDDEN // 2) + k0 // 2), result_type=V4F))
+                acc = mfma_bf16(cur[kc].bitcast(fx.BFloat16), fbv.bitcast(fx.BFloat16), acc)
+            fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            if const_expr(k == 0):
+                stamp(c, 10)  # the first job's MFMAs done
+            # branch = bf16(the fp32 sum over the waves, in wave order)
+            if tid < UNP_ROWS * nt:
+                fx.ptr_store(bf16_round(row_sum(red, tid % UNP_ROWS, tid // UNP_ROWS)), misc + tid)
+            gpu.barrier()
+            if live_k & (tid < (UNP_ROWS // 2) * nt):
+                tk = tid // (UNP_ROWS // 2)
+                rr = (tid % (UNP_ROWS // 2)) * 2
+                vals = [fx.ptr_load(misc + (tk * UNP_ROWS + rr)), fx.ptr_load(misc + (tk * UNP_ROWS + rr + 1))]  # fmt: skip
+                for pe in range_constexpr(W):
+                    put_bf(c["peer_unp"][pe], (t0 + tk) * HIDDEN + gtask * UNP_ROWS + rr, vals)
+            gpu.barrier()
+            if const_expr(k == 0):
+                stamp(c, 11)  # the first job's rows pushed
             if const_expr(k + 1 < KU):
                 cur = nxt
 
