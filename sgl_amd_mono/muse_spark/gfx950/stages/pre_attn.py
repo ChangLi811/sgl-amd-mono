@@ -25,11 +25,12 @@ progress.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
+    CM_DEV,
     CM_NT,
     bf16_round,
     butterfly,
@@ -55,6 +56,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     V_OFF,
 )
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ELEMS,
     GATE_TASKS,
@@ -327,8 +329,18 @@ def stage_gate(c, g):
 
 
 @flyc.jit
-def run_k1(c, bid, first=None):
-    """K1's stages on this CTA: its GEMV task(s), then its head or gate task."""
+def run_k1(c, bid, x_flag=None):
+    """K1's stages on this CTA: the x staging, its GEMV task(s), then its head or
+    gate task. ``x_flag`` (a mailbox region): x was written earlier in this launch
+    (the previous layer's boundary), flagged a token each; the first task's first
+    weight batches go out before the wait."""
+    first = None
+    if const_expr(x_flag is not None):
+        first = [gemv_w_batch(c, bid // HALVES, bid % HALVES, b, c["args"]["w"]) for b in range(2)]
+        rocdl.sched_barrier(0)
+        c["poll"]([(x_flag, t, 1) for t in range(c["S"])])
+        acquire_loads()
+    stage_x(c)
     stage_gemv(c, bid, first)
     if bid < SPLIT_TASKS - BLOCKS:
         stage_gemv(c, BLOCKS + bid)

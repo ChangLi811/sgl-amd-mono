@@ -93,6 +93,9 @@ SGLANG_READS = {
 FP8_CACHE = torch.float8_e4m3fn
 # SGLANG_AMD_MONO_MUSE_KERNELS=0: every layer on SGLang's modules (the stage-0 plugin)
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
+# SGLANG_AMD_MONO_MUSE_LAYER=1: an MXFP4 layer's attention, K2, K3 and the next layer's
+# K1 as one launch (else the four launches)
+USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "0") == "1"
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -149,6 +152,8 @@ class MuseMonoRunner:
         self.views, self.modules, self.boundaries = list(views), list(modules), list(boundaries)
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
+        self.use_layer = USE_LAYER
+        self._k1_done = -1  # the layer whose K1 the previous merged launch ran
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         dev, bf16 = self.device, torch.bfloat16
         self.deadline_s = None
@@ -183,6 +188,7 @@ class MuseMonoRunner:
         self._kattn: dict = {}
         self._k2: dict = {}
         self._k3: dict = {}
+        self._layer: dict = {}
         self.backend = None
         self.pool = None
         self.caches = None  # per layer: (k cache ptr, v cache ptr, is a sliding layer)
@@ -236,6 +242,27 @@ class MuseMonoRunner:
             )
         return self._k3[rows]
 
+    def layer_kernel(self, rows: int, q_len: int, next_k1: bool):
+        if (rows, q_len, next_k1) not in self._layer:
+            from sgl_amd_mono.muse_spark.gfx950.layer import LayerBuild, build_layer
+
+            no_capture(f"the {rows}-row layer launch first reached")
+            self._layer[(rows, q_len, next_k1)] = build_layer(
+                LayerBuild(
+                    tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
+                    fault_site=self.fault_site, fault_after=self.fault_after,
+                )  # fmt: skip
+            )
+        return self._layer[(rows, q_len, next_k1)]
+
+    def merged(self, i: int, rows: int, q_len: int) -> bool:
+        """Layer ``i`` runs as one launch (the attention, K2, K3 and, when the next
+        layer takes the kernels too, its K1)."""
+        return self.use_layer and self.views[i].kind == "mxfp4" and rows % q_len == 0
+
+    def _next_k1(self, i: int) -> bool:
+        return i + 1 < len(self.views) and self.views[i + 1].kind == "mxfp4"
+
     def precompile(self, rows: int, q_len: int = 8) -> None:
         """Compile every launch of a width (FlyDSL's disk cache then serves the
         other ranks and the next start)."""
@@ -244,8 +271,12 @@ class MuseMonoRunner:
         compile_only(self.k1_kernel(rows))
         if rows % q_len == 0:
             compile_only(self.kattn_kernel(rows, q_len))
-        compile_only(self.k2_kernel(rows))
-        compile_only(self.k3_kernel(rows))
+            if self.use_layer:
+                for next_k1 in {self._next_k1(i) for i in range(len(self.views)) if self.views[i].kind == "mxfp4"}:
+                    compile_only(self.layer_kernel(rows, q_len, next_k1))
+        if not (self.use_layer and rows % q_len == 0):
+            compile_only(self.k2_kernel(rows))
+            compile_only(self.k3_kernel(rows))
 
     # ---------------------------------------------------------------- caches
     def cache_reasons(self, backend, pool) -> list[str]:
@@ -339,12 +370,37 @@ class MuseMonoRunner:
         m = self.swa_map
         cur = torch.cuda.current_stream()
         cos_sin = L.cos_sin if L.cos_sin is not None else self.any_cos_sin
-        self.k1_kernel(rows)(
-            _ptr(attn_input), _ptr(L.w_qkvg), _ptr(cos_sin), _ptr(positions), _ptr(slots), _ptr(m),
-            k_cache, v_cache, _ptr(self.q), _ptr(self.k), _ptr(self.v), _ptr(self.g),
-            _ptr(self.scratch_k1), _ptr(self.epoch), i, int(L.use_rope), int(is_swa),
-            int(slots.dtype == torch.int64), int(m.dtype == torch.int64), stream=cur,
-        )  # fmt: skip
+        if self._k1_done != i:  # else the previous merged launch ran this layer's K1
+            self.k1_kernel(rows)(
+                _ptr(attn_input), _ptr(L.w_qkvg), _ptr(cos_sin), _ptr(positions), _ptr(slots), _ptr(m),
+                k_cache, v_cache, _ptr(self.q), _ptr(self.k), _ptr(self.v), _ptr(self.g),
+                _ptr(self.scratch_k1), _ptr(self.epoch), i, int(L.use_rope), int(is_swa),
+                int(slots.dtype == torch.int64), int(m.dtype == torch.int64), stream=cur,
+            )  # fmt: skip
+        self._k1_done = -1
+        last = i == len(self.modules) - 1
+        if self.merged(i, rows, q_len):
+            next_k1 = self._next_k1(i)
+            L1 = self.views[i + 1] if next_k1 else L
+            k_cache1, v_cache1, is_swa1 = self.caches[i + 1] if next_k1 else self.caches[i]
+            cos_sin1 = L1.cos_sin if L1.cos_sin is not None else self.any_cos_sin
+            self.layer_kernel(rows, q_len, next_k1)(
+                _ptr(self.q), _ptr(self.o), *self._attn_args(i, rows, forward_batch, q_len),
+                _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta), _ptr(L.pre_w),
+                _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool), _ptr(L.xn_w),
+                _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
+                int(self.modules[i].mlp.local_expert_start), _ptr(L.w13), _ptr(L.s13), _ptr(L.w2),
+                _ptr(L.s2), _ptr(L.pen_w), _ptr(L.pfw), _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw),
+                _ptr(L.w_unpool), _ptr(self.attn_in), _ptr(self.scratch_k3),
+                _ptr(L1.w_qkvg), _ptr(cos_sin1), _ptr(positions), _ptr(slots), _ptr(m), k_cache1,
+                v_cache1, _ptr(self.k), _ptr(self.v), _ptr(self.scratch_k1), int(L1.use_rope),
+                int(is_swa1), int(slots.dtype == torch.int64), int(m.dtype == torch.int64),
+                self.peers.local, _ptr(self.peers.addresses), self.rank, _ptr(self.epoch), i,
+                int(last), stream=cur,
+            )  # fmt: skip
+            if next_k1:
+                self._k1_done = i + 1
+            return stream, self.attn_in[:rows]
         self.kattn_kernel(rows, q_len)(
             _ptr(self.q), _ptr(self.o), *self._attn_args(i, rows, forward_batch, q_len),
             _ptr(self.epoch), i, stream=cur,
@@ -355,7 +411,6 @@ class MuseMonoRunner:
             _ptr(L.xn_w), _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
             self.peers.local, _ptr(self.peers.addresses), self.rank, _ptr(self.epoch), i, stream=cur,
         )  # fmt: skip
-        last = i == len(self.modules) - 1
         self.k3_kernel(rows)(
             _ptr(self.xin), _ptr(self.ids), _ptr(self.scores), int(self.modules[i].mlp.local_expert_start),
             _ptr(L.w13), _ptr(L.s13), _ptr(L.w2), _ptr(L.s2), _ptr(L.pen_w), _ptr(stream), _ptr(L.pfw),
@@ -368,3 +423,4 @@ class MuseMonoRunner:
     def end_step(self) -> None:
         """The next step's epoch, enqueued after this step's last launch."""
         self.epoch[0].add_(1)
+        self._k1_done = -1
