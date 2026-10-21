@@ -11,12 +11,14 @@ LDS_BYTES = 160 * 1024
 
 
 def test_k1_tasks_fit_the_grid():
-    # 144 row groups x 2 halves: a task a CTA plus a second on the first 32
-    assert L.SPLIT_TASKS == 2 * (QKVG_ROWS // L.ROWS) == 288
-    assert L.HT0 == L.SPLIT_TASKS - BLOCKS
-    assert L.GT0 == L.HT0 + L.HEAD_TASKS
-    assert L.GT0 + L.GATE_TASKS <= BLOCKS
-    assert L.HALVES * L.K_PER_WAVE * 8 == HIDDEN
+    # row groups 0 .. 127 x 2 halves: a task a CTA; the last 16 groups x 4 quarters:
+    # second tasks on the CTAs past the head / gate tasks
+    assert L.HALF_GROUPS + L.QUARTER_GROUPS == QKVG_ROWS // L.ROWS == 144
+    assert L.HALF_GROUPS * L.HALVES == BLOCKS
+    assert L.SPLIT_TASKS == BLOCKS + L.QUARTER_GROUPS * L.PARTS == 320
+    assert L.GT0 == L.HT0 + L.HEAD_TASKS and L.QT0 == L.GT0 + L.GATE_TASKS
+    assert L.QT0 + L.QUARTER_GROUPS * L.PARTS <= BLOCKS
+    assert L.HALVES * L.K_PER_WAVE * 8 == HIDDEN and L.PARTS == 4
 
 
 @pytest.mark.parametrize("s", list(WIDTHS) + [1, 5, 24, 63])
@@ -31,7 +33,7 @@ def test_k1_scratch_regions_do_not_overlap():
     spans = sorted((off, off + n) for off, n in lay.values())
     for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
         assert a1 <= b0
-    assert lay["k1_part"][1] == L.HALVES * MAX_TOKENS * QKVG_ROWS * 8
+    assert lay["k1_part"][1] == L.PARTS * MAX_TOKENS * QKVG_ROWS * 8
     assert L.scratch_bytes(lay) == spans[-1][1]
 
 

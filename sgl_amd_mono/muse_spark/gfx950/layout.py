@@ -23,24 +23,28 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
 ROWS = 16  # projection rows a GEMV task: the MFMA's M
 TILE = 16  # tokens an MFMA B operand holds: a token tile
 K_STEP = 32  # the bf16 MFMA's K
-HALVES = 2  # every row group as two K halves: 288 tasks over 256 CTAs
+HALVES = 2  # row groups 0 .. 127 as two K halves: one task a CTA
+PARTS = 4  # partial slots a (token, row): the halves, or the overflow groups' quarters
 K_HALF = HIDDEN // HALVES  # 4096
 K_PER_WAVE = K_HALF // WAVES  # 512: each wave's contiguous K range of a half
 K_STEPS = K_PER_WAVE // K_STEP  # 16 MFMAs a wave a token tile
 STEP_BATCH = 8  # k-steps whose weight loads go out together (32 VGPRs)
 GEMV_TASKS = QKVG_ROWS // ROWS  # 144 row groups
-SPLIT_TASKS = GEMV_TASKS * HALVES  # 288: CTAs 0 .. 31 take a second task
+HALF_GROUPS = BLOCKS // HALVES  # 128 row groups as halves, a task a CTA
+QUARTER_GROUPS = GEMV_TASKS - HALF_GROUPS  # 16 row groups (the gate rows' tail) as four K quarters
+SPLIT_TASKS = HALF_GROUPS * HALVES + QUARTER_GROUPS * PARTS  # 256 + 64
 HEAD_TASKS = LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS  # 20: a CTA a q, k or v head
-GATE_TASKS = Q_K // HEAD_DIM  # 16: the gate rows' half sums, 64 rows a task
-HT0 = SPLIT_TASKS - BLOCKS  # the first head task's CTA, past the CTAs with a second GEMV task
+GATE_TASKS = Q_K // HEAD_DIM  # 16: the gate rows' part sums, 64 rows a task
+HT0 = 32  # the first head task's CTA
 GT0 = HT0 + HEAD_TASKS  # the first gate task's CTA
+QT0 = GT0 + GATE_TASKS  # the first quarter task's CTA: 64 quarter tasks as second tasks, past the head / gate CTAs
+assert QT0 + QUARTER_GROUPS * PARTS <= BLOCKS and HALF_GROUPS * ROWS == 2048
 ELEMS = 4  # a head task lane's dims: 16 lanes x 4 = HEAD_DIM, two RoPE pairs
 TOKEN_LANES = 16
 TOKENS_PER_PASS = THREADS // TOKEN_LANES  # 32 tokens a head / gate pass
 XS_LDS_MAX = 8  # steps of up to this many rows stage x in LDS (16 KB a row)
 RED_FLOATS = WAVES * 64 * 4  # one token tile's MFMA accumulators in LDS
-assert QKVG_ROWS % ROWS == 0 and K_STEPS % STEP_BATCH == 0
-assert BLOCKS <= SPLIT_TASKS <= 2 * BLOCKS
+assert QKVG_ROWS % ROWS == 0 and K_STEPS % STEP_BATCH == 0 and (K_STEPS // 2) % STEP_BATCH == 0
 assert GT0 + GATE_TASKS <= BLOCKS
 assert MAX_TOKENS % TILE == 0
 
@@ -60,7 +64,7 @@ def k1_scratch_layout() -> dict:
     the halves' fp32 partials (a pair a (half, token, row)) and, in a merged
     launch, a flag a token for its x."""
     return pair_layout(
-        [("k1_part", HALVES * MAX_TOKENS * QKVG_ROWS), ("k1_xflag", MAX_TOKENS), ("k1_trace", BLOCKS * TRACE_SLOTS)],
+        [("k1_part", PARTS * MAX_TOKENS * QKVG_ROWS), ("k1_xflag", MAX_TOKENS), ("k1_trace", BLOCKS * TRACE_SLOTS)],
         align=256,
     )
 

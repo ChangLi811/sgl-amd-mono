@@ -13,11 +13,14 @@ cache write, for S = ``tokens`` rows (a token each; 8 consecutive rows a request
          (unit KV scale, checked at bind; the sliding layers' slots through the
          SWA pool's full-to-SWA table)
 
-Stage 1 is the GEMV tasks: every row group (16 rows) as two K halves, 288 tasks
-over the 256 CTAs (CTAs 0 .. 31 take a second), each half's fp32 partials to the
-``k1_part`` mailbox. Stage 2 is a head task a q, k or v head on CTAs ``HT0`` ..
-and a gate task a q head after them, each summing the halves in order and
-rounding once, 32 tokens a pass on 16 lanes of 4 dims. Dependencies only point
+Stage 1 is the GEMV tasks: row groups (16 rows) 0 .. 127 as two K halves, one
+task a CTA, and the last 16 row groups (gate rows) as four K quarters, 64 second
+tasks on CTAs ``QT0`` .. (a quarter is half a task: the second round costs half
+of what a 288-task split's did), each part's fp32 partials to one of a row's
+``PARTS`` slots in the ``k1_part`` mailbox (a half task zero-fills slots 2 and 3).
+Stage 2 is a head task a q, k or v head on CTAs ``HT0`` .. and a gate task a q
+head after them, each summing the four slots in order and rounding once, 32
+tokens a pass on 16 lanes of 4 dims. Dependencies only point
 from stage 2 to stage 1 and all CTAs are co-resident, so every wait makes
 progress.
 """
@@ -61,6 +64,7 @@ from sgl_amd_mono.muse_spark.gfx950.layout import (
     ELEMS,
     GATE_TASKS,
     GT0,
+    HALF_GROUPS,
     HALVES,
     HEAD_TASKS,
     HT0,
@@ -68,9 +72,11 @@ from sgl_amd_mono.muse_spark.gfx950.layout import (
     K_PER_WAVE,
     K_STEP,
     K_STEPS,
+    PARTS,
+    QT0,
+    QUARTER_GROUPS,
     RED_FLOATS,
     ROWS,
-    SPLIT_TASKS,
     STEP_BATCH,
     TILE,
     TOKEN_LANES,
@@ -81,14 +87,17 @@ from sgl_amd_mono.muse_spark.gfx950.layout import (
 )
 
 
-def gemv_k(lane, wave, half, kc):
-    """The k of step ``kc`` this lane streams, in K half ``half``."""
-    return half * K_HALF + wave * K_PER_WAVE + kc * K_STEP + 8 * (lane // 16)
+def gemv_k(lane, wave, part, nparts, kc):
+    """The k of step ``kc`` this lane streams, in K part ``part`` of ``nparts``
+    (each wave a contiguous ``HIDDEN / nparts / WAVES`` range of the part)."""
+    span = HIDDEN // nparts
+    return part * span + wave * (span // WAVES) + kc * K_STEP + 8 * (lane // 16)
 
 
-def gemv_w_batch(c, rg, half, b, w):
-    """Batch ``b`` of GEMV task (``rg``, ``half``)'s weight loads, this lane's: in
-    flight. Row-major bf16, 16 B a lane a k-step, read once a layer (nontemporal)."""
+def gemv_w_batch(c, rg, part, nparts, b, w):
+    """Batch ``b`` of GEMV task (``rg``, ``part`` of ``nparts``)'s weight loads, this
+    lane's: in flight. Row-major bf16, 16 B a lane a k-step, read once a layer
+    (nontemporal)."""
     lane, wave = c["lane"], c["wave"]
     row = rg * ROWS + lane % 16
     r_w = rsrc(w)
@@ -96,7 +105,7 @@ def gemv_w_batch(c, rg, half, b, w):
         fx.Vector(
             bo.buffer_load(
                 r_w,
-                (row * HIDDEN + gemv_k(lane, wave, half, b * STEP_BATCH + j)) // 2,
+                (row * HIDDEN + gemv_k(lane, wave, part, nparts, b * STEP_BATCH + j)) // 2,
                 vec_width=4,
                 dtype=T.i32,
                 cache_modifier=CM_NT,
@@ -125,27 +134,28 @@ def stage_x(c):
 
 
 @flyc.jit
-def stage_gemv(c, task, first=None):
-    """GEMV task ``task``: K half ``task % 2`` of row group ``task / 2``, for every
-    token tile. Lane l of wave w holds row l % 16 and, per k-step, k = half 4096 +
-    512 w + 32 kc + 8 (l / 16) .. + 8 of the weight (A) and of token 16 t + l % 16
-    (B, from LDS on narrow steps); the waves' accumulators are summed in wave order
-    and the half's fp32 partials go to the mailbox. ``first``: the leading weight
-    batches, already in flight (``gemv_w_batch``)."""
+def stage_gemv(c, rg, kpart, nparts, first=None):
+    """GEMV task: K part ``kpart`` of ``nparts`` (2: a half, 4: a quarter) of row
+    group ``rg``, for every token tile. Lane l of wave w holds row l % 16 and, per
+    k-step, k = part span + w span / 8 + 32 kc + 8 (l / 16) .. + 8 of the weight
+    (A) and of token 16 t + l % 16 (B, from LDS on narrow steps); the waves'
+    accumulators are summed in wave order and the part's fp32 partials go to slot
+    ``kpart`` of the mailbox (a half task also zero-fills slots 2 and 3: every row
+    has ``PARTS`` slots to sum). ``first``: the leading weight batches, already in
+    flight (``gemv_w_batch``)."""
     S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     red, xs, put, part = c["red"], c["xs"], c["put"], c["part"]
     a = c["args"]
-    rg = task // HALVES
-    half = task % HALVES
     tiles = token_tiles(S)
     r_x = rsrc(a["x"])
     x_cm = c["x_cm"]
     V4F = fx.Vector.make_type(4, fx.Float32)
+    steps = K_STEPS * HALVES // nparts  # 16 a half, 8 a quarter
 
     def w_batch(b):
         if const_expr(first is not None and b < len(first)):
             return first[b]
-        return gemv_w_batch(c, rg, half, b, a["w"])
+        return gemv_w_batch(c, rg, kpart, nparts, b, a["w"])
 
     def x_batch(b, t):
         tok = fx.min(t * TILE + lane % 16, S - 1)
@@ -154,7 +164,7 @@ def stage_gemv(c, task, first=None):
                 fx.Vector(
                     bo.buffer_load(
                         r_x,
-                        (tok * HIDDEN + gemv_k(lane, wave, half, b * STEP_BATCH + j)) // 2,
+                        (tok * HIDDEN + gemv_k(lane, wave, kpart, nparts, b * STEP_BATCH + j)) // 2,
                         vec_width=4,
                         dtype=T.i32,
                         cache_modifier=x_cm,
@@ -165,7 +175,7 @@ def stage_gemv(c, task, first=None):
         return [
             fx.Vector(
                 fx.ptr_load(
-                    xs + (tok * (HIDDEN // 2) + gemv_k(lane, wave, half, b * STEP_BATCH + j) // 2),
+                    xs + (tok * (HIDDEN // 2) + gemv_k(lane, wave, kpart, nparts, b * STEP_BATCH + j) // 2),
                     result_type=V4F,
                 )
             )
@@ -175,7 +185,7 @@ def stage_gemv(c, task, first=None):
     # each batch's weights go out before the previous batch's MFMAs; a token
     # tile's x right before its MFMAs (L2-resident past LDS)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(tiles)]
-    nb = K_STEPS // STEP_BATCH
+    nb = steps // STEP_BATCH
     cur = w_batch(0)
     for b in range_constexpr(nb):
         if const_expr(b + 1 < nb):
@@ -191,7 +201,8 @@ def stage_gemv(c, task, first=None):
     for t in range_constexpr(tiles):
         fx.ptr_store(accs[t], red + (t * RED_FLOATS + (wave * 64 + lane) * 4))
     gpu.barrier()
-    # this half's fp32 partials: the head and gate tasks sum the halves and round
+    # this part's fp32 partials: the head and gate tasks sum a row's PARTS slots and
+    # round; a half task (nparts 2, part 0) zero-fills the two quarter slots
     n_out = ROWS * S
     for p in range_constexpr(-(-n_out // THREADS)):
         idx = tid + p * THREADS
@@ -199,24 +210,29 @@ def stage_gemv(c, task, first=None):
             r = idx % ROWS
             tk = idx // ROWS
             v = row_sum(red + (tk // TILE) * RED_FLOATS, r, tk % TILE)
-            put(part, (half * MAX_TOKENS + tk) * QKVG_ROWS + rg * ROWS + r, v)
+            put(part, (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * ROWS + r, v)
+            if const_expr(nparts == HALVES):
+                if kpart == 0:
+                    for q in range_constexpr(HALVES, PARTS):
+                        put(part, (q * MAX_TOKENS + tk) * QKVG_ROWS + rg * ROWS + r, fx.Float32(0.0))
     gpu.barrier()  # ``red`` is reused by the CTA's next task
 
 
 def half_sum(poll, part, tk, pb):
     """Token ``tk``'s elements ``pb`` .. ``pb + ELEMS`` of the projection: the K
-    halves' fp32 partials from the mailbox, summed in half order, bf16."""
+    parts' fp32 partials (``PARTS`` slots a row: two halves and two zero slots, or
+    four quarters) from the mailbox, summed in slot order, bf16."""
     gq = poll(
         [
             (part, (hf * MAX_TOKENS + tk) * QKVG_ROWS + pb + 2 * p, 2)
-            for hf in range(HALVES)
+            for hf in range(PARTS)
             for p in range(2)
         ]
     )
     out = []
     for j in range_constexpr(ELEMS):
         v = gq[j // 2][j % 2].bitcast(fx.Float32)
-        for hf in range_constexpr(1, HALVES):
+        for hf in range_constexpr(1, PARTS):
             v = v + gq[hf * 2 + j // 2][j % 2].bitcast(fx.Float32)
         out.append(bf16_round(v))
     return out[0], out[1], out[2], out[3]
@@ -337,14 +353,15 @@ def run_k1(c, bid, x_flag=None):
     stamp(c, 0)
     first = None
     if const_expr(x_flag is not None):
-        first = [gemv_w_batch(c, bid // HALVES, bid % HALVES, b, c["args"]["w"]) for b in range(2)]
+        first = [gemv_w_batch(c, bid // HALVES, bid % HALVES, HALVES, b, c["args"]["w"]) for b in range(2)]
         rocdl.sched_barrier(0)
         poll_flags(c, [(x_flag, c["S"])])
     stamp(c, 1)  # x arrived (a merged launch) / entry
     stage_x(c)
-    stage_gemv(c, bid, first)
-    if bid < SPLIT_TASKS - BLOCKS:
-        stage_gemv(c, BLOCKS + bid)
+    stage_gemv(c, bid // HALVES, bid % HALVES, HALVES, first)  # row groups 0 .. 127 as halves
+    if (bid >= QT0) & (bid < QT0 + QUARTER_GROUPS * PARTS):
+        q = bid - QT0  # the last 16 row groups as quarters, second tasks on idle CTAs
+        stage_gemv(c, HALF_GROUPS + q // PARTS, q % PARTS, PARTS)
     stamp(c, 2)  # the GEMV task(s) done
     if (bid >= HT0) & (bid < HT0 + HEAD_TASKS):
         stage_head(c, bid - HT0)

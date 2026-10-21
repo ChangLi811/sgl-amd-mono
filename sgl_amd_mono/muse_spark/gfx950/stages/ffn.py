@@ -834,8 +834,6 @@ def stage_unpool(c, first_w):
         cur = first_w
         for k in range_constexpr(KU):
             task, gtask, job_ps = unp_gtask(c, k)
-            if const_expr(k + 1 < KU):
-                nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
             if task < b["unp_jobs"]:
                 if const_expr(True):  # the job's token pass (every served width is whole passes)
                     t0 = job_ps * XS_LDS_MAX
@@ -855,6 +853,8 @@ def stage_unpool(c, first_w):
                             )
                             for kc in range(UNP_STEPS)
                         ]
+                        if const_expr(k + 1 < KU):
+                            nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
                     else:
                         # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane
                         for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
@@ -862,7 +862,11 @@ def stage_unpool(c, first_w):
                             rocdl.raw_ptr_buffer_load_lds(
                                 r_f, (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr, 16, t0 * (MOE_HIDDEN * 2) + v * 16, fx.Int32(0), 0, CM_DEV  # fmt: skip
                             )
-                        rocdl.s_waitcnt(vmcnt=0)
+                        # the next job's weights go out behind this job's rows (loads
+                        # complete in order: issued before them, they would delay the rows)
+                        if const_expr(k + 1 < KU):
+                            nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
+                        rocdl.s_waitcnt(vmcnt=0)  # FIXME: also waits for ``nxt``; a counted wait would not
                         gpu.barrier()
                     if const_expr(k == 0):
                         stamp(c, 9)  # the first pass's rows issued / landed in LDS
@@ -891,6 +895,9 @@ def stage_unpool(c, first_w):
                     gpu.barrier()
                     if const_expr(k == 0):
                         stamp(c, 11)  # the first pass's rows pushed
+            else:
+                if const_expr(k + 1 < KU):
+                    nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
             if const_expr(k + 1 < KU):
                 cur = nxt
 
