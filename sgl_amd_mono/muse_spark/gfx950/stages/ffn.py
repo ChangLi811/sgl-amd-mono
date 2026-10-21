@@ -118,6 +118,7 @@ UNP_ROWS = 16  # unpooler rows an unpool task: the MFMA's M
 UNP_TASKS = HIDDEN // UNP_ROWS  # 512 row tiles, 1 / npes of them a rank
 UNP_STEPS = MOE_HIDDEN // WAVES // 32  # 16 bf16 MFMA steps a wave
 BND_ELEMS = HIDDEN // THREADS  # 16 elements a thread of a token's row
+UNP_DIRECT = True  # the unpool passes load the summed rows into VGPRs (else LDS DMA)
 assert XQW == THREADS and INTER == MOE_HIDDEN and UG_CHUNKS == 4 and DN_CHUNKS == 4
 assert TILE_COLS * (XQW + XSW) <= XS_LDS_MAX * MOE_HIDDEN // 2  # a staged tile fits ``xcol``
 assert MOE_HIDDEN == 8 * THREADS and HIDDEN == 16 * THREADS and TOP_K == 8
@@ -831,21 +832,39 @@ def stage_unpool(c, first_w):
                 for ps in range_constexpr(cdiv(S, XS_LDS_MAX)):
                     t0 = ps * XS_LDS_MAX
                     nt = min(XS_LDS_MAX, S - t0)
-                    # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane
-                    for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
-                        v = tid + THREADS * i
-                        rocdl.raw_ptr_buffer_load_lds(
-                            r_f, (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr, 16, t0 * (MOE_HIDDEN * 2) + v * 16, fx.Int32(0), 0, CM_DEV  # fmt: skip
-                        )
-                    rocdl.s_waitcnt(vmcnt=0)
-                    gpu.barrier()
-                    if const_expr(k == 0 and ps == 0):
-                        stamp(c, 9)  # the first pass's rows landed in LDS
                     tl = fx.min(l16, nt - 1)
+                    if const_expr(UNP_DIRECT):
+                        # the pass's rows straight into the B operands: lane (token tl, k
+                        # eighth of its wave) loads its 16 B a step, the 16 steps in flight
+                        # (64 VGPRs beside the weights); the DMA path costs ~4.5 us a pass
+                        fbs = [
+                            fx.Vector(
+                                bo.buffer_load(
+                                    r_f,
+                                    ((t0 + tl) * MOE_HIDDEN + wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4) // 2,
+                                    vec_width=4, dtype=T.i32, cache_modifier=CM_DEV,
+                                )  # fmt: skip
+                            )
+                            for kc in range(UNP_STEPS)
+                        ]
+                    else:
+                        # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane
+                        for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
+                            v = tid + THREADS * i
+                            rocdl.raw_ptr_buffer_load_lds(
+                                r_f, (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr, 16, t0 * (MOE_HIDDEN * 2) + v * 16, fx.Int32(0), 0, CM_DEV  # fmt: skip
+                            )
+                        rocdl.s_waitcnt(vmcnt=0)
+                        gpu.barrier()
+                    if const_expr(k == 0 and ps == 0):
+                        stamp(c, 9)  # the first pass's rows issued / landed in LDS
                     acc = fx.Vector.filled(4, 0.0, fx.Float32)
                     for kc in range_constexpr(UNP_STEPS):
-                        k0 = wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4
-                        fbv = fx.Vector(fx.ptr_load(xcol + (tl * (MOE_HIDDEN // 2) + k0 // 2), result_type=V4F))
+                        if const_expr(UNP_DIRECT):
+                            fbv = fbs[kc]
+                        else:
+                            k0 = wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4
+                            fbv = fx.Vector(fx.ptr_load(xcol + (tl * (MOE_HIDDEN // 2) + k0 // 2), result_type=V4F))
                         acc = mfma_bf16(cur[kc].bitcast(fx.BFloat16), fbv.bitcast(fx.BFloat16), acc)
                     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
                     gpu.barrier()
