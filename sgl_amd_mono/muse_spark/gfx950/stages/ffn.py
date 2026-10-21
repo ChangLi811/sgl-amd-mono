@@ -820,6 +820,7 @@ def stage_unpool(c, first_w):
     if live:
         rocdl.sched_barrier(0)
         poll_flags(c, [(c["fflag"], S * AP)])
+    stamp(c, 8)  # the fin flags arrived (unpool CTAs)
     if live:
         cur = first_w
         for k in range_constexpr(KU):
@@ -838,6 +839,8 @@ def stage_unpool(c, first_w):
                         )
                     rocdl.s_waitcnt(vmcnt=0)
                     gpu.barrier()
+                    if const_expr(k == 0 and ps == 0):
+                        stamp(c, 9)  # the first pass's rows landed in LDS
                     tl = fx.min(l16, nt - 1)
                     acc = fx.Vector.filled(4, 0.0, fx.Float32)
                     for kc in range_constexpr(UNP_STEPS):
@@ -846,6 +849,8 @@ def stage_unpool(c, first_w):
                         acc = mfma_bf16(cur[kc].bitcast(fx.BFloat16), fbv.bitcast(fx.BFloat16), acc)
                     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
                     gpu.barrier()
+                    if const_expr(k == 0 and ps == 0):
+                        stamp(c, 10)  # the first pass's MFMAs done
                     # branch = bf16(the fp32 sum over the waves, in wave order)
                     if tid < UNP_ROWS * nt:
                         fx.ptr_store(bf16_round(row_sum(red, tid % UNP_ROWS, tid // UNP_ROWS)), misc + tid)
@@ -857,6 +862,8 @@ def stage_unpool(c, first_w):
                         for pe in range_constexpr(W):
                             put_bf(c["peer_unp"][pe], (t0 + tk) * HIDDEN + gtask * UNP_ROWS + rr, vals)
                     gpu.barrier()
+                    if const_expr(k == 0 and ps == 0):
+                        stamp(c, 11)  # the first pass's rows pushed
             if const_expr(k + 1 < KU):
                 cur = nxt
 

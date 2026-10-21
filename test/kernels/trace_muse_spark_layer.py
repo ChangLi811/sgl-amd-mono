@@ -16,7 +16,7 @@ from test_muse_spark_layer import LAYER, LENS, Buffers, Layer, _attn_args, _epoc
 K1_STAMPS = ["entry", "x ready", "gemv done", "head/gate done"]
 KA_STAMPS = ["entry", "attention tasks done", "merge done"]
 K2_STAMPS = ["entry", "og done", "o tasks done", "a_part done", "x arrived", "passes done", "pooled out", "end"]
-K3_STAMPS = ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end"]
+K3_STAMPS = ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end", "unp flags", "unp dma", "unp mfma", "unp pushed"]
 
 
 def _stamps(scratch, layout, region, blocks, slots):
