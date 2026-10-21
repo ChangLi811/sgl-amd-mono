@@ -74,7 +74,7 @@ SGLANG_READS = {
         '"moe_ep_size"',
     ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
-    "srt/model_executor/forward_batch_info.py": ("contains_mm_inputs", "forward_mode", "is_decode"),
+    "srt/model_executor/forward_batch_info.py": ("contains_mm_inputs", "forward_mode", "is_decode", "out_cache_loc"),
     "srt/models/muse_spark_omni.py": (
         "MuseSparkForConditionalGeneration",
         "forward(input_ids)",
@@ -212,15 +212,30 @@ class _Built:
         stream = input_embeds.to(m.residual_dtype)
         attn_input = m.layers[0].self_attn_input_norm(stream)
         aux, last = [], len(m.layers) - 1
+        check = self.check and not torch.cuda.is_current_stream_capturing()
+        live = forward_batch.out_cache_loc[:rows] > 0 if check else None
         for i in range(len(m.layers)):
+            pre_norm_dtype = torch.bfloat16 if i == last else None
+            ref = self._reference(i, positions, forward_batch, stream, attn_input, pre_norm_dtype) if check else None  # fmt: skip
             stream, attn_input = r.launch(
                 i=i, rows=rows, positions=positions, forward_batch=forward_batch,
-                stream=stream, attn_input=attn_input,
-                pre_norm_dtype=torch.bfloat16 if i == last else None,
+                stream=stream, attn_input=attn_input, pre_norm_dtype=pre_norm_dtype,
             )  # fmt: skip
+            if ref is not None:
+                _log_check(i, live, (stream, attn_input), ref)
             if i in m.layers_to_capture:  # set after attach: read per step
                 aux.append(stream.to(torch.bfloat16))
         return attn_input, (aux if self.lm.capture_aux_hidden_states else None)
+
+    def _reference(self, i, positions, forward_batch, stream, attn_input, pre_norm_dtype):
+        """Check mode: SGLang's layer ``i`` on copies of the launch's inputs, returning
+        (stream, next attention input) as the launch does. It writes the same KV
+        slots with the same values, which the launch then writes again."""
+        m = self.model
+        return m.layers[i](
+            positions, stream.clone(), forward_batch, attn_input=attn_input.clone(),
+            ffn_boundary=m._ffn_boundaries[i], pre_norm_dtype=pre_norm_dtype,
+        )  # fmt: skip
 
     def _bind(self) -> None:
         """At the first routed forward, which every rank runs eagerly together: the
@@ -239,6 +254,20 @@ class _Built:
         if bad:
             raise ValueError("Muse Spark monokernels: " + "; ".join(bad))
         self.runner.bind(backend, pool)
+
+
+def _log_check(lid: int, live: torch.Tensor, got, ref) -> None:
+    """Check mode: the launch's outputs against SGLang's on the step's live rows: the
+    largest difference over the largest reference value, the least row cosine."""
+    if not bool(live.any()):
+        return
+    stats = []
+    for name, o, r in zip(("stream", "attn_input"), got, ref):
+        o, r = o[live].float(), r[live].float()
+        rel = ((o - r).abs().amax() / r.abs().amax().clamp_min(1e-30)).item()
+        cos = torch.nn.functional.cosine_similarity(o, r, dim=-1).min().item()
+        stats.append(f"{name} rel {rel:.5f} cosine {cos:.6f}")
+    logger.info("monokernel check layer %d, %d rows: %s", lid, int(live.sum()), "; ".join(stats))  # fmt: skip
 
 
 def _build(model, hf_config, ctx) -> _Built:
