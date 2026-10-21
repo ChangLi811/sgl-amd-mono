@@ -17,10 +17,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr.typing import as_ir_value
 
-from sgl_amd_mono.common import epoch as _epoch
-from sgl_amd_mono.common import guard as _guard
-from sgl_amd_mono.common import ops as _ops
-
 _PTR1 = "!llvm.ptr<1>"
 
 
@@ -85,8 +81,20 @@ def _stop_launch():
     _store(_gptr(0), fx.Int32(1), words=1, volatile=True)
 
 
+_DONE = None
+
+
 def install() -> list[str]:
-    """Install the bridge where FlyDSL lacks the API; the names installed."""
+    """Install the bridge where FlyDSL lacks the API (once); the names installed.
+    Imports the upstream modules it patches, which pull aiter: call it from the
+    builders, not at package import."""
+    global _DONE
+    if _DONE is not None:
+        return _DONE
+    from sgl_amd_mono.common import epoch as _epoch
+    from sgl_amd_mono.common import guard as _guard
+    from sgl_amd_mono.common import ops as _ops
+
     done = []
     if not hasattr(fx, "generic_store"):
         fx.generic_store = lambda ptr, value, volatile=False: _store(ptr, value, volatile=volatile)
@@ -107,7 +115,5 @@ def install() -> list[str]:
         _epoch.gstore = _gstore
         _guard.stop_launch = _stop_launch
         done += ["ops.global_ptr", "ops.global_load", "epoch.gstore", "guard.stop_launch"]
+    _DONE = done
     return done
-
-
-INSTALLED = install()

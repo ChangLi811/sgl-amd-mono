@@ -23,6 +23,9 @@ from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import (
     sym_layout,
 )
 
+from sgl_amd_mono.muse_spark.gfx950 import compat
+
+BRIDGE = compat.install()  # FlyDSL 0.3.2: the upstream helpers the image lacks
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 
