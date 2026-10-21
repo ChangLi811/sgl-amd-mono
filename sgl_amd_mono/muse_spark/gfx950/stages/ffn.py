@@ -118,7 +118,7 @@ UNP_ROWS = 16  # unpooler rows an unpool task: the MFMA's M
 UNP_TASKS = HIDDEN // UNP_ROWS  # 512 row tiles, 1 / npes of them a rank
 UNP_STEPS = MOE_HIDDEN // WAVES // 32  # 16 bf16 MFMA steps a wave
 BND_ELEMS = HIDDEN // THREADS  # 16 elements a thread of a token's row
-UNP_DIRECT = True  # the unpool passes load the summed rows into VGPRs (else LDS DMA)
+UNP_DIRECT = False  # the unpool passes load the summed rows into VGPRs (else LDS DMA; measured the same)
 assert XQW == THREADS and INTER == MOE_HIDDEN and UG_CHUNKS == 4 and DN_CHUNKS == 4
 assert TILE_COLS * (XQW + XSW) <= XS_LDS_MAX * MOE_HIDDEN // 2  # a staged tile fits ``xcol``
 assert MOE_HIDDEN == 8 * THREADS and HIDDEN == 16 * THREADS and TOP_K == 8
@@ -155,6 +155,7 @@ def k3_bases(tokens: int, npes: int) -> dict:
     unp0 = fin0 + tokens * parts
     stride = BLOCKS - unp0
     tasks = UNP_TASKS // npes
+    passes = cdiv(tokens, XS_LDS_MAX)  # token passes of XS_LDS_MAX: a job each
     assert UNP_TASKS % npes == 0 and stride > 0, (tokens, npes)
     return {
         "ar_parts": parts,
@@ -162,7 +163,9 @@ def k3_bases(tokens: int, npes: int) -> dict:
         "unp0": unp0,
         "unp_stride": stride,
         "unp_tasks": tasks,
-        "ku": cdiv(tasks, stride),
+        "unp_passes": passes,
+        "unp_jobs": tasks * passes,  # (row tile, token pass) pairs, spread over the unpool CTAs
+        "ku": cdiv(tasks * passes, stride),
     }
 
 
@@ -418,12 +421,16 @@ def dn_pair_loads(c, q, n_tiles):
 
 
 def unp_gtask(c, k):
-    """CTA ``bid``'s k-th unpool task: (its index among the rank's, its row tile of
-    the unpooler; outside the rank's tasks: the tile past the buffer, no traffic)."""
+    """CTA ``bid``'s k-th unpool job: (its index among the rank's jobs, its row tile of
+    the unpooler, its token pass; outside the rank's jobs: the tile past the buffer, no
+    traffic). A job is one row tile over one pass of XS_LDS_MAX tokens, so a wide
+    step's passes spread over the unpool CTAs instead of queuing on a tile's."""
     b = c["bases"]
-    task = c["bid"] - b["unp0"] + b["unp_stride"] * k
-    live = (task >= 0) & (task < b["unp_tasks"])
-    return task, live.select(c["rank"] * b["unp_tasks"] + task, fx.Int32(UNP_TASKS))
+    job = c["bid"] - b["unp0"] + b["unp_stride"] * k
+    live = (job >= 0) & (job < b["unp_jobs"])
+    tile = job // b["unp_passes"]
+    ps = job % b["unp_passes"]
+    return job, live.select(c["rank"] * b["unp_tasks"] + tile, fx.Int32(UNP_TASKS)), ps
 
 
 def unp_w_loads(c, gtask):
@@ -816,8 +823,9 @@ def stage_unpool(c, first_w):
     V4F = fx.Vector.make_type(4, fx.Float32)
     l16, g4 = lane % 16, lane // 16
     r_f = rsrc(c["fbuf"].value)
-    task0, _ = unp_gtask(c, 0)
-    live = (task0 >= 0) & (task0 < b["unp_tasks"])
+    assert S % XS_LDS_MAX == 0, S  # a job is one whole pass of XS_LDS_MAX tokens
+    task0, _, _ = unp_gtask(c, 0)
+    live = (task0 >= 0) & (task0 < b["unp_jobs"])
     if live:
         rocdl.sched_barrier(0)
         poll_flags(c, [(c["fflag"], S * AP)])
@@ -825,13 +833,13 @@ def stage_unpool(c, first_w):
     if live:
         cur = first_w
         for k in range_constexpr(KU):
-            task, gtask = unp_gtask(c, k)
+            task, gtask, job_ps = unp_gtask(c, k)
             if const_expr(k + 1 < KU):
                 nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
-            if task < b["unp_tasks"]:
-                for ps in range_constexpr(cdiv(S, XS_LDS_MAX)):
-                    t0 = ps * XS_LDS_MAX
-                    nt = min(XS_LDS_MAX, S - t0)
+            if task < b["unp_jobs"]:
+                if const_expr(True):  # the job's token pass (every served width is whole passes)
+                    t0 = job_ps * XS_LDS_MAX
+                    nt = XS_LDS_MAX
                     tl = fx.min(l16, nt - 1)
                     if const_expr(UNP_DIRECT):
                         # the pass's rows straight into the B operands: lane (token tl, k
@@ -856,7 +864,7 @@ def stage_unpool(c, first_w):
                             )
                         rocdl.s_waitcnt(vmcnt=0)
                         gpu.barrier()
-                    if const_expr(k == 0 and ps == 0):
+                    if const_expr(k == 0):
                         stamp(c, 9)  # the first pass's rows issued / landed in LDS
                     acc = fx.Vector.filled(4, 0.0, fx.Float32)
                     for kc in range_constexpr(UNP_STEPS):
@@ -868,7 +876,7 @@ def stage_unpool(c, first_w):
                         acc = mfma_bf16(cur[kc].bitcast(fx.BFloat16), fbv.bitcast(fx.BFloat16), acc)
                     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
                     gpu.barrier()
-                    if const_expr(k == 0 and ps == 0):
+                    if const_expr(k == 0):
                         stamp(c, 10)  # the first pass's MFMAs done
                     # branch = bf16(the fp32 sum over the waves, in wave order)
                     if tid < UNP_ROWS * nt:
@@ -881,7 +889,7 @@ def stage_unpool(c, first_w):
                         for pe in range_constexpr(W):
                             put_bf(c["peer_unp"][pe], (t0 + tk) * HIDDEN + gtask * UNP_ROWS + rr, vals)
                     gpu.barrier()
-                    if const_expr(k == 0 and ps == 0):
+                    if const_expr(k == 0):
                         stamp(c, 11)  # the first pass's rows pushed
             if const_expr(k + 1 < KU):
                 cur = nxt
@@ -970,7 +978,7 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None):
     stamp(c, 4)  # this CTA's dn items done
     # the unpool CTAs' first task's weights go out now, behind nothing, so the fin
     # hops stream them; the fin CTAs carry none (their tile is past the buffer)
-    first_w = unp_w_loads(c, unp_gtask(c, 0)[1])
+    first_w = unp_w_loads(c, unp_gtask(c, 0)[1])  # the first job's tile
     rocdl.sched_barrier(0)
     if (bid >= b["fin0"]) & (bid < b["fin0"] + S * AP):
         stage_fin(c, (bid - b["fin0"]) // AP, (bid - b["fin0"]) % AP)
