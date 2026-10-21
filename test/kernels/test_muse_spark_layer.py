@@ -60,7 +60,7 @@ def _fp4_weight(experts, rows, k, device, gen):
 class Layer:
     """One MXFP4 layer's weights and caches, and a step's inputs, on the device."""
 
-    def __init__(self, S, ql, dev, seed):
+    def __init__(self, S, ql, dev, seed, lens=None, window=0):
         from sgl_amd_mono.muse_spark.gfx950.config import (
             EXPERTS,
             HEAD_DIM,
@@ -77,7 +77,7 @@ class Layer:
         gen = torch.Generator(device=dev).manual_seed(seed)
         torch.manual_seed(seed)
         bf = torch.bfloat16
-        self.S, self.ql, self.dev = S, ql, dev
+        self.S, self.ql, self.dev, self.window = S, ql, dev, window
         R = S // ql
         self.x0 = torch.randn(S, HIDDEN, device=dev).to(bf)  # the layer's attention input
         self.res0 = torch.randn(S, HIDDEN, device=dev)  # the residual stream before it
@@ -85,7 +85,8 @@ class Layer:
         self.w_qkvg1 = (torch.randn(QKVG_ROWS, HIDDEN, device=dev) * 0.02).to(bf)  # the next layer's
         self.cos_sin = _cos_sin(dev)
         self.positions = torch.randint(0, POSITIONS, (S,), device=dev, dtype=torch.int64)
-        lens = LENS[:R]
+        lens = list(lens) if lens is not None else LENS[:R]
+        self.lens = lens
         self.seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
         self.prefix = (self.seq_lens - ql).contiguous()
         # this layer's cache: random keys, distinct pages a request, the step's rows at the end
@@ -180,7 +181,7 @@ def _k1(launch, L, B, x, w, k_cache, v_cache, epoch, layer, use_swa, stream):
 def _attn_args(L, B):
     return (
         B.q.data_ptr(), B.o.data_ptr(), L.k_cache.data_ptr(), L.v_cache.data_ptr(), L.table.data_ptr(),
-        MAX_BLOCKS, L.table.numel() * 4, L.prefix.data_ptr(), 0, L.ql, 0, 0, L.scale_bits,
+        MAX_BLOCKS, L.table.numel() * 4, L.prefix.data_ptr(), 0, L.ql, L.window, 0, L.scale_bits,
         B.scratch_a.data_ptr(),
     )  # fmt: skip
 
@@ -363,6 +364,28 @@ def main():
             for mode, timer in (("eager", _time), ("graph", _time_graph)):
                 t = {n: timer(f) for n, f in fns}
                 print(f"S={S:2d} {mode:5s}: " + "  ".join(f"{n} {v * 1000:7.1f} us" for n, v in t.items()) + f"   (lens {LENS[:S // ql]})")
+        finally:
+            B.close()
+    # the attention at the server's shapes: the sliding layers (window 2047) and the full
+    # layers over the AgentX context, graph replay
+    from sgl_amd_mono.muse_spark.gfx950.layer import KAttnBuild, build_kattn
+
+    for S, window, lens in (
+        (8, 0, [95000]), (8, 2047, [95000]), (8, 2047, [2500]), (8, 0, [20000]),
+        (16, 0, [95000, 60000]), (16, 2047, [95000, 60000]),
+        (32, 0, [95000, 300, 17, 60000]), (32, 2047, [95000, 300, 17, 60000]),
+        (64, 0, LENS), (64, 2047, LENS),
+    ):
+        ql = 8
+        L = Layer(S, ql, dev, seed=50 + S, lens=lens, window=window)
+        ka = build_kattn(KAttnBuild(tokens=S, q_len=ql))
+        epoch = _epoch(dev, deadline_s=60.0)
+        B = Buffers(S, ql, dev)
+        try:
+            B.q.normal_().mul_(5.47)
+            def fn():
+                ka(*_attn_args(L, B), epoch.data_ptr(), LAYER, stream=cur()); epoch[0] += 1
+            print(f"attn S={S:2d} window={window:4d} lens={lens}: graph {_time_graph(fn) * 1000:7.1f} us")
         finally:
             B.close()
 
