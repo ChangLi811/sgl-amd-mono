@@ -8,10 +8,11 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, rocdl
+from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from sgl_amd_mono.common.ops import clock, rsrc, uniform
+from sgl_amd_mono.common.plan import THREADS
 from sgl_amd_mono.muse_spark.gfx950.config import LAYER_SLOTS
 
 
@@ -52,3 +53,20 @@ def stamp(c, idx: int):
         addr = c["trace"].value + fx.Int64((c["bid"] * TRACE_SLOTS + idx) * 8)
         ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
         llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
+
+
+@flyc.jit
+def poll_flags(c, regions):
+    """Wait for the flags ``regions`` = [(region, n), ...] (flags 0 .. n of each),
+    one flag a thread, then a barrier and an acquire: one round trip whatever the
+    count (a thread polling every flag takes a round trip per ``POLL_MAX`` specs).
+    Every thread of the CTA must call it (the barrier)."""
+    tid = c["tid"]
+    off = 0
+    for region, n in regions:
+        if (tid >= off) & (tid < off + n):
+            c["poll"]([(region, tid - off, 1)])
+        off += n
+    assert off <= THREADS, off
+    gpu.barrier()
+    acquire_loads()

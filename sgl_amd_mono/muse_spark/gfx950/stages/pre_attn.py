@@ -56,7 +56,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     V_OFF,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, poll_flags, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ELEMS,
     GATE_TASKS,
@@ -339,8 +339,7 @@ def run_k1(c, bid, x_flag=None):
     if const_expr(x_flag is not None):
         first = [gemv_w_batch(c, bid // HALVES, bid % HALVES, b, c["args"]["w"]) for b in range(2)]
         rocdl.sched_barrier(0)
-        c["poll"]([(x_flag, t, 1) for t in range(c["S"])])
-        acquire_loads()
+        poll_flags(c, [(x_flag, c["S"])])
     stamp(c, 1)  # x arrived (a merged launch) / entry
     stage_x(c)
     stage_gemv(c, bid, first)

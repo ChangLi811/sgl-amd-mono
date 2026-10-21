@@ -88,7 +88,7 @@ def main():
             ("2 gemv tasks", cta < 32), ("head tasks", (cta >= 32) & (cta < 52)), ("gate tasks", (cta >= 52) & (cta < 68)), ("1 gemv task", cta >= 68),
         ])  # fmt: skip
         _report("K-attn", _stamps(B.scratch_a, kattn_scratch_layout(S, ql), "attn_trace", BLOCKS, TRACE_SLOTS), KA_STAMPS, [
-            ("merge CTAs", cta < (S // ql) * 2 * 4), ("other CTAs", cta >= (S // ql) * 2 * 4),
+            ("merge CTAs", cta >= BLOCKS - (S // ql) * 2 * 4), ("other CTAs", cta < BLOCKS - (S // ql) * 2 * 4),
         ])  # fmt: skip
         chain0 = post_attn.CHAIN0
         _report("K2", _stamps(B.scratch_k2, post_attn.k2_scratch_layout(), "k2_trace", BLOCKS, TRACE_SLOTS), K2_STAMPS, [

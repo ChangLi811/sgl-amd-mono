@@ -83,7 +83,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     TOP_K,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, release_stores, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, poll_flags, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import (
     e2m1_code,
     lanes_before,
@@ -819,8 +819,7 @@ def stage_unpool(c, first_w):
     live = (task0 >= 0) & (task0 < b["unp_tasks"])
     if live:
         rocdl.sched_barrier(0)
-        poll([(c["fflag"], f, 1) for f in range(S * AP)])
-        acquire_loads()
+        poll_flags(c, [(c["fflag"], S * AP)])
     if live:
         cur = first_w
         for k in range_constexpr(KU):
@@ -935,9 +934,7 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None):
     AP = c["ar_parts"]
     stamp(c, 0)
     if const_expr(route_flag is not None):
-        c["poll"]([(route_flag, t, 1) for t in range(S)])
-        c["poll"]([(xin_flag, t, 1) for t in range(S)])
-        acquire_loads()
+        poll_flags(c, [(route_flag, S), (xin_flag, S)])
     stamp(c, 1)  # the routing and expert input arrived (a merged launch) / entry
     n_tiles = stage_plan(c)
     stamp(c, 2)  # the plan built

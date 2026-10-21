@@ -377,10 +377,11 @@ def run_kattn(c, o_flag=None):
     # a thread: row 16 rt + tid / 32 (clamped past ROWS: its output is not
     # written), dims 8 ((tid / 4) % 8) .., every fourth partition from tid % 4,
     # two a spin; the four partition groups' partials combine in LDS
-    if bid < R * LOCAL_KV_HEADS * ROW_TILES:
-        rt = bid % ROW_TILES
-        h = (bid // ROW_TILES) % LOCAL_KV_HEADS
-        r = bid // (ROW_TILES * LOCAL_KV_HEADS)
+    mbid = BLOCKS - 1 - bid  # the last CTAs: the attention task loop's extra tasks sit on the first
+    if mbid < R * LOCAL_KV_HEADS * ROW_TILES:
+        rt = mbid % ROW_TILES
+        h = (mbid // ROW_TILES) % LOCAL_KV_HEADS
+        r = mbid // (ROW_TILES * LOCAL_KV_HEADS)
         keys = seq_len_of(r)
         lo, hi = chunk_range(keys, 0)
         p_lo = fx.Int32(0)
@@ -415,12 +416,12 @@ def run_kattn(c, o_flag=None):
                 fx.Vector.from_elements([g[1 + j // 2][j % 2].bitcast(fx.Float32) for j in range(8)], fx.Float32),  # fmt: skip
             )
 
-        for gi in range(0, (p_hi - p_lo + 7) // 8):
-            p0 = p_lo + gi * 8 + pg
-            p1 = p0 + 4
-            got = poll(specs(fx.min(p0, p_hi - 1)) + specs(fx.min(p1, p_hi - 1)))
-            m, l, ov = fold(m, l, ov, *words(got[0:5]), p0 < p_hi)
-            m, l, ov = fold(m, l, ov, *words(got[5:10]), p1 < p_hi)
+        # four partitions a thread a spin (16 a spin over the four groups), one round trip
+        for gi in range(0, (p_hi - p_lo + 15) // 16):
+            ps = [p_lo + gi * 16 + pg + 4 * k for k in range(4)]
+            got = poll(sum([specs(fx.min(pk, p_hi - 1)) for pk in ps], []), batch=20)
+            for k in range_constexpr(4):
+                m, l, ov = fold(m, l, ov, *words(got[5 * k : 5 * k + 5]), ps[k] < p_hi)
         slot = comb + (((row16 * 8 + dch) * 4 + pg) * 10)
         fx.ptr_store(m, slot)
         fx.ptr_store(l, slot + 1)

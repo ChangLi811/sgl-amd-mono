@@ -92,7 +92,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     ROUTER_MULT,
     TOP_K,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, release_stores, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, poll_flags, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     GQA,
     K_STEP,
@@ -590,10 +590,9 @@ def x_gemv(c, rg, bufs, publish, t0, nt, part=None):
 @flyc.jit
 def wait_x(c):
     """The tokens' x flags, then device-scope loads."""
-    S, poll, xflag = c["S"], c["poll"], c["xflag"]
+    S, xflag = c["S"], c["xflag"]
     rocdl.sched_barrier(0)
-    poll([(xflag, t, 1) for t in range(S)])
-    acquire_loads()
+    poll_flags(c, [(xflag, S)])
 
 
 @flyc.jit
@@ -653,7 +652,8 @@ def stage_route(c, t, route_flag=None):
                 (logits, (p * MAX_TOKENS + t) * EXPERTS + lane + 64 * h, 1)
                 for p in range(R_PARTS)
                 for h in range(4)
-            ]
+            ],
+            batch=4 * R_PARTS,  # one round trip for the parts' logits
         )
         keys = []
         for h in range_constexpr(4):
