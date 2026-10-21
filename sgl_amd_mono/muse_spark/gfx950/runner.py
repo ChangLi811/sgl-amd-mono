@@ -1,21 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 """One rank's Muse Spark launches on gfx950.
 
-Stage 0: every launch is SGLang's own ROCm decoder layer (``MuseSpark1xDecoderLayer``
-with the model's fused cross-layer FFN boundary), so a routed step's output is
-identical to the normal path. The runner already binds and checks the attention
-backend and the KV pool the kernels will read, at the first routed forward.
+A decoder layer with MXFP4 experts runs as K1 (``stages/pre_attn``: the fused
+projection, the q / k norms and query scale, RoPE, the fp8 cache write), K-attn
+(``stages/attention``: the verify attention over the cache), K2
+(``stages/post_attn``: o-norm-gate, o_proj with the attention all-reduce, the
+attention boundary, router / pooler, top-8, the pre-expert norm) and K3
+(``stages/ffn``: the experts, finalize with the EP all-reduce, the sharded
+unpooler, the FFN boundary). The bf16-expert layers (0 and 61) run SGLang's own
+decoder layer, as the stage-0 plugin did. A launch takes ``(stream, attn_input)``,
+the fp32 residual stream (updated in place) and the layer's bf16 attention input,
+and hands on the next pair.
+
+Everything but the caches is allocated at construction, before SGLang sizes the
+KV cache. The caches, the SWA slot table and the attention backend are bound at
+the first forward (``bind``). Word 0 of the epoch buffer is the step: the host
+moves it on after a step's last launch, which keeps a layer's mailbox tags
+distinct from the same layer's one step earlier; words 1-5 are the guard block.
 """
 
 from __future__ import annotations
 
 import inspect
 import os
+import struct
 from pathlib import Path
 
 import torch
 
-from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, PAGE, WINDOW
+from sgl_amd_mono.common import guard
+from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.muse_spark.gfx950.config import (
+    HEAD_DIM,
+    HIDDEN,
+    KV_K,
+    LAYER_SLOTS,
+    LOCAL_KV_HEADS,
+    MAX_TOKENS,
+    MOE_HIDDEN,
+    PAGE,
+    Q_K,
+    SOFTMAX_SCALE,
+    TOP_K,
+    WINDOW,
+)
+from sgl_amd_mono.muse_spark.gfx950.layout import (
+    k1_scratch_layout,
+    kattn_scratch_layout,
+    scratch_bytes,
+)
 
 # The SGLang names the runner reads, by file under the sglang package;
 # test/unit/test_contract.py pins them.
@@ -27,19 +60,43 @@ SGLANG_READS = {
         "use_triton_unified_attention",
         "use_sliding_window_kv_pool",
         "token_to_kv_pool",
+        "forward_metadata",
+        "swa_page_table",
+        "kv_indices",
+        "k_scale",
+        "v_scale",
     ),
-    "srt/mem_cache/swa_memory_pool.py": ("SWAKVPool", "layers_mapping", "get_kv_buffer"),
+    "srt/mem_cache/swa_memory_pool.py": (
+        "SWAKVPool",
+        "layers_mapping",
+        "get_kv_buffer",
+        "full_to_swa_index_mapping",
+    ),
     "srt/rocm_muse_spark/model.py": (
         "forward(attn_input)",
         "forward(ffn_boundary)",
         "forward(pre_norm_dtype)",
         "self_attn",
         "attn",
+        "mlp",
+        "local_expert_start",
     ),
-    "srt/layers/radix_attention.py": ("sliding_window_size", "layer_id"),
+    "srt/layers/radix_attention.py": ("sliding_window_size", "layer_id", "scaling"),
+    "srt/model_executor/forward_batch_info.py": (
+        "out_cache_loc",
+        "seq_lens",
+        "forward_mode",
+        "is_target_verify",
+    ),
 }
 
 FP8_CACHE = torch.float8_e4m3fn
+# SGLANG_AMD_MONO_MUSE_KERNELS=0: every layer on SGLang's modules (the stage-0 plugin)
+USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
+
+
+def _ptr(t: torch.Tensor) -> int:
+    return t.data_ptr()
 
 
 def no_capture(what: str) -> None:
@@ -76,21 +133,121 @@ def _ensure_writable_flydsl_cache() -> None:
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = str(path)
 
 
+def _f32_bits(value: float) -> int:
+    return struct.unpack("i", struct.pack("f", value))[0]
+
+
 class MuseMonoRunner:
-    def __init__(self, *, layers, boundaries, rank: int, npes: int, device):
-        self.layers = list(layers)
-        self.boundaries = list(boundaries)
-        self.rank, self.npes, self.device = rank, npes, device
+    """The buffers, kernels and launches of one TP rank's Muse Spark layers."""
+
+    def __init__(self, *, views, modules, boundaries, rank: int, npes: int, cpu_group, device):
+        from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_scratch_layout
+        from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import k2_scratch_layout, sym_bytes
+
+        _ensure_writable_flydsl_cache()
+        assert len(views) == len(modules) == len(boundaries) <= LAYER_SLOTS
+        self.views, self.modules, self.boundaries = list(views), list(modules), list(boundaries)
+        self.rank, self.npes, self.device = rank, npes, torch.device(device)
+        self.use_kernels = USE_KERNELS
+        self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
+        dev, bf16 = self.device, torch.bfloat16
         self.deadline_s = None
+        self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+        self.scratch_k1 = torch.zeros(scratch_bytes(k1_scratch_layout()), dtype=torch.uint8, device=dev)
+        self.scratch_attn = torch.zeros(
+            max(scratch_bytes(kattn_scratch_layout(MAX_TOKENS, q)) for q in (1, 8)),
+            dtype=torch.uint8, device=dev,
+        )  # fmt: skip
+        self.scratch_k2 = torch.zeros(scratch_bytes(k2_scratch_layout()), dtype=torch.uint8, device=dev)
+        self.scratch_k3 = torch.zeros(scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev)
+        # the peers' error flags follow the partial-row regions (Guard's flags_offset);
+        # the handshake is collective: every rank gets here (attach agreed first)
+        self.peers = PeerBuffer(sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev)
+        self.peers.bytes.zero_()
+        # row k = token k of the step
+        self.q = torch.empty(MAX_TOKENS, Q_K, dtype=bf16, device=dev)
+        self.k = torch.empty(MAX_TOKENS, KV_K, dtype=bf16, device=dev)
+        self.v = torch.empty(MAX_TOKENS, KV_K, dtype=bf16, device=dev)
+        self.g = torch.empty(MAX_TOKENS, Q_K, dtype=bf16, device=dev)
+        self.o = torch.empty(MAX_TOKENS, Q_K, dtype=bf16, device=dev)
+        self.ids = torch.empty(MAX_TOKENS, TOP_K, dtype=torch.int32, device=dev)
+        self.scores = torch.empty(MAX_TOKENS, TOP_K, dtype=torch.float32, device=dev)
+        self.xin = torch.empty(MAX_TOKENS, MOE_HIDDEN, dtype=bf16, device=dev)
+        self.attn_in = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        # K1 reads the cos / sin table of every token: a NoPE layer takes any table
+        tables = [L.cos_sin for L in self.views if L.cos_sin is not None]
+        if not tables:
+            raise RuntimeError("Muse Spark monokernels: no rotary table")
+        self.any_cos_sin = tables[0]
+        self._k1: dict = {}
+        self._kattn: dict = {}
+        self._k2: dict = {}
+        self._k3: dict = {}
         self.backend = None
         self.pool = None
+        self.caches = None  # per layer: (k cache ptr, v cache ptr, is a sliding layer)
+        self.swa_map = None
+        self.windows = None
 
     def set_deadline(self, seconds: float) -> None:
+        """Every wait's deadline, as the guard block's clock ticks."""
         self.deadline_s = float(seconds)
+        ticks = guard.deadline_ticks(seconds)
+        lo = ticks & 0xFFFFFFFF
+        self.epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
+        self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
-    def precompile(self, rows: int) -> None:
-        """Stage 0 builds no kernel."""
+    # ---------------------------------------------------------------- kernels
+    def k1_kernel(self, rows: int):
+        if rows not in self._k1:
+            from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, build_k1
 
+            no_capture(f"the {rows}-row K1 first reached")
+            self._k1[rows] = build_k1(K1Build(tokens=rows, fault_site=self.fault_site, fault_after=self.fault_after))
+        return self._k1[rows]
+
+    def kattn_kernel(self, rows: int, q_len: int):
+        if (rows, q_len) not in self._kattn:
+            from sgl_amd_mono.muse_spark.gfx950.layer import KAttnBuild, build_kattn
+
+            no_capture(f"the {rows}-row K-attn first reached")
+            self._kattn[(rows, q_len)] = build_kattn(
+                KAttnBuild(tokens=rows, q_len=q_len, fault_site=self.fault_site, fault_after=self.fault_after)
+            )
+        return self._kattn[(rows, q_len)]
+
+    def k2_kernel(self, rows: int):
+        if rows not in self._k2:
+            from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, build_k2
+
+            no_capture(f"the {rows}-row K2 first reached")
+            self._k2[rows] = build_k2(
+                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after)
+            )
+        return self._k2[rows]
+
+    def k3_kernel(self, rows: int):
+        if rows not in self._k3:
+            from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
+
+            no_capture(f"the {rows}-row K3 first reached")
+            self._k3[rows] = build_k3(
+                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after)
+            )
+        return self._k3[rows]
+
+    def precompile(self, rows: int, q_len: int = 8) -> None:
+        """Compile every launch of a width (FlyDSL's disk cache then serves the
+        other ranks and the next start)."""
+        if not self.use_kernels:
+            return
+        compile_only(self.k1_kernel(rows))
+        if rows % q_len == 0:
+            compile_only(self.kattn_kernel(rows, q_len))
+        compile_only(self.k2_kernel(rows))
+        compile_only(self.k3_kernel(rows))
+
+    # ---------------------------------------------------------------- caches
     def cache_reasons(self, backend, pool) -> list[str]:
         """Why the kernels cannot read this backend's caches (empty: they can)."""
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -106,27 +263,108 @@ class MuseMonoRunner:
             why.append("the kernels mirror aiter's unified attention")
         if not backend.use_sliding_window_kv_pool or type(pool).__name__ != "SWAKVPool":
             return why + [f"KV pool {type(pool).__name__}, the kernels read the sliding-window pool"]
-        for i, layer in enumerate(self.layers):
+        m = pool.full_to_swa_index_mapping
+        if m is None or m.dtype not in (torch.int32, torch.int64) or not m.is_contiguous():
+            why.append("no contiguous int32 / int64 full-to-SWA slot table")
+        for name in ("k_scale", "v_scale"):
+            s = getattr(backend, name, None)
+            if s is not None and (not isinstance(s, torch.Tensor) or s.numel() != 1 or float(s) != 1.0):
+                why.append(f"backend {name} {s}: the kernels write fp8 at unit scale")
+        for i, layer in enumerate(self.modules):
             attn = layer.self_attn.attn
+            if attn.k_scale is not None or attn.v_scale is not None:
+                why.append(f"layer {i}: a per-layer K / V scale")
             _, is_swa = pool.layers_mapping[attn.layer_id]
             if is_swa != (attn.sliding_window_size == WINDOW):
                 why.append(f"layer {i}: pool {'sliding' if is_swa else 'full'} vs window {attn.sliding_window_size}")
             k, v = pool.get_kv_buffer(attn.layer_id)
             for t, what in ((k, "K"), (v, "V")):
-                if not (t.dtype == FP8_CACHE and tuple(t.shape[-2:]) == (LOCAL_KV_HEADS, HEAD_DIM)):
-                    why.append(f"layer {i} {what} cache: {t.dtype} {tuple(t.shape)}, want {FP8_CACHE} [*, {LOCAL_KV_HEADS}, {HEAD_DIM}]")  # fmt: skip
+                if not (t.dtype == FP8_CACHE and t.is_contiguous() and t.dim() == 3 and tuple(t.shape[-2:]) == (LOCAL_KV_HEADS, HEAD_DIM)):  # fmt: skip
+                    why.append(f"layer {i} {what} cache: {t.dtype} {tuple(t.shape)}, want contiguous {FP8_CACHE} [*, {LOCAL_KV_HEADS}, {HEAD_DIM}]")  # fmt: skip
         return why
 
     def bind(self, backend, pool) -> None:
+        """The layers' caches, windows and the SWA slot table, after SGLang sized them."""
+        no_capture("the caches bound")
+        self.caches, self.windows = [], []
+        for layer in self.modules:
+            attn = layer.self_attn.attn
+            _, is_swa = pool.layers_mapping[attn.layer_id]
+            k, v = pool.get_kv_buffer(attn.layer_id)
+            self.caches.append((_ptr(k), _ptr(v), bool(is_swa)))
+            w = int(attn.sliding_window_size or -1)
+            self.windows.append(w if w > 0 else 0)
+        self.swa_map = pool.full_to_swa_index_mapping
         self.backend, self.pool = backend, pool
 
-    def launch(self, *, i: int, rows: int, positions, forward_batch, stream, attn_input, pre_norm_dtype):
-        """Layer ``i`` on ``rows`` rows: (stream, next layer's attention input)."""
-        return self.layers[i](
-            positions,
-            stream,
-            forward_batch,
-            attn_input=attn_input,
-            ffn_boundary=self.boundaries[i],
-            pre_norm_dtype=pre_norm_dtype,
-        )
+    # ---------------------------------------------------------------- launches
+    def _attn_args(self, i: int, rows: int, forward_batch, q_len: int) -> tuple:
+        """K-attn's arguments after q and o for layer ``i``: the cache, the page
+        table, the lengths, the window, the scale, the scratch."""
+        meta = self.backend.forward_metadata
+        k_cache, v_cache, is_swa = self.caches[i]
+        table = meta.swa_page_table if is_swa else meta.kv_indices
+        if table is None or table.dtype != torch.int32 or table.dim() != 2 or not table.is_contiguous():
+            raise RuntimeError(f"K-attn layer {i}: page table {None if table is None else (table.dtype, tuple(table.shape))}")  # fmt: skip
+        lens = forward_batch.seq_lens
+        if lens.dtype not in (torch.int32, torch.int64) or lens.numel() * q_len < rows:
+            raise RuntimeError(f"K-attn: seq_lens {lens.dtype} {tuple(lens.shape)}")
+        extra = q_len if forward_batch.forward_mode.is_target_verify() else 0
+        scale = float(self.modules[i].self_attn.attn.scaling)
+        return (
+            k_cache, v_cache, _ptr(table), table.shape[1], table.numel() * 4, _ptr(lens),
+            int(lens.dtype == torch.int64), extra, self.windows[i], 0, _f32_bits(scale),
+            _ptr(self.scratch_attn),
+        )  # fmt: skip
+
+    def launch(self, *, i: int, rows: int, q_len: int, positions, forward_batch, stream, attn_input, pre_norm_dtype):
+        """Layer ``i`` on ``rows`` rows (``q_len`` a request): (stream, next
+        layer's attention input)."""
+        L = self.views[i]
+        if not (self.use_kernels and L.kind == "mxfp4" and rows % q_len == 0):
+            return self.modules[i](
+                positions, stream, forward_batch, attn_input=attn_input,
+                ffn_boundary=self.boundaries[i], pre_norm_dtype=pre_norm_dtype,
+            )  # fmt: skip
+        if self.pool is None:
+            raise RuntimeError("Muse Spark monokernels: launch before bind")
+        if not (stream.dtype == torch.float32 and stream.is_contiguous() and tuple(stream.shape) == (rows, HIDDEN)):
+            raise RuntimeError(f"Muse Spark launch: stream {tuple(stream.shape)} {stream.dtype}")
+        if not (attn_input.dtype == torch.bfloat16 and attn_input.is_contiguous() and tuple(attn_input.shape) == (rows, HIDDEN)):  # fmt: skip
+            raise RuntimeError(f"Muse Spark launch: attention input {tuple(attn_input.shape)} {attn_input.dtype}")
+        slots = forward_batch.out_cache_loc
+        if slots.dtype not in (torch.int32, torch.int64) or slots.numel() < rows:
+            raise RuntimeError(f"Muse Spark launch: out_cache_loc {slots.dtype} {tuple(slots.shape)}")
+        k_cache, v_cache, is_swa = self.caches[i]
+        m = self.swa_map
+        cur = torch.cuda.current_stream()
+        cos_sin = L.cos_sin if L.cos_sin is not None else self.any_cos_sin
+        self.k1_kernel(rows)(
+            _ptr(attn_input), _ptr(L.w_qkvg), _ptr(cos_sin), _ptr(positions), _ptr(slots), _ptr(m),
+            k_cache, v_cache, _ptr(self.q), _ptr(self.k), _ptr(self.v), _ptr(self.g),
+            _ptr(self.scratch_k1), _ptr(self.epoch), i, int(L.use_rope), int(is_swa),
+            int(slots.dtype == torch.int64), int(m.dtype == torch.int64), stream=cur,
+        )  # fmt: skip
+        self.kattn_kernel(rows, q_len)(
+            _ptr(self.q), _ptr(self.o), *self._attn_args(i, rows, forward_batch, q_len),
+            _ptr(self.epoch), i, stream=cur,
+        )  # fmt: skip
+        self.k2_kernel(rows)(
+            _ptr(self.o), _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta),
+            _ptr(L.pre_w), _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool),
+            _ptr(L.xn_w), _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
+            self.peers.local, _ptr(self.peers.addresses), self.rank, _ptr(self.epoch), i, stream=cur,
+        )  # fmt: skip
+        last = i == len(self.modules) - 1
+        self.k3_kernel(rows)(
+            _ptr(self.xin), _ptr(self.ids), _ptr(self.scores), int(self.modules[i].mlp.local_expert_start),
+            _ptr(L.w13), _ptr(L.s13), _ptr(L.w2), _ptr(L.s2), _ptr(L.pen_w), _ptr(stream), _ptr(L.pfw),
+            _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw), _ptr(L.w_unpool), _ptr(self.attn_in),
+            _ptr(self.scratch_k3), self.peers.local, _ptr(self.peers.addresses), self.rank,
+            _ptr(self.epoch), i, int(last), stream=cur,
+        )  # fmt: skip
+        return stream, self.attn_in[:rows]
+
+    def end_step(self) -> None:
+        """The next step's epoch, enqueued after this step's last launch."""
+        self.epoch[0].add_(1)

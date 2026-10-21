@@ -9,9 +9,12 @@ forward, which re-enters this one with the embeddings; a text batch embeds and
 normalizes here. The backbone is ``MuseSpark1xModel.forward`` with every decoder
 layer as one runner launch; SGLang's logits processor closes the step.
 
-Stage 0: each launch is SGLang's own layer, so the output is identical to the
-normal path and any GSM8K drift isolates the wiring (routing, capture, the aux
-list, the multimodal re-entry), not numerics.
+Each MXFP4 layer runs as the K1 / K-attn / K2 / K3 launches (``gfx950/runner.py``);
+the bf16-expert layers run SGLang's own layer. ``SGLANG_AMD_MONO_MUSE_KERNELS=0``
+keeps every layer on SGLang's modules (stage 0: the output is then identical to
+the normal path, which isolates the wiring from the numerics). Check mode
+(``SGLANG_AMD_MONO_CHECK=1``, graphs off) runs SGLang's layer on a copy of every
+launch's input and logs each layer's rel / cosine on the live rows.
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ SGLANG_READS = {
         "NumericsKind",
         "Requirements",
         "rows",
+        "tokens_per_request",
     ),
     "srt/monokernels/runtime.py": ('"target_verify"', '"decode"'),
     "srt/arg_groups/fields/*.py": (
@@ -66,6 +70,9 @@ SGLANG_READS = {
     ),
     "srt/runtime_context.py": (
         "get_parallel",
+        "get_spec",
+        '"speculative_algorithm"',
+        '"speculative_num_draft_tokens"',
         '"tp_size"',
         '"tp_rank"',
         '"tp_group"',
@@ -208,9 +215,9 @@ class _Built:
         m, r = self.model, self.runner
         if r.backend is None:
             self._bind()
-        rows = plan.key.rows
-        stream = input_embeds.to(m.residual_dtype)
-        attn_input = m.layers[0].self_attn_input_norm(stream)
+        rows, q_len = plan.key.rows, plan.key.tokens_per_request
+        stream = input_embeds.to(m.residual_dtype).contiguous()
+        attn_input = m.layers[0].self_attn_input_norm(stream).contiguous()
         aux, last = [], len(m.layers) - 1
         check = self.check and not torch.cuda.is_current_stream_capturing()
         live = forward_batch.out_cache_loc[:rows] > 0 if check else None
@@ -218,13 +225,14 @@ class _Built:
             pre_norm_dtype = torch.bfloat16 if i == last else None
             ref = self._reference(i, positions, forward_batch, stream, attn_input, pre_norm_dtype) if check else None  # fmt: skip
             stream, attn_input = r.launch(
-                i=i, rows=rows, positions=positions, forward_batch=forward_batch,
+                i=i, rows=rows, q_len=q_len, positions=positions, forward_batch=forward_batch,
                 stream=stream, attn_input=attn_input, pre_norm_dtype=pre_norm_dtype,
             )  # fmt: skip
             if ref is not None:
                 _log_check(i, live, (stream, attn_input), ref)
             if i in m.layers_to_capture:  # set after attach: read per step
                 aux.append(stream.to(torch.bfloat16))
+        r.end_step()
         return attn_input, (aux if self.lm.capture_aux_hidden_states else None)
 
     def _reference(self, i, positions, forward_batch, stream, attn_input, pre_norm_dtype):
@@ -271,22 +279,35 @@ def _log_check(lid: int, live: torch.Tensor, got, ref) -> None:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_parallel, get_spec
 
     from sgl_amd_mono.muse_spark.gfx950.runner import MuseMonoRunner
+    from sgl_amd_mono.muse_spark.weights import LayerViews
 
     lm = model.model.language_model
+    layers = list(lm.layers)
+    next_norms = [layer.self_attn.pre_attn_norm for layer in layers[1:]] + [lm.norm]
+    views = [LayerViews.build(layer, i, next_norms[i], ctx.copies) for i, layer in enumerate(layers)]
     p = get_parallel()
+    # the peer handshake is collective: every rank gets here (attach agreed first)
     runner = MuseMonoRunner(
-        layers=lm.layers,
+        views=views,
+        modules=layers,
         boundaries=lm._ffn_boundaries,
         rank=p.tp_rank,
         npes=p.tp_size,
+        cpu_group=p.tp_group.cpu_group,
         device=lm.norm.weight.device,
     )
     runner.set_deadline(ctx.deadline_s)
-    for rows in ctx.widths:
-        runner.precompile(rows)
+    spec_config = get_spec()
+    q_len = int(spec_config.speculative_num_draft_tokens or 1) if spec_config.speculative_algorithm is not None else 1
+    # every rank builds every width; FlyDSL's disk cache hands a rank the kernels
+    # another rank built (a lock per kernel), so each rank starts at its own share
+    widths = list(ctx.widths)
+    start = len(widths) * p.tp_rank // max(p.tp_size, 1)
+    for rows in widths[start:] + widths[:start]:
+        runner.precompile(rows, q_len)
     # the class's forward, bound now: attach replaces the instance's afterwards
     original = type(model).forward.__get__(model, type(model))
     return _Built(model, runner, original)
