@@ -271,8 +271,9 @@ def _log_check(lid: int, live: torch.Tensor, got, ref) -> None:
     for name, o, r in zip(("stream", "attn_input"), got, ref):
         o, r = o[live].float(), r[live].float()
         rel = ((o - r).abs().amax() / r.abs().amax().clamp_min(1e-30)).item()
-        cos = torch.nn.functional.cosine_similarity(o, r, dim=-1).min().item()
-        stats.append(f"{name} rel {rel:.5f} cosine {cos:.6f}")
+        cos = torch.nn.functional.cosine_similarity(o, r, dim=-1)
+        # the least row (one row's flipped expert shows as ~0.98), the mean, and the rows below 0.99
+        stats.append(f"{name} rel {rel:.5f} cosine {cos.min().item():.6f} mean {cos.mean().item():.6f} low {int((cos < 0.99).sum())}")
     logger.info("monokernel check layer %d, %d rows: %s", lid, int(live.sum()), "; ".join(stats))  # fmt: skip
 
 
