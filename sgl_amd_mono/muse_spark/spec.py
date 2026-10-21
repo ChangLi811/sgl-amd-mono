@@ -222,16 +222,32 @@ class _Built:
         for i in range(len(m.layers)):
             pre_norm_dtype = torch.bfloat16 if i == last else None
             ref = self._reference(i, positions, forward_batch, stream, attn_input, pre_norm_dtype) if check else None  # fmt: skip
+            kv_ref = self._kv_rows(i, forward_batch, rows) if check else None
             stream, attn_input = r.launch(
                 i=i, rows=rows, q_len=q_len, positions=positions, forward_batch=forward_batch,
                 stream=stream, attn_input=attn_input, pre_norm_dtype=pre_norm_dtype,
             )  # fmt: skip
             if ref is not None:
                 _log_check(i, live, (stream, attn_input), ref)
+                _log_kv_check(i, live, self._kv_rows(i, forward_batch, rows), kv_ref)
             if i in m.layers_to_capture:  # set after attach: read per step
                 aux.append(stream.to(torch.bfloat16))
         r.end_step()
         return attn_input, (aux if self.lm.capture_aux_hidden_states else None)
+
+    def _kv_rows(self, i, forward_batch, rows):
+        """Check mode: layer ``i``'s K / V cache rows of this step's slots (through the
+        sliding pool's slot table on sliding layers), as fp32 copies."""
+        r = self.runner
+        if r.pool is None or r.caches is None:
+            return None
+        slots = forward_batch.out_cache_loc[:rows].long()
+        _, _, is_swa = r.caches[i]
+        if is_swa:
+            slots = r.swa_map[slots.clamp_min(0)].long()
+        slots = slots.clamp_min(0)
+        k, v = r.pool.get_kv_buffer(self.model.layers[i].self_attn.attn.layer_id)
+        return k[slots].float().clone(), v[slots].float().clone()
 
     def _reference(self, i, positions, forward_batch, stream, attn_input, pre_norm_dtype):
         """Check mode: SGLang's layer ``i`` on copies of the launch's inputs, returning
@@ -275,6 +291,21 @@ def _log_check(lid: int, live: torch.Tensor, got, ref) -> None:
         # the least row (one row's flipped expert shows as ~0.98), the mean, and the rows below 0.99
         stats.append(f"{name} rel {rel:.5f} cosine {cos.min().item():.6f} mean {cos.mean().item():.6f} low {int((cos < 0.99).sum())}")
     logger.info("monokernel check layer %d, %d rows: %s", lid, int(live.sum()), "; ".join(stats))  # fmt: skip
+
+
+def _log_kv_check(lid: int, live: torch.Tensor, got, ref) -> None:
+    """Check mode: the K / V rows the launch wrote for the live slots against the
+    reference layer's (written just before): the share of equal fp8 values and
+    the largest difference."""
+    if got is None or ref is None or not bool(live.any()):
+        return
+    stats = []
+    for name, o, r in zip(("K", "V"), got, ref):
+        o, r = o[live], r[live]
+        same = (o == r).float().mean().item()
+        diff = (o - r).abs().amax().item()
+        stats.append(f"{name} equal {same:.4f} maxdiff {diff:.3f} ref|max| {r.abs().amax().item():.3f}")
+    logger.info("monokernel kv check layer %d: %s", lid, "; ".join(stats))
 
 
 def _build(model, hf_config, ctx) -> _Built:
