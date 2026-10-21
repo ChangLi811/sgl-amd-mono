@@ -96,6 +96,9 @@ USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
 # SGLANG_AMD_MONO_MUSE_LAYER=1: an MXFP4 layer's attention, K2, K3 and the next layer's
 # K1 as one launch (else the four launches)
 USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "0") == "1"
+# SGLANG_AMD_MONO_MUSE_SKIP=1: a timing diagnostic, the MXFP4 layers skipped (garbage
+# output): the step's cost outside the kernel layers
+SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_MUSE_SKIP", "0") == "1"
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -366,6 +369,8 @@ class MuseMonoRunner:
         slots = forward_batch.out_cache_loc
         if slots.dtype not in (torch.int32, torch.int64) or slots.numel() < rows:
             raise RuntimeError(f"Muse Spark launch: out_cache_loc {slots.dtype} {tuple(slots.shape)}")
+        if SKIP_LAYERS:
+            return stream, attn_input
         k_cache, v_cache, is_swa = self.caches[i]
         m = self.swa_map
         cur = torch.cuda.current_stream()

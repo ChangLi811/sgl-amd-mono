@@ -301,6 +301,7 @@ def test_the_merged_launch_matches_the_four(S, ql):
 
 
 def _time(fn, iters=20):
+    """Eager: the launches back to back (the CPU launch cost bounds it)."""
     s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     fn()
     torch.cuda.synchronize()
@@ -312,35 +313,56 @@ def _time(fn, iters=20):
     return s.elapsed_time(e) / iters
 
 
+def _time_graph(fn, iters=20):
+    """Graph replay of ``iters`` launches (the GPU time, as the server runs them)."""
+    fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(iters):
+            fn()
+    g.replay()
+    torch.cuda.synchronize()
+    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    s.record()
+    g.replay()
+    e.record()
+    torch.cuda.synchronize()
+    return s.elapsed_time(e) / iters
+
+
 def main():
-    """Step times of each launch and of the two forms at every served width."""
+    """Step times of each launch and of the two forms at every served width:
+    eager (bounded by the CPU launch cost) and graph replay (the GPU time)."""
     dev = torch.device("cuda")
+    cur = torch.cuda.current_stream
     for S in (8, 16, 32, 64):
         ql = 8
         L = Layer(S, ql, dev, seed=40 + S)
         K = _kernels(S, ql)
-        stream = torch.cuda.current_stream()
         epoch = _epoch(dev, deadline_s=60.0)
         B = Buffers(S, ql, dev)
         try:
             def k1():
-                _k1(K["k1"], L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream); epoch[0] += 1
+                _k1(K["k1"], L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, cur()); epoch[0] += 1
             def ka():
-                K["ka"](*_attn_args(L, B), epoch.data_ptr(), LAYER, stream=stream); epoch[0] += 1
+                K["ka"](*_attn_args(L, B), epoch.data_ptr(), LAYER, stream=cur()); epoch[0] += 1
             def k2():
-                K["k2"](B.o.data_ptr(), *_k2_args(L, B), B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, stream=stream); epoch[0] += 1  # fmt: skip
+                K["k2"](B.o.data_ptr(), *_k2_args(L, B), B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, stream=cur()); epoch[0] += 1  # fmt: skip
             def k3():
                 a3 = _k3_args(L, B)
                 K["k3"](B.xin.data_ptr(), B.ids.data_ptr(), B.scores.data_ptr(), a3[0], *a3[1:5], a3[5], B.res.data_ptr(), *a3[6:],
-                        B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream); epoch[0] += 1  # fmt: skip
+                        B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=cur()); epoch[0] += 1  # fmt: skip
             def split():
-                _k1(K["k1"], L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream); run_split(K, L, B, epoch, stream); epoch[0] += 1  # fmt: skip
+                _k1(K["k1"], L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, cur()); run_split(K, L, B, epoch, cur()); epoch[0] += 1  # fmt: skip
             def merged():
-                _k1(K["k1"], L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream); run_merged(K, L, B, epoch, stream); epoch[0] += 1  # fmt: skip
+                _k1(K["k1"], L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, cur()); run_merged(K, L, B, epoch, cur()); epoch[0] += 1  # fmt: skip
             # a valid state for the standalone timings: one full step first
             B.res.copy_(L.res0); split(); torch.cuda.synchronize()
-            t = {n: _time(f) for n, f in (("k1", k1), ("kattn", ka), ("k2", k2), ("k3", k3), ("k1+four", split), ("k1+merged", merged))}
-            print(f"S={S:2d}: " + "  ".join(f"{n} {v * 1000:7.1f} us" for n, v in t.items()) + f"   (lens {LENS[:S // ql]})")
+            fns = (("k1", k1), ("kattn", ka), ("k2", k2), ("k3", k3), ("k1+four", split), ("k1+merged", merged))
+            for mode, timer in (("eager", _time), ("graph", _time_graph)):
+                t = {n: timer(f) for n, f in fns}
+                print(f"S={S:2d} {mode:5s}: " + "  ".join(f"{n} {v * 1000:7.1f} us" for n, v in t.items()) + f"   (lens {LENS[:S // ql]})")
         finally:
             B.close()
 
