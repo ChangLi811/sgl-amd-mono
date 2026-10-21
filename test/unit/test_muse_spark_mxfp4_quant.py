@@ -41,7 +41,7 @@ def test_the_values_are_the_aiter_rule_and_the_layout_is_quark():
     torch.manual_seed(1)
     w = (torch.randn(3, 64, 256) * 0.02).to(torch.bfloat16)
     w[0, 0, :32] = 0  # a zero block
-    w[1, 5, 32:64] = torch.linspace(-7, 7, 32).to(torch.bfloat16)  # a block to saturate
+    w[1, 5, 32:64] = torch.linspace(-6.5, 6.5, 32).to(torch.bfloat16)  # a block to saturate (6.5 keeps the 2^0 scale)
     packed, scales = quantize_mxfp4(w, chunk=2)
     assert packed.dtype == torch.uint8 and tuple(packed.shape) == (3, 64, 128)
     assert scales.dtype == torch.uint8 and tuple(scales.shape) == (3, 64, 8)
@@ -50,7 +50,7 @@ def test_the_values_are_the_aiter_rule_and_the_layout_is_quark():
     assert torch.equal(back, _decode_like_the_kernel_test(packed, scales)), "the layout differs"
     assert (packed[0, 0, :16] == 0).all() and scales[0, 0, 0] == 0  # the zero block: codes 0, scale 2^-127
     sat = back[1, 5, 32:64]
-    assert sat.abs().max() == 6.0 * torch.ldexp(torch.ones(1), scales[1, 5, 1].int() - 127)
+    assert int(scales[1, 5, 1]) == 127 and sat.abs().max() == 6.0  # 6.5 at scale 1 saturates to the E2M1 max
     rel = ((back.float() - w.float()).norm() / w.float().norm()).item()
     assert 0.02 < rel < 0.2, rel  # an MXFP4's error, not a layout slip
 

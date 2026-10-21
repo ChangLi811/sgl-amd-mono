@@ -36,6 +36,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
     WINDOW,
 )
+from sgl_amd_mono.muse_spark import weights as muse_weights
 from sgl_amd_mono.muse_spark.weights import LayerViews, expert_kind, layer_reasons
 
 # Muse Spark's text config (config.json, text_config): 46 sliding + 16 full layers
@@ -298,5 +299,15 @@ def test_the_views_read_in_place_and_log_the_copies():
     layer.mlp.router_pooler_packed_weight = packed
     v2 = LayerViews.build(layer, 3, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {})
     assert v2.gate_hi.data_ptr() == packed[MOE_HIDDEN].data_ptr()
+    # bf16 experts: quantized online into Quark-layout copies (the layer then takes the
+    # kernels), or left to the modules with the switch off
     bf16 = _layer(experts=_bf16_experts())
-    assert LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {}).w13 is None
+    copies = {}
+    q = LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), copies)
+    assert q.quantized and q.kind == "mxfp4"
+    assert tuple(q.w13.shape) == (LOCAL_EXPERTS, 2 * INTER, MOE_HIDDEN // 2) and q.w13.dtype == torch.uint8
+    assert tuple(q.s2.shape) == (LOCAL_EXPERTS, MOE_HIDDEN, INTER // 32) and q.s2.dtype == torch.uint8
+    assert any(k.startswith("layer 0 experts: online MXFP4") for k in copies)
+    with mock.patch.object(muse_weights, "QUANT_BF16", False):
+        plain = LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {})
+    assert plain.kind == "bf16" and plain.w13 is None and not plain.quantized
