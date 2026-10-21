@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the kernels read of one Muse Spark decoder layer, checked at startup.
 
-The kernels will read tensors through raw pointers: a differently-laid-out weight
+The kernels read tensors through raw pointers: a differently-laid-out weight
 would not fault, it would produce plausible garbage. So every module name, dtype,
 shape and constant the kernels assume is checked once (``layer_reasons``, a refusal
-at startup) on SGLang's ROCm Muse Spark modules. Stage 0 takes no views and makes
-no copies; the checks pin the layout the kernel drop-in will meet.
+at startup) on SGLang's ROCm Muse Spark modules, and only then are the views taken
+(``LayerViews.build``).
+
+Everything is read in place except the copies logged at startup: a norm's
+effective weight (``weight + gain_center``) where the model has not cached it, a
+residual gate's alpha / beta where not precomputed, and the router's bf16 hi + lo
+split where the model did not pack it next to the pooler (``SGLANG_MUSE_JOINT_ROUTER_POOLER``).
 """
 
 from __future__ import annotations
 
 import math
 
+import msgspec
 import torch
 
 from sgl_amd_mono.muse_spark import TP
@@ -96,7 +102,13 @@ SGLANG_READS = {
         "weight",
         "gate",
         "temperature",
+        "_get_effective_weight",
+        "_effective_weight_cache",
+        "_coefficients",
+        "_alpha",
+        "_beta",
     ),
+    "srt/rocm_muse_spark/router_pooler.py": ('"router_pooler_packed_weight"',),
     "srt/layers/rotary_embedding/*.py": ("cos_sin_cache", "is_neox_style", "rotary_dim"),
     "srt/layers/radix_attention.py": ("sliding_window_size", "k_scale", "v_scale"),
 }
@@ -229,3 +241,111 @@ def layer_reasons(layer, i: int) -> list[str]:
 def expert_kind(layer) -> str:
     """``"mxfp4"`` or ``"bf16"``: which experts a layer ``layer_reasons`` accepted holds."""
     return "bf16" if type(layer.mlp.experts).__name__ == "MuseSpark1xNativeExperts" else "mxfp4"
+
+
+def _effective_norm_weight(module, i: int, what: str, copies: dict) -> torch.Tensor:
+    """A norm's ``weight + gain_center`` as the kernels read it: the model's cache
+    where it made one, else a copy kept in ``copies``."""
+    cached = getattr(module, "_effective_weight_cache", None)
+    if cached is not None:
+        return cached.data
+    key = ("effective norm weight", i, what)
+    if key not in copies:
+        with torch.no_grad():
+            copies[key] = module._get_effective_weight().detach().to(torch.bfloat16).contiguous()
+    return copies[key]
+
+
+def _gate_coefficients(gate, i: int, what: str, copies: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """A residual gate's (alpha, beta) fp32 [HIDDEN]: the precomputed ones, else a copy."""
+    if gate._alpha is not None and gate._beta is not None:
+        return gate._alpha.reshape(-1).float().contiguous(), gate._beta.reshape(-1).float().contiguous()
+    key = ("residual gate", i, what)
+    if key not in copies:
+        with torch.no_grad():
+            alpha, beta = gate._coefficients(gate.gate.view(1, -1).float() / gate.temperature)
+            if not isinstance(alpha, torch.Tensor):
+                alpha = torch.full_like(beta, float(alpha))
+            copies[key] = (alpha.reshape(-1).float().contiguous(), beta.reshape(-1).float().contiguous())
+    return copies[key]
+
+
+def _router_hi_lo(moe, i: int, copies: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """The fp32 router as bf16 hi + lo [EXPERTS, HIDDEN]: the model's packed weight
+    (rows 4096 .. 4352 and 4352 .. 4608 next to the pooler) when it prepared one,
+    else copies."""
+    packed = getattr(moe, "router_pooler_packed_weight", None)
+    if packed is not None and tuple(packed.shape) == (MOE_HIDDEN + 2 * EXPERTS, HIDDEN):
+        return packed[MOE_HIDDEN : MOE_HIDDEN + EXPERTS], packed[MOE_HIDDEN + EXPERTS :]
+    key = ("router hi/lo", i)
+    if key not in copies:
+        with torch.no_grad():
+            hi = moe.router.weight.data.T.to(torch.bfloat16).contiguous()
+            lo = (moe.router.weight.data.T - hi.float()).to(torch.bfloat16).contiguous()
+            copies[key] = (hi, lo)
+    return copies[key]
+
+
+class LayerViews(msgspec.Struct, frozen=True):
+    """Everything the launches read for one decoder layer ``layer_reasons`` accepted."""
+
+    layer_id: int
+    kind: str  # "mxfp4" or "bf16" experts
+    is_swa: bool
+    use_rope: bool
+    cos_sin: object  # fp32 [max_pos, HEAD_DIM] (cos | sin) or None on NoPE layers
+    w_qkvg: torch.Tensor  # bf16 [QKVG_ROWS, HIDDEN]
+    w_o: torch.Tensor  # bf16 [HIDDEN, Q_K]
+    alpha: torch.Tensor  # fp32 [HIDDEN]: the post-attention residual gate
+    beta: torch.Tensor
+    pre_w: torch.Tensor  # bf16 [HIDDEN]: pre_feedforward_layernorm (+1)
+    gate_hi: torch.Tensor  # bf16 [EXPERTS, HIDDEN]
+    gate_lo: torch.Tensor
+    bias: torch.Tensor  # fp32 [EXPERTS]
+    w_pool: torch.Tensor  # bf16 [MOE_HIDDEN, HIDDEN]
+    xn_w: torch.Tensor  # bf16 [MOE_HIDDEN]: pre_expert_norm (+1)
+    w13: object  # MXFP4 u8 [LOCAL_EXPERTS, 2 INTER, MOE_HIDDEN / 2] or None (bf16 experts)
+    s13: object
+    w2: object
+    s2: object
+    pen_w: torch.Tensor  # bf16 [MOE_HIDDEN]: post_expert_norm (+1)
+    w_unpool: torch.Tensor  # bf16 [HIDDEN, MOE_HIDDEN]
+    pfw: torch.Tensor  # bf16 [HIDDEN]: post_feedforward_layernorm (+1)
+    alpha2: torch.Tensor  # fp32 [HIDDEN]: the post-FFN residual gate
+    beta2: torch.Tensor
+    npw: torch.Tensor  # bf16 [HIDDEN]: the next layer's pre_attn_norm (+1), or the final norm's
+
+    @staticmethod
+    def build(layer, i: int, next_pre_norm, copies: dict) -> "LayerViews":
+        attn, moe, experts = layer.self_attn, layer.mlp, layer.mlp.experts
+        kind = expert_kind(layer)
+        alpha, beta = _gate_coefficients(layer.post_attention_residual_gate, i, "post_attention", copies)
+        alpha2, beta2 = _gate_coefficients(layer.post_feedforward_residual_gate, i, "post_feedforward", copies)
+        hi, lo = _router_hi_lo(moe, i, copies)
+        return LayerViews(
+            layer_id=i,
+            kind=kind,
+            is_swa=attn.attn.sliding_window_size == WINDOW,
+            use_rope=attn.rotary_emb is not None,
+            cos_sin=None if attn.rotary_emb is None else attn.rotary_emb.cos_sin_cache.data,
+            w_qkvg=attn.qkv_proj.weight.data,
+            w_o=attn.o_proj.weight.data,
+            alpha=alpha,
+            beta=beta,
+            pre_w=_effective_norm_weight(layer.pre_feedforward_layernorm, i, "pre_feedforward_layernorm", copies),
+            gate_hi=hi,
+            gate_lo=lo,
+            bias=moe.expert_bias.data,
+            w_pool=moe.pre_expert_proj.weight.data,
+            xn_w=_effective_norm_weight(moe.pre_expert_norm, i, "pre_expert_norm", copies),
+            w13=experts.w13_weight.data if kind == "mxfp4" else None,
+            s13=experts.w13_weight_scale.data if kind == "mxfp4" else None,
+            w2=experts.w2_weight.data if kind == "mxfp4" else None,
+            s2=experts.w2_weight_scale.data if kind == "mxfp4" else None,
+            pen_w=_effective_norm_weight(moe.post_expert_norm, i, "post_expert_norm", copies),
+            w_unpool=moe.post_expert_proj.weight.data,
+            pfw=_effective_norm_weight(layer.post_feedforward_layernorm, i, "post_feedforward_layernorm", copies),
+            alpha2=alpha2,
+            beta2=beta2,
+            npw=_effective_norm_weight(next_pre_norm, i, "next pre_attn_norm", copies),
+        )

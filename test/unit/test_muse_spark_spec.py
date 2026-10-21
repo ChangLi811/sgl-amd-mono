@@ -36,7 +36,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
     WINDOW,
 )
-from sgl_amd_mono.muse_spark.weights import expert_kind, layer_reasons
+from sgl_amd_mono.muse_spark.weights import LayerViews, expert_kind, layer_reasons
 
 # Muse Spark's text config (config.json, text_config): 46 sliding + 16 full layers
 LAYERS = HF_CONFIG["num_hidden_layers"]
@@ -121,6 +121,10 @@ class MuseSpark1xRMSNorm(torch.nn.Module):
             if weighted
             else None
         )
+        self._effective_weight_cache = None
+
+    def _get_effective_weight(self):
+        return None if self.weight is None else self.weight + 1
 
 
 class MuseSpark1xRMSNormWithInputScale(MuseSpark1xRMSNorm):
@@ -139,8 +143,21 @@ def _meta(*shape, dtype=torch.bfloat16):
     return torch.empty(*shape, dtype=dtype, device="meta")
 
 
+class _Gate:
+    """A norm-preserving residual gate as the views read it (coefficients not precomputed)."""
+
+    def __init__(self, gate=None):
+        self.gate = _meta(HIDDEN) if gate is None else gate
+        self.temperature = GATE_TEMPERATURE
+        self._alpha = self._beta = None
+
+    def _coefficients(self, w):
+        beta = torch.sigmoid(w)
+        return torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1.0 + beta), min=1e-3)), beta
+
+
 def _gate():
-    return SimpleNamespace(gate=_meta(HIDDEN), temperature=GATE_TEMPERATURE)
+    return _Gate()
 
 
 def _mxfp4_experts():
@@ -243,7 +260,7 @@ def test_the_checks_accept_every_layer_kind():
         {"self_attn.attn": SimpleNamespace(sliding_window_size=WINDOW, k_scale=_meta(2, dtype=torch.float32), v_scale=None)},
         {"post_attn_norm": MuseSpark1xRMSNorm(HIDDEN, POST_EPS)},  # weighted post norm
         {"post_feedforward_layernorm": SimpleNamespace(weight=_meta(HIDDEN))},  # not a Muse norm
-        {"post_attention_residual_gate": SimpleNamespace(gate=_meta(1), temperature=GATE_TEMPERATURE)},
+        {"post_attention_residual_gate": _Gate(_meta(1))},
         {"mlp.ep_size": 4},
         {"mlp.top_k": 4},
         {"mlp.router_multiplier": 1.0},
@@ -262,3 +279,24 @@ def test_the_checks_accept_every_layer_kind():
 def test_each_unsupported_layer_is_refused(changes):
     reasons = layer_reasons(_layer(**changes), 3)
     assert len(reasons) == 1, reasons
+
+
+def test_the_views_read_in_place_and_log_the_copies():
+    layer = _layer()
+    copies = {}
+    v = LayerViews.build(layer, 3, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), copies)
+    assert v.kind == "mxfp4" and v.is_swa and v.use_rope
+    assert v.w_qkvg.data_ptr() == layer.self_attn.qkv_proj.weight.data_ptr()
+    assert tuple(v.gate_hi.shape) == tuple(v.gate_lo.shape) == (EXPERTS, HIDDEN)
+    assert tuple(v.alpha.shape) == tuple(v.beta2.shape) == (HIDDEN,) and v.alpha.dtype == torch.float32
+    assert v.pre_w.dtype == v.npw.dtype == torch.bfloat16 and v.pen_w.numel() == MOE_HIDDEN
+    # no packed router and no cached norms on this layer: the split and the effective weights are copies
+    kinds = {k[0] for k in copies}
+    assert kinds == {"router hi/lo", "effective norm weight", "residual gate"}
+    # a packed router is read in place
+    packed = _meta(MOE_HIDDEN + 2 * EXPERTS, HIDDEN)
+    layer.mlp.router_pooler_packed_weight = packed
+    v2 = LayerViews.build(layer, 3, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {})
+    assert v2.gate_hi.data_ptr() == packed[MOE_HIDDEN].data_ptr()
+    bf16 = _layer(experts=_bf16_experts())
+    assert LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {}).w13 is None
