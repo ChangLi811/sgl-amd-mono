@@ -39,7 +39,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import BLOCKS, WAVES
 from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, LOG2E, Q_K
-from sgl_amd_mono.muse_spark.gfx950.device import release_stores
+from sgl_amd_mono.muse_spark.gfx950.device import release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ATTN_CHUNK as CHUNK,
     ATTN_KEY_SPLITS as KEY_SPLITS,
@@ -358,6 +358,7 @@ def run_kattn(c, o_flag=None):
                             put(part_mb, pi + 2 + dt * 16 + l16, o_f[dt][e])
         gpu.barrier()
 
+    stamp(c, 0)
     n_parts = (max_span * CHUNK + part - 1) // part
     for job in range(bid, R * LOCAL_KV_HEADS * TASK_TILES * n_parts, BLOCKS):
         p = job % n_parts
@@ -371,6 +372,7 @@ def run_kattn(c, o_flag=None):
         if c_lo < c_hi:
             attn_task(r, h, rt0, p)
 
+    stamp(c, 1)  # the attention tasks done
     # ============================================ merge tasks: (request, head, row tile)
     # a thread: row 16 rt + tid / 32 (clamped past ROWS: its output is not
     # written), dims 8 ((tid / 4) % 8) .., every fourth partition from tid % 4,
@@ -445,3 +447,4 @@ def run_kattn(c, o_flag=None):
             gpu.barrier()
             if tid == 0:
                 put(o_flag, (r * LOCAL_KV_HEADS + h) * ROW_TILES + rt, fx.Int32(1))
+    stamp(c, 2)  # the merge done (end)

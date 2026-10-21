@@ -70,6 +70,7 @@ from sgl_amd_mono.common.ops import (
     uniform,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, cdiv, pair_layout
+from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_SLOTS
 from sgl_amd_mono.muse_spark.gfx950.config import (
     HIDDEN,
     INTER,
@@ -82,7 +83,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     TOP_K,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, release_stores
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import (
     e2m1_code,
     lanes_before,
@@ -176,6 +177,7 @@ def k3_scratch_layout() -> dict:
             ("k3_fflag", MAX_TOKENS * AR_PARTS_MAX),
             ("k3_pss", MAX_TOKENS * AR_PARTS_MAX * TOP_K),
             ("k3_fbuf", MAX_TOKENS * MOE_HIDDEN // 4),
+            ("k3_trace", BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )
@@ -931,19 +933,27 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None):
     S, bid = c["S"], c["bid"]
     b = c["bases"]
     AP = c["ar_parts"]
+    stamp(c, 0)
     if const_expr(route_flag is not None):
         c["poll"]([(route_flag, t, 1) for t in range(S)])
         c["poll"]([(xin_flag, t, 1) for t in range(S)])
         acquire_loads()
+    stamp(c, 1)  # the routing and expert input arrived (a merged launch) / entry
     n_tiles = stage_plan(c)
+    stamp(c, 2)  # the plan built
     stage_ug(c, n_tiles)
+    stamp(c, 3)  # this CTA's ug items done
     stage_dn(c, n_tiles)
+    stamp(c, 4)  # this CTA's dn items done
     # the unpool CTAs' first task's weights go out now, behind nothing, so the fin
     # hops stream them; the fin CTAs carry none (their tile is past the buffer)
     first_w = unp_w_loads(c, unp_gtask(c, 0)[1])
     rocdl.sched_barrier(0)
     if (bid >= b["fin0"]) & (bid < b["fin0"] + S * AP):
         stage_fin(c, (bid - b["fin0"]) // AP, (bid - b["fin0"]) % AP)
+    stamp(c, 5)  # the fin task done (fin CTAs)
     stage_unpool(c, first_w)
+    stamp(c, 6)  # the unpool task(s) done (unpool CTAs)
     if bid < S:
         stage_bnd(c, bid, x_flag, x_put)
+    stamp(c, 7)  # the boundary done (end)

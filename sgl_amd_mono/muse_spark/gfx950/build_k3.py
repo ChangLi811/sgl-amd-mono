@@ -40,6 +40,7 @@ class K3Build(msgspec.Struct, frozen=True):
     last: bool = False
     fault_site: int = 0
     fault_after: int = 0
+    trace: bool = False
 
 
 def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict) -> dict:
@@ -73,6 +74,7 @@ def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, la
         "args": args,
         "rank": rank,
         "last": key.last,
+        "trace_on": key.trace,
         "bases": ffn.k3_bases(s, npes),
         "ar_parts": ffn.ar_parts(s),
         "own_ffn": preg(sym, ffn_off, "ffn"),
@@ -100,7 +102,7 @@ def build_k3(key: K3Build):
     last-layer rule, when the build did not compile it in)."""
     S, npes = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= npes <= WAVES, (S, npes)
-    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site)
+    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = ffn.k3_scratch_layout()

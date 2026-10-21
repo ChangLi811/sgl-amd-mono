@@ -3,9 +3,11 @@
 step's mailbox tag and the fences of a plain-words hand-off (on the llvm dialect
 directly, which every FlyDSL this family runs on provides)."""
 
+import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import rocdl
+from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import rsrc, uniform
@@ -31,3 +33,25 @@ def release_stores():
 def acquire_loads():
     """Order this thread's later loads after a flag it polled."""
     llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+
+
+# ---------------------------------------------------------------- stage trace
+TRACE_SLOTS = 16  # stamps a CTA: int64 clock ticks (100 MHz) at trace[(bid TRACE_SLOTS + idx)]
+
+
+def stamp(c, idx: int):
+    """Trace stamp ``idx`` of this CTA, compiled in by a build with ``trace``: the
+    100 MHz realtime clock, an int64 in the launch's ``*_trace`` scratch region
+    (``c["trace"]``, a pair a stamp), written by thread 0."""
+    if const_expr(not c.get("trace_on", False)):
+        return
+    from flydsl._mlir.dialects import llvm
+    from flydsl.expr.typing import as_ir_value
+
+    from sgl_amd_mono.common.ops import clock
+
+    if c["tid"] == 0:
+        now = clock()
+        addr = c["trace"].value + fx.Int64((c["bid"] * TRACE_SLOTS + idx) * 8)
+        ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
+        llvm.StoreOp(as_ir_value(now), ptr, alignment=8)

@@ -7,6 +7,8 @@ a GPU (``test/unit/test_muse_spark_layout.py``).
 """
 
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, pair_layout
+
+TRACE_SLOTS = 16  # stage stamps a CTA (``device.stamp``), an int64 pair each
 from sgl_amd_mono.muse_spark.gfx950.config import (
     HEAD_DIM,
     HIDDEN,
@@ -58,7 +60,7 @@ def k1_scratch_layout() -> dict:
     the halves' fp32 partials (a pair a (half, token, row)) and, in a merged
     launch, a flag a token for its x."""
     return pair_layout(
-        [("k1_part", HALVES * MAX_TOKENS * QKVG_ROWS), ("k1_xflag", MAX_TOKENS)],
+        [("k1_part", HALVES * MAX_TOKENS * QKVG_ROWS), ("k1_xflag", MAX_TOKENS), ("k1_trace", BLOCKS * TRACE_SLOTS)],
         align=256,
     )
 
@@ -100,7 +102,7 @@ def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
     """K-attn's scratch: (request, head, partition)'s (m, l, O[64]) a row, fp32 pairs."""
     rows = attn_rows(q_len)
     pairs = (tokens // q_len) * LOCAL_KV_HEADS * ATTN_MAX_PARTS * rows * ATTN_PART_ROW
-    return pair_layout([("attn_part", pairs)], align=256)
+    return pair_layout([("attn_part", pairs), ("attn_trace", BLOCKS * TRACE_SLOTS)], align=256)
 
 
 def kattn_lds_bytes(nt: int) -> int:

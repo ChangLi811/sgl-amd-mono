@@ -38,6 +38,7 @@ class K1Build(msgspec.Struct, frozen=True):
     tokens: int
     fault_site: int = 0
     fault_after: int = 0
+    trace: bool = False  # stage stamps into the ``k1_trace`` region (``device.stamp``)
 
 
 def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged: bool = False) -> dict:
@@ -58,6 +59,7 @@ def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged
         "poll": mb.poll,
         "args": args,
         "x_cm": CM_DEV if merged else 0,  # x from this launch: past the L2 (another XCD wrote it)
+        "trace_on": key.trace,
     }
     for region, (off, _) in layout.items():
         c[region[3:]] = sreg(scratch, off, region)  # "k1_part" -> c["part"]
@@ -68,7 +70,7 @@ def build_k1(key: K1Build):
     """``@flyc.jit`` launcher of K1 for a step of ``key.tokens`` rows."""
     tokens = key.tokens
     assert 1 <= tokens <= MAX_TOKENS
-    name = kernel_symbol("muse_spark_k1", s=tokens, f=key.fault_site)
+    name = kernel_symbol("muse_spark_k1", s=tokens, f=key.fault_site, t=int(key.trace))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = k1_scratch_layout()
@@ -153,6 +155,7 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     nt: int = 1
     fault_site: int = 0
     fault_after: int = 0
+    trace: bool = False
 
 
 def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict) -> dict:
@@ -175,8 +178,10 @@ def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict) 
         "put": mb.put,
         "poll": mb.poll,
         "args": args,
+        "trace_on": key.trace,
     }
     c["part"] = sreg(scratch, layout["attn_part"][0], "attn_part")
+    c["trace"] = sreg(scratch, layout["attn_trace"][0], "attn_trace")
     return c
 
 
@@ -186,7 +191,7 @@ def build_kattn(key: KAttnBuild):
     assert QL in (1, 8) and S % QL == 0 and 1 <= S <= MAX_TOKENS
     row_tiles = (attn_rows(QL) + 15) // 16
     assert row_tiles % NT == 0, (row_tiles, NT)
-    name = kernel_symbol("muse_spark_kattn", s=S, q=QL, n=NT, f=key.fault_site)
+    name = kernel_symbol("muse_spark_kattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = kattn_scratch_layout(S, QL)
@@ -265,6 +270,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     last: bool = False
     fault_site: int = 0
     fault_after: int = 0
+    trace: bool = False
 
 
 def build_layer(key: LayerBuild):
@@ -289,13 +295,13 @@ def build_layer(key: LayerBuild):
 
     S, QL, W, next_k1, last = key.tokens, key.q_len, key.npes, key.next_k1, key.last
     assert 1 <= S <= MAX_TOKENS and S % QL == 0 and QL in (1, 8) and 1 <= W <= guard.FLAG_WORDS
-    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site)
+    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace))
     keyed = key_tuple(key, SOURCES)
-    fault_site, fault_after = key.fault_site, key.fault_after
-    k1_key = K1Build(S, fault_site, fault_after)
-    ka_key = KAttnBuild(S, QL, 1, fault_site, fault_after)
-    k2_key = K2Build(S, W, fault_site, fault_after)
-    k3_key = K3Build(S, W, last, fault_site, fault_after)
+    fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
+    k1_key = K1Build(S, fault_site, fault_after, tr)
+    ka_key = KAttnBuild(S, QL, 1, fault_site, fault_after, tr)
+    k2_key = K2Build(S, W, fault_site, fault_after, tr)
+    k3_key = K3Build(S, W, last, fault_site, fault_after, tr)
     k1_layout, ka_layout = k1_scratch_layout(), kattn_scratch_layout(S, QL)
     k2_layout, k3_layout = k2_scratch_layout(), ffn.k3_scratch_layout()
     sy = ffn.k3_sym_layout(W)

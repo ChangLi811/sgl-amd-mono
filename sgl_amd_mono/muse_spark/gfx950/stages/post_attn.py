@@ -74,6 +74,7 @@ from sgl_amd_mono.common.ops import (
     sum_partials,
 )
 from sgl_amd_mono.common.plan import BLOCKS, PAIR_BYTES, THREADS, WAVES, pair_layout
+from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_SLOTS
 from sgl_amd_mono.common.sync import preg
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
@@ -91,7 +92,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     ROUTER_MULT,
     TOP_K,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, release_stores
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     GQA,
     K_STEP,
@@ -162,6 +163,7 @@ def k2_scratch_layout() -> dict:
             ("k2_rflag", MAX_TOKENS),
             ("k2_xinflag", MAX_TOKENS),
             ("k2_oflag", MAX_TOKENS * LOCAL_KV_HEADS * 4),
+            ("k2_trace", BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )
@@ -732,12 +734,15 @@ def run_chain(c, route_flag=None, xin_flag=None):
     pool_w = x_w_loads(c, a["w_pool"], bid)
     rocdl.sched_barrier(0)
     wait_x(c)
+    stamp(c, 4)  # every token's x arrived
     for ps in range_constexpr(-(-S // XT)):
         t0 = ps * XT
         nt = min(XT, S - t0)
         stage_pass(c, t0, nt)
         x_gemv(c, bid, pool_w, put_pooled, t0, nt)
+    stamp(c, 5)  # the pooler passes done
     stage_pool_out(c)
+    stamp(c, 6)  # the pooled rows out
     if tok < S:
         stage_route(c, tok, route_flag)
         stage_xn(c, tok, xin_flag)
@@ -756,6 +761,7 @@ def run_stream(c, o_flag=None, QL=8):
     A_PARTS = a_parts(S)
     if (bid >= OG0) & (bid < OG0 + S):
         stage_og(c, bid - OG0, o_flag, QL)
+    stamp(c, 1)  # the og task done (og CTAs)
     w_first = o_w_loads(c, bid)
     w_second = o_w_loads(c, bid + CHAIN0)
     w_third = o_w_loads(c, bid + 2 * CHAIN0)
@@ -764,13 +770,16 @@ def run_stream(c, o_flag=None, QL=8):
     stage_o(c, bid + CHAIN0, w_second)
     if bid < O_THIRD:
         stage_o(c, bid + 2 * CHAIN0, w_third)
+    stamp(c, 2)  # the o tasks done
     # the boundary parts, before this CTA's pooler weights go out (its poll
     # would wait behind them)
     if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
         stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
+    stamp(c, 3)  # the boundary part done (a_part CTAs)
     pool_w = x_w_loads(c, a["w_pool"], bid)
     rocdl.sched_barrier(0)
     wait_x(c)
+    stamp(c, 4)  # every token's x arrived
     r_tile = fx.min((bid - R0) // R_PARTS, fx.Int32(R_TILES - 1))
     r_part = (bid - R0) % R_PARTS
     router_w = x_w_loads(c, a["w_hi"], r_tile, a["w_lo"], r_part)
@@ -788,7 +797,9 @@ def run_stream(c, o_flag=None, QL=8):
         if (bid >= R0) & (bid < R0 + R_TASKS):
             x_gemv(c, r_tile, router_w, put_logit, t0, nt, r_part)
         x_gemv(c, bid, pool_w, put_pooled, t0, nt)
+    stamp(c, 5)  # the router / pooler passes done
     stage_pool_out(c)
+    stamp(c, 6)  # the pooled rows out
 
 
 @flyc.jit
@@ -799,7 +810,9 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     attention ran earlier in this launch, a flag a (request of ``QL`` rows, KV
     head, row tile) once its o rows are out."""
     bid = c["bid"]
+    stamp(c, 0)
     if bid >= CHAIN0:
         run_chain(c, route_flag, xin_flag)
     else:
         run_stream(c, o_flag, QL)
+    stamp(c, 7)  # end
