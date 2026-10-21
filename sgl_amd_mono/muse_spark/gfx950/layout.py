@@ -75,3 +75,38 @@ def k1_lds_floats(s: int) -> tuple[int, int]:
 
 def k1_lds_bytes(s: int) -> int:
     return 4 * sum(k1_lds_floats(s))
+
+# ---------------------------------------------------------------- K-attn (attention)
+GQA = 8  # query heads a KV head on a rank
+ATTN_CHUNK = 256  # keys a chunk of the task loop
+ATTN_MAX_PARTS = 64  # partitions a request at most (the host sizes ``part`` to fit)
+ATTN_Q_PITCH = HEAD_DIM + 4  # LDS pitches (bf16 elements), 16 B aligned, bank-spread
+ATTN_V_PITCH = 40  # keys: a 32-key V^T sub-block's row
+ATTN_PART_ROW = 2 + HEAD_DIM  # fp32 pairs a partial row: (m, l, O[64])
+ATTN_KEY_SPLITS = WAVES  # the waves share a task's keys
+ATTN_KEYS_PER_WAVE = ATTN_CHUNK // ATTN_KEY_SPLITS  # 32
+ATTN_KEY_TILES = ATTN_KEYS_PER_WAVE // 16  # 2
+ATTN_V_STEPS = ATTN_KEYS_PER_WAVE // 32  # 32-key PV steps a wave: 1
+ATTN_P_PITCH = ATTN_KEYS_PER_WAVE + 8  # bf16 elements, 16 B aligned
+assert GQA * LOCAL_KV_HEADS == LOCAL_Q_HEADS
+
+
+def attn_rows(q_len: int) -> int:
+    """Rows a (request, KV head): the request's q_len rows x GQA heads."""
+    return q_len * GQA
+
+
+def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
+    """K-attn's scratch: (request, head, partition)'s (m, l, O[64]) a row, fp32 pairs."""
+    rows = attn_rows(q_len)
+    pairs = (tokens // q_len) * LOCAL_KV_HEADS * ATTN_MAX_PARTS * rows * ATTN_PART_ROW
+    return pair_layout([("attn_part", pairs)], align=256)
+
+
+def kattn_lds_bytes(nt: int) -> int:
+    qs = nt * 16 * ATTN_Q_PITCH * 2
+    pt = WAVES * nt * 16 * ATTN_P_PITCH * 2
+    vt = WAVES * HEAD_DIM * ATTN_V_PITCH * 2
+    comb = nt * 16 * (ATTN_KEY_SPLITS - 1) * (2 + HEAD_DIM) * 4
+    return qs + pt + vt + comb + RED_FLOATS * 4
+

@@ -33,3 +33,15 @@ def test_k1_scratch_regions_do_not_overlap():
         assert a1 <= b0
     assert lay["k1_part"][1] == L.HALVES * MAX_TOKENS * QKVG_ROWS * 8
     assert L.scratch_bytes(lay) == spans[-1][1]
+
+
+@pytest.mark.parametrize("nt", [1, 2])
+def test_kattn_lds_fits(nt):
+    assert L.kattn_lds_bytes(nt) <= LDS_BYTES
+
+
+@pytest.mark.parametrize("s,ql", [(8, 8), (64, 8), (16, 1)])
+def test_kattn_scratch_covers_every_partial(s, ql):
+    lay = L.kattn_scratch_layout(s, ql)
+    rows = L.attn_rows(ql)
+    assert lay["attn_part"][1] == (s // ql) * 2 * L.ATTN_MAX_PARTS * rows * L.ATTN_PART_ROW * 8
