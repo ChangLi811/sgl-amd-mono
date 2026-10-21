@@ -71,8 +71,6 @@ SGLANG_READS = {
     "srt/runtime_context.py": (
         "get_parallel",
         "get_spec",
-        '"speculative_algorithm"',
-        '"speculative_num_draft_tokens"',
         '"tp_size"',
         '"tp_rank"',
         '"tp_group"',
