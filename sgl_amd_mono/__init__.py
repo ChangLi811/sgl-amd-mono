@@ -24,6 +24,7 @@ SPECS = {
     "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
     "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
     "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
+    "MuseSparkForConditionalGeneration": "sgl_amd_mono.muse_spark.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
