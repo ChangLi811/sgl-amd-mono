@@ -23,8 +23,8 @@ pytestmark = pytest.mark.skipif(
     reason="needs a gfx950 GPU",
 )
 
-PAGES = 8192  # cache pages of the layer's K / V planes (131k keys)
-MAX_BLOCKS = 8192
+PAGES = 16384  # cache pages of the layer's K / V planes (262k keys)
+MAX_BLOCKS = 16384
 POSITIONS = 4096
 THETA = 500000.0
 LAYER = 9
