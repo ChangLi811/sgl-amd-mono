@@ -267,14 +267,15 @@ def _gate_coefficients(gate, i: int, what: str, copies: dict) -> tuple[torch.Ten
     """A residual gate's (alpha, beta) fp32 [HIDDEN]: the precomputed ones, else a copy."""
     if gate._alpha is not None and gate._beta is not None:
         return gate._alpha.reshape(-1).float().contiguous(), gate._beta.reshape(-1).float().contiguous()
-    key = ("residual gate", i, what)
-    if key not in copies:
+    keys = (("residual gate", i, what, "alpha"), ("residual gate", i, what, "beta"))
+    if keys[0] not in copies:
         with torch.no_grad():
             alpha, beta = gate._coefficients(gate.gate.view(1, -1).float() / gate.temperature)
             if not isinstance(alpha, torch.Tensor):
                 alpha = torch.full_like(beta, float(alpha))
-            copies[key] = (alpha.reshape(-1).float().contiguous(), beta.reshape(-1).float().contiguous())
-    return copies[key]
+            copies[keys[0]] = alpha.reshape(-1).float().contiguous()
+            copies[keys[1]] = beta.reshape(-1).float().contiguous()
+    return copies[keys[0]], copies[keys[1]]
 
 
 def _quantized_experts(experts, i: int, copies: dict) -> tuple:
@@ -282,13 +283,14 @@ def _quantized_experts(experts, i: int, copies: dict) -> tuple:
     quantized once at the build by aiter's rule and kept in ``copies``."""
     from sgl_amd_mono.muse_spark.mxfp4_quant import quantize_mxfp4
 
-    key = f"layer {i} experts: online MXFP4 (w13 + w2 codes and scales)"
-    if key not in copies:
+    keys = tuple(("online MXFP4 experts", i, name) for name in ("w13", "s13", "w2", "s2"))
+    if keys[0] not in copies:
         with torch.no_grad():
             w13, s13 = quantize_mxfp4(experts.w13_weight.data)
             w2, s2 = quantize_mxfp4(experts.w2_weight.data)
-            copies[key] = (w13, s13, w2, s2)
-    return copies[key]
+            for k, t in zip(keys, (w13, s13, w2, s2)):
+                copies[k] = t
+    return tuple(copies[k] for k in keys)
 
 
 def _router_hi_lo(moe, i: int, copies: dict) -> tuple[torch.Tensor, torch.Tensor]:
@@ -298,13 +300,13 @@ def _router_hi_lo(moe, i: int, copies: dict) -> tuple[torch.Tensor, torch.Tensor
     packed = getattr(moe, "router_pooler_packed_weight", None)
     if packed is not None and tuple(packed.shape) == (MOE_HIDDEN + 2 * EXPERTS, HIDDEN):
         return packed[MOE_HIDDEN : MOE_HIDDEN + EXPERTS], packed[MOE_HIDDEN + EXPERTS :]
-    key = ("router hi/lo", i)
-    if key not in copies:
+    keys = (("router hi/lo", i, "hi"), ("router hi/lo", i, "lo"))
+    if keys[0] not in copies:
         with torch.no_grad():
             hi = moe.router.weight.data.T.to(torch.bfloat16).contiguous()
             lo = (moe.router.weight.data.T - hi.float()).to(torch.bfloat16).contiguous()
-            copies[key] = (hi, lo)
-    return copies[key]
+            copies[keys[0]], copies[keys[1]] = hi, lo
+    return copies[keys[0]], copies[keys[1]]
 
 
 class LayerViews(msgspec.Struct, frozen=True):

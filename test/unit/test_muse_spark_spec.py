@@ -307,7 +307,7 @@ def test_the_views_read_in_place_and_log_the_copies():
     assert q.quantized and q.kind == "mxfp4"
     assert tuple(q.w13.shape) == (LOCAL_EXPERTS, 2 * INTER, MOE_HIDDEN // 2) and q.w13.dtype == torch.uint8
     assert tuple(q.s2.shape) == (LOCAL_EXPERTS, MOE_HIDDEN, INTER // 32) and q.s2.dtype == torch.uint8
-    assert any(k.startswith("layer 0 experts: online MXFP4") for k in copies)
+    assert {k[0] for k in copies} >= {"online MXFP4 experts"} and all(torch.is_tensor(v) for v in copies.values())
     with mock.patch.object(muse_weights, "QUANT_BF16", False):
         plain = LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {})
     assert plain.kind == "bf16" and plain.w13 is None and not plain.quantized
