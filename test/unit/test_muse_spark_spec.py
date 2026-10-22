@@ -124,15 +124,20 @@ def test_each_unsupported_setting_is_one_reason(cfg, text):
 
 
 def test_the_recipe_routes_verify_batches_of_one_to_eight():
-    # 8 verify rows a request: the 8-, 16-, 32- and 64-row launches route batch
-    # sizes 1, 2, 4 and 8, captured besides the configured sizes above them
-    assert muse.SPEC.widths("gfx950") == (8, 16, 32, 64)
+    # the served widths come from SGLANG_AMD_MONO_MUSE_WIDTHS (default 8: the
+    # verify batch of one request; wider launches lose to SGLang's kernels)
+    from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
+
+    assert muse.SPEC.widths("gfx950") == WIDTHS and 8 in WIDTHS
+    # 8 verify rows a request: with every width served, the 8-, 16-, 32- and 64-row
+    # launches route batch sizes 1, 2, 4 and 8, captured besides the configured sizes
     assert covered_capture_sizes(
-        widths=muse.SPEC.widths("gfx950"), tokens_per_request=8, sizes=[1, 2, 4, 8, 16, 32]
+        widths=(8, 16, 32, 64), tokens_per_request=8, sizes=[1, 2, 4, 8, 16, 32]
     ) == [1, 2, 4, 8, 16, 32]
+    assert covered_capture_sizes(widths=(8,), tokens_per_request=8, sizes=[1, 2, 4, 8, 16, 32]) == [1, 2, 4, 8, 16, 32]
     # without speculation the same launches serve decode batches of 8 to 64
     assert covered_capture_sizes(
-        widths=muse.SPEC.widths("gfx950"), tokens_per_request=1, sizes=[1, 8, 128]
+        widths=(8, 16, 32, 64), tokens_per_request=1, sizes=[1, 8, 128]
     ) == [8, 16, 32, 64, 128]
 
 

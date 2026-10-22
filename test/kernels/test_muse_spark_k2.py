@@ -201,9 +201,7 @@ def test_k2_matches_the_ops_math(rows, fp8):
 def test_every_width_compiles(rows):
     from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, build_k2
     from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
-    from sgl_amd_mono.muse_spark.spec import SPEC
-
-    assert rows in SPEC.widths("gfx950")
+    # every width compiles, served (SGLANG_AMD_MONO_MUSE_WIDTHS, default 8) or not
     compile_only(build_k2(K2Build(tokens=rows)))
 
 
