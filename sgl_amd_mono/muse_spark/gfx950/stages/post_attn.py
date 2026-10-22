@@ -526,13 +526,30 @@ def pool_w_loads(c, rt0, part, nsub):
     out = []
     for sub in range(nsub):
         row = (rt0 + sub) * ROWS + l16
+        if fp8:
+            # the swizzled copy (``pack_fp8_rows_pooler``): a step pair's 16 codes of this
+            # lane group sit together, one 16 B load a pair
+            assert P_STEPS % 2 == 0
+            steps = []
+            for pr in range(P_STEPS // 2):
+                v = fx.Vector(
+                    bo.buffer_load(
+                        r_w,
+                        (row * HIDDEN + part * K_PER_WAVE + wave * (P_STEPS * K_STEP) + pr * (2 * K_STEP) + 16 * g4) // 4,
+                        vec_width=4, dtype=T.i32, cache_modifier=CM_NT,
+                    )  # fmt: skip
+                )
+                steps.append(fx.Vector.from_elements([v[0], v[1]], fx.Int32))
+                steps.append(fx.Vector.from_elements([v[2], v[3]], fx.Int32))
+            out.append(steps)
+            continue
         out.append(
             [
                 fx.Vector(
                     bo.buffer_load(
                         r_w,
-                        (row * HIDDEN + part * K_PER_WAVE + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // (4 if fp8 else 2),
-                        vec_width=2 if fp8 else 4, dtype=T.i32, cache_modifier=CM_NT,
+                        (row * HIDDEN + part * K_PER_WAVE + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // 2,
+                        vec_width=4, dtype=T.i32, cache_modifier=CM_NT,
                     )  # fmt: skip
                 )
                 for kc in range(P_STEPS)

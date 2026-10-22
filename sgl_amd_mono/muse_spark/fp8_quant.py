@@ -43,6 +43,24 @@ def pack_fp8_rows(w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def pack_fp8_rows_pooler(w: torch.Tensor) -> torch.Tensor:
+    """``pack_fp8_rows`` with each row's codes permuted for the pooler GEMV's 16-byte
+    lane loads: within every 128-k wave block (k = 32 kc + 8 g4 + j, kc < 4 the MFMA
+    steps, g4 the lane group, j < 8), the two steps of a lane group sit together
+    (position 64 (kc / 2) + 16 g4 + 8 (kc % 2) + j), so one load a step pair feeds
+    both steps (a CU issues VMEM instructions at a fixed rate: 8-byte lane loads
+    stream at half the bandwidth of 16-byte ones). The row scales follow as before."""
+    codes, scales = quantize_fp8_rows(w)
+    N, K = codes.shape
+    assert K % 128 == 0, K
+    c8 = codes.view(torch.uint8).reshape(N, K // 128, 2, 2, 4, 8)  # [n][block][kc / 2][kc % 2][g4][j]
+    c8 = c8.permute(0, 1, 2, 4, 3, 5).contiguous().reshape(N, K)  # -> [n][block][kc / 2][g4][kc % 2][j]
+    out = torch.empty(N * K + 4 * N, dtype=torch.uint8, device=w.device)
+    out[: N * K] = c8.reshape(-1)
+    out[N * K :] = scales.view(torch.uint8)
+    return out
+
+
 def unpack_fp8_rows(packed: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """The fp32 values [n, k] a ``pack_fp8_rows`` buffer encodes."""
     codes = packed[: n * k].view(torch.float8_e4m3fn).reshape(n, k)

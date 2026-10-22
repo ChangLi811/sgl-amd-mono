@@ -298,12 +298,13 @@ def _quantized_experts(experts, i: int, copies: dict) -> tuple:
 
 def _fp8_dense(weight: torch.Tensor, i: int, what: str, copies: dict) -> torch.Tensor:
     """A dense bf16 weight's packed FP8 copy (``pack_fp8_rows``), kept in ``copies``."""
-    from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows
+    from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, pack_fp8_rows_pooler
 
     key = ("fp8 dense", i, what)
     if key not in copies:
         with torch.no_grad():
-            copies[key] = pack_fp8_rows(weight.data)
+            pack = pack_fp8_rows_pooler if what == "pooler" else pack_fp8_rows  # the pooler's lane-swizzled layout
+            copies[key] = pack(weight.data)
     return copies[key]
 
 

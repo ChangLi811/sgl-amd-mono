@@ -135,9 +135,9 @@ class Layer:
             "w_unpool": (torch.randn(HIDDEN, MOE_HIDDEN, device=dev) * 0.02).to(bf),
         }
         if FP8_DENSE:  # the kernels stream the packed copies (the merged / four launch forms agree either way)
-            from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows
+            from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, pack_fp8_rows_pooler
 
-            self.w2k["w_pool"] = pack_fp8_rows(self.w2k["w_pool"])
+            self.w2k["w_pool"] = pack_fp8_rows_pooler(self.w2k["w_pool"])  # the pooler's lane-swizzled layout
             self.w3k["w_unpool"] = pack_fp8_rows(self.w3k["w_unpool"])
 
 

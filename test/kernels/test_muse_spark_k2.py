@@ -160,10 +160,10 @@ def test_k2_matches_the_ops_math(rows, fp8):
     # takes the values they encode (fp32)
     pool_ptr = w["w_pool"].data_ptr()
     if fp8:
-        from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, unpack_fp8_rows
+        from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, pack_fp8_rows_pooler, unpack_fp8_rows
 
-        packed = pack_fp8_rows(w["w_pool"])
-        w["w_pool"] = unpack_fp8_rows(packed, MOE_HIDDEN, HIDDEN)
+        packed = pack_fp8_rows_pooler(w["w_pool"])  # the kernel's lane-swizzled layout
+        w["w_pool"] = unpack_fp8_rows(pack_fp8_rows(w["w_pool"]), MOE_HIDDEN, HIDDEN)  # the same codes, row-major
         pool_ptr = packed.data_ptr()
     ids = torch.full((MAX_TOKENS, TOP_K), -7, dtype=torch.int32, device=dev)
     scores = torch.full((MAX_TOKENS, TOP_K), float("nan"), device=dev)
