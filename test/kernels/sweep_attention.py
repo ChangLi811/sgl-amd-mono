@@ -11,6 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_muse_spark_layer import LAYER, LENS, Buffers, Layer, _attn_args, _epoch, _time_graph  # noqa: E402
 
 CASES = (
+    (8, 0, [300000]),
+    (8, 2047, [300000]),
+    (16, 0, [300000, 200000]),
     (8, 0, [95000]),
     (8, 2047, [95000]),
     (8, 0, [20000]),
