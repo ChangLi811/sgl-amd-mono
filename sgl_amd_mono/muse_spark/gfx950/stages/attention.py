@@ -21,8 +21,9 @@ statistics, P through LDS, V transposed through LDS, PV; the waves' key splits
 merge in LDS as a tree (8 -> 4 -> 2 -> 1); the partial (m, l, O) a row goes out
 as plain fp32 words with one flag a task. The partitions are sized to at most
 ``MAX_PARTS`` a request from the longest request's span (``part_in`` overrides),
-so a 95k-key full layer is 128 tasks of three chunks a KV head and a sliding
-layer eight tasks of one.
+so one 95k-key request's full layer is 128 tasks of three chunks a KV head and a
+sliding layer eight tasks of one; with more requests the partitions shrink in
+number so the step stays near two tasks a CTA.
 
 Merge. A (request, KV head, row tile) with at most ``DIRECT_MAX`` partitions
 folds them in one job; a longer one in two levels: ``MERGE_GROUPS`` level-1 jobs
@@ -169,7 +170,11 @@ def run_kattn(c, o_flag=None):
     max_span = span_of(fx.Int32(0))
     for rr in range_constexpr(1, R):
         max_span = fx.max(max_span, span_of(fx.Int32(rr)))
-    auto = ((max_span * CHUNK + MAX_PARTS * CHUNK - 1) // (MAX_PARTS * CHUNK)) * CHUNK
+    # partitions a request: up to MAX_PARTS, fewer with more requests so that the step
+    # has about two tasks a CTA (a task costs ~6 us beside its chunks: eight 95k
+    # requests at 128 partitions each were 15 tasks a CTA, 212 us)
+    MP = max(1, min(MAX_PARTS, (2 * BLOCKS) // (R * LOCAL_KV_HEADS * TASK_TILES)))
+    auto = ((max_span * CHUNK + MP * CHUNK - 1) // (MP * CHUNK)) * CHUNK
     part = (part_in > 0).select(part_in, auto)
     n_parts = (max_span * CHUNK + part - 1) // part  # partitions a (request, head) at most
 
