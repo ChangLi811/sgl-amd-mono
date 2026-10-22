@@ -44,7 +44,10 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
     WINDOW,
 )
+from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark.gfx950.layout import (
+    TRACE_LAYERS,
+    TRACE_SLOTS,
     k1_scratch_layout,
     kattn_scratch_layout,
     scratch_bytes,
@@ -163,7 +166,7 @@ class MuseMonoRunner:
         # the pooler / unpooler as FP8 copies when every kernel layer carries them
         self.fp8_dense = all(v.w_pool_fp8 is not None and v.w_unpool_fp8 is not None for v in views if v.kind == "mxfp4")
         self._k1_done = -1  # the layer whose K1 the previous merged launch ran
-        self._trace_shape, self._trace_captured, self._trace_started = None, False, False
+        self._trace_shape = None  # (rows, q_len) of the last launch, for the attention trace region's offset
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         dev, bf16 = self.device, torch.bfloat16
         self.deadline_s = None
@@ -337,6 +340,13 @@ class MuseMonoRunner:
             self.windows.append(w if w > 0 else 0)
         self.swa_map = pool.full_to_swa_index_mapping
         self.backend, self.pool = backend, pool
+        if TRACE_DIR:
+            # the pinned host buffers before any capture (no host allocation inside
+            # one); the save thread is CPU-only, so it may run through the captures
+            regions = {"k1": self.scratch_k1, "attn": self.scratch_attn, "k2": self.scratch_k2, "k3": self.scratch_k3}
+            self._trace_host = {k: torch.empty(TRACE_LAYERS * BLOCKS * TRACE_SLOTS * 8, dtype=torch.uint8, pin_memory=True) for k in regions}  # fmt: skip
+            self._trace_epoch_host = torch.empty_like(self.epoch, device="cpu", pin_memory=True)
+            self._start_trace_thread()
 
     # ---------------------------------------------------------------- stage trace
     def _trace_regions(self):
@@ -364,11 +374,8 @@ class MuseMonoRunner:
         inside a launch."""
         if self._trace_shape is None:
             return
-        if not hasattr(self, "_trace_host"):
-            self._trace_host = {k: torch.empty(v.numel(), dtype=torch.uint8, pin_memory=True) for k, v in self._trace_regions().items()}
-            self._trace_epoch_host = torch.empty_like(self.epoch, device="cpu", pin_memory=True)
         for k, v in self._trace_regions().items():
-            self._trace_host[k].copy_(v, non_blocking=True)
+            self._trace_host[k][: v.numel()].copy_(v, non_blocking=True)
         self._trace_epoch_host.copy_(self.epoch, non_blocking=True)
 
     def _start_trace_thread(self) -> None:
@@ -378,7 +385,6 @@ class MuseMonoRunner:
         import time
 
         os.makedirs(TRACE_DIR, exist_ok=True)
-        self._trace_started = True
 
         def loop():
             path = os.path.join(TRACE_DIR, f"rank{self.rank}.pt")
@@ -503,13 +509,6 @@ class MuseMonoRunner:
     def end_step(self) -> None:
         """The next step's epoch, enqueued after this step's last launch."""
         if TRACE_DIR:
-            self._trace_copy_out()
-            # the save thread starts at the first eager step after the graph captures
-            # (a prefill: the decode steps replay graphs and never reach Python); it
-            # must not run during a capture (global capture mode)
-            if torch.cuda.is_current_stream_capturing():
-                self._trace_captured = True
-            elif self._trace_captured and not self._trace_started:
-                self._start_trace_thread()
+            self._trace_copy_out()  # captured into the graph with the step
         self.epoch[0].add_(1)
         self._k1_done = -1
