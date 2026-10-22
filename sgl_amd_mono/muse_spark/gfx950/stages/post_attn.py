@@ -810,20 +810,23 @@ def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     stage_o(c, bid, w_first)
     stage_o(c, bid + BLOCKS, w_second)
     stamp(c, 2)  # the o tasks done
-    # every chain CTA holds a boundary task at the served widths (a_parts); its
-    # pooler weights: the prefetching waves' before the boundary (they stream while it
-    # waits on the ranks), the boundary waves' after (loads complete in order)
-    assert A_PARTS * S == A_TASKS_MAX, (A_PARTS, S)
+    # a chain CTA's pooler weights: the prefetching waves' before its boundary task
+    # (they stream while the boundary waits on the ranks), the boundary waves' after
+    # (loads complete in order: issued before, they would queue the boundary's polls)
     tile, part = bid // P_PARTS, bid % P_PARTS
     BW = boundary_waves(S)
+    has_bnd = (bid >= AP0) & (bid < AP0 + A_PARTS * S)
     if const_expr(BW < WAVES):
         pre = pool_w_loads(c, tile, part, waves=(0, WAVES - BW))
-    stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
-    stamp(c, 3)  # the boundary part done
-    if const_expr(BW < WAVES):
+        if has_bnd:
+            stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
+        stamp(c, 3)  # the boundary part done (boundary CTAs)
         late = pool_w_loads(c, tile, part, waves=(WAVES - BW, WAVES))
         pool_w = [[pre[sub][kc] + late[sub][kc] for kc in range(P_STEPS)] for sub in range(P_SUB)]
     else:
+        if has_bnd:
+            stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
+        stamp(c, 3)  # the boundary part done (boundary CTAs)
         pool_w = pool_w_loads(c, tile, part)
     rocdl.sched_barrier(0)
     wait_x(c)
