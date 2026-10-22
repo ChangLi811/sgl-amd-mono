@@ -22,8 +22,8 @@ merge in LDS as a tree (8 -> 4 -> 2 -> 1); the partial (m, l, O) a row goes out
 as plain fp32 words with one flag a task. The partitions are sized to at most
 ``MAX_PARTS`` a request from the longest request's span (``part_in`` overrides),
 so one 95k-key request's full layer is 128 tasks of three chunks a KV head and a
-sliding layer eight tasks of one; with more requests the partitions shrink in
-number so the step stays near two tasks a CTA.
+sliding layer eight tasks of one; the partition grows with the step's total
+chunk work so a step stays near two equal tasks a CTA whatever the request mix.
 
 Merge. A (request, KV head, row tile) with at most ``DIRECT_MAX`` partitions
 folds them in one job; a longer one in two levels: ``MERGE_GROUPS`` level-1 jobs
@@ -168,14 +168,20 @@ def run_kattn(c, o_flag=None):
         return hi_r - lo_r
 
     max_span = span_of(fx.Int32(0))
+    total_span = max_span
     for rr in range_constexpr(1, R):
-        max_span = fx.max(max_span, span_of(fx.Int32(rr)))
-    # partitions a request: up to MAX_PARTS, fewer with more requests so that the step
-    # has about two tasks a CTA (a task costs ~6 us beside its chunks: eight 95k
-    # requests at 128 partitions each were 15 tasks a CTA, 212 us)
-    MP = max(1, min(MAX_PARTS, (2 * BLOCKS) // (R * LOCAL_KV_HEADS * TASK_TILES)))
-    auto = ((max_span * CHUNK + MP * CHUNK - 1) // (MP * CHUNK)) * CHUNK
-    part = (part_in > 0).select(part_in, auto)
+        sp = span_of(fx.Int32(rr))
+        max_span = fx.max(max_span, sp)
+        total_span = total_span + sp
+    # the partition (chunks a task) from the step's total chunk work, so that the
+    # step has about two equal tasks a CTA whatever the request mix (a task costs
+    # ~6 us beside its chunks: eight 95k requests at 128 partitions each were 15
+    # tasks a CTA, 212 us; one partition a request for all would starve the CTAs
+    # on a mixed step), and at least what keeps the longest request within MAX_PARTS
+    per_cta = (total_span * (LOCAL_KV_HEADS * TASK_TILES) + 2 * BLOCKS - 1) // (2 * BLOCKS)
+    floor_ = (max_span + MAX_PARTS - 1) // MAX_PARTS
+    pc = fx.max(fx.max(per_cta, floor_), fx.Int32(1))
+    part = (part_in > 0).select(part_in, pc * CHUNK)
     n_parts = (max_span * CHUNK + part - 1) // part  # partitions a (request, head) at most
 
     def n_parts_of(r):
