@@ -60,8 +60,6 @@ SGLANG_READS = {
         "layers",
         "candidate_selector",
         "draft_config",
-        "embed_tokens",
-        "forward_embed",
         "norm",
         "input_layernorm",
         "post_attention_layernorm",
@@ -233,7 +231,8 @@ class _Draft:
 
         m = self.model
         if input_embeds is None:
-            input_embeds = m.embed_tokens(input_ids) if m.embed_tokens is not None else m.forward_embed(input_ids)
+            # the worker embeds the block with the target's table (a DFlash2 draft has none)
+            raise ValueError("the Muse Spark DFlash2 draft forward needs input_embeds")
         rows = int(plan.key.rows)
         hidden, residual = input_embeds, None
         stream = torch.cuda.current_stream()
