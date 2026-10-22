@@ -445,13 +445,7 @@ class MuseMonoRunner:
         if SKIP_LAYERS:
             return stream, attn_input
         if TRACE_DIR:
-            # the snapshot thread's copies would invalidate a graph capture (global
-            # capture mode): it starts at the first launch after the captures
             self._trace_shape = (rows, q_len)
-            if torch.cuda.is_current_stream_capturing():
-                self._trace_captured = True
-            elif getattr(self, "_trace_captured", False) and not getattr(self, "_trace_started", False):
-                self._start_trace_thread()
         k_cache, v_cache, is_swa = self.caches[i]
         m = self.swa_map
         cur = torch.cuda.current_stream()
@@ -510,5 +504,12 @@ class MuseMonoRunner:
         """The next step's epoch, enqueued after this step's last launch."""
         if TRACE_DIR:
             self._trace_copy_out()
+            # the save thread starts at the first eager step after the graph captures
+            # (a prefill: the decode steps replay graphs and never reach Python); it
+            # must not run during a capture (global capture mode)
+            if torch.cuda.is_current_stream_capturing():
+                self._trace_captured = True
+            elif self._trace_captured and not self._trace_started:
+                self._start_trace_thread()
         self.epoch[0].add_(1)
         self._k1_done = -1
