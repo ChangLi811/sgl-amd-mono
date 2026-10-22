@@ -16,7 +16,6 @@ from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import (
-    XS_LDS_MAX,
     attn_rows,
     k1_scratch_layout,
     kattn_scratch_layout,
@@ -54,7 +53,6 @@ def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged
         "lane": tid % 64,
         "wave": tid // 64,
         "red": lds.red.ptr,
-        "xs": lds.xs.ptr if s <= XS_LDS_MAX else None,
         "put": mb.put,
         "poll": mb.poll,
         "args": args,

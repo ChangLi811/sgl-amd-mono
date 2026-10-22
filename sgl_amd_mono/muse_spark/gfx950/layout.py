@@ -20,32 +20,31 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
 )
 
 # ---------------------------------------------------------------- K1 (pre_attn)
-ROWS = 16  # projection rows a GEMV task: the MFMA's M
+ROWS = 16  # projection rows an MFMA tile: the MFMA's M
 TILE = 16  # tokens an MFMA B operand holds: a token tile
 K_STEP = 32  # the bf16 MFMA's K
-HALVES = 2  # row groups 0 .. 127 as two K halves: one task a CTA
-PARTS = 4  # partial slots a (token, row): the halves, or the overflow groups' quarters
-K_HALF = HIDDEN // HALVES  # 4096
-K_PER_WAVE = K_HALF // WAVES  # 512: each wave's contiguous K range of a half
-K_STEPS = K_PER_WAVE // K_STEP  # 16 MFMAs a wave a token tile
-STEP_BATCH = 8  # k-steps whose weight loads go out together (32 VGPRs)
-GEMV_TASKS = QKVG_ROWS // ROWS  # 144 row groups
-HALF_GROUPS = BLOCKS // HALVES  # 128 row groups as halves, a task a CTA
-QUARTER_GROUPS = GEMV_TASKS - HALF_GROUPS  # 16 row groups (the gate rows' tail) as four K quarters
-SPLIT_TASKS = HALF_GROUPS * HALVES + QUARTER_GROUPS * PARTS  # 256 + 64
+G_ROWS = 64  # projection rows a GEMV task: four MFMA tiles
+G_TILES = G_ROWS // ROWS  # 4
+K_PARTS = 8  # a task covers one eighth of K: x a task is S x 2 KB (not S x 16 KB), a slot a part
+PARTS = K_PARTS  # partial slots a (token, row)
+K_PART = HIDDEN // K_PARTS  # 1024
+K_PER_WAVE = K_PART // WAVES  # 128: each wave's contiguous K range of a part
+K_STEPS = K_PER_WAVE // K_STEP  # 4 MFMAs a wave a (row tile, token tile)
+STEP_BATCH = K_STEPS  # one batch: a task's weights all in flight (64 VGPRs)
+GEMV_GROUPS = QKVG_ROWS // G_ROWS  # 36 row groups
+GEMV_TASKS = GEMV_GROUPS * K_PARTS  # 288 tasks: one a CTA, a second on 32 CTAs
+SECOND_TASKS = GEMV_TASKS - BLOCKS  # 32
 HEAD_TASKS = LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS  # 20: a CTA a q, k or v head
 GATE_TASKS = Q_K // HEAD_DIM  # 16: the gate rows' part sums, 64 rows a task
 HT0 = 32  # the first head task's CTA
 GT0 = HT0 + HEAD_TASKS  # the first gate task's CTA
-QT0 = GT0 + GATE_TASKS  # the first quarter task's CTA: 64 quarter tasks as second tasks, past the head / gate CTAs
-assert QT0 + QUARTER_GROUPS * PARTS <= BLOCKS and HALF_GROUPS * ROWS == 2048
+QT0 = GT0 + GATE_TASKS  # the first CTA with a second GEMV task (past the head / gate CTAs)
 ELEMS = 4  # a head task lane's dims: 16 lanes x 4 = HEAD_DIM, two RoPE pairs
 TOKEN_LANES = 16
 TOKENS_PER_PASS = THREADS // TOKEN_LANES  # 32 tokens a head / gate pass
-XS_LDS_MAX = 8  # steps of up to this many rows stage x in LDS (16 KB a row)
-RED_FLOATS = WAVES * 64 * 4  # one token tile's MFMA accumulators in LDS
-assert QKVG_ROWS % ROWS == 0 and K_STEPS % STEP_BATCH == 0 and (K_STEPS // 2) % STEP_BATCH == 0
-assert GT0 + GATE_TASKS <= BLOCKS
+RED_FLOATS = WAVES * 64 * 4  # one (row tile, token tile)'s MFMA accumulators in LDS
+assert QKVG_ROWS % G_ROWS == 0 and K_STEPS % STEP_BATCH == 0 and GEMV_GROUPS * G_ROWS == QKVG_ROWS
+assert QT0 + SECOND_TASKS <= BLOCKS and 0 < SECOND_TASKS <= BLOCKS
 assert MAX_TOKENS % TILE == 0
 
 
@@ -61,7 +60,7 @@ def token_passes(s: int) -> int:
 
 def k1_scratch_layout() -> dict:
     """K1's scratch regions, name -> (byte offset, bytes), sized for MAX_TOKENS:
-    the halves' fp32 partials (a pair a (half, token, row)) and, in a merged
+    the K parts' fp32 partials (a pair a (part, token, row)) and, in a merged
     launch, a flag a token for its x."""
     return pair_layout(
         [("k1_part", PARTS * MAX_TOKENS * QKVG_ROWS), ("k1_xflag", MAX_TOKENS), ("k1_trace", BLOCKS * TRACE_SLOTS)],
@@ -73,14 +72,13 @@ def scratch_bytes(layout: dict) -> int:
     return max(off + nbytes for off, nbytes in layout.values())
 
 
-def k1_lds_floats(s: int) -> tuple[int, int]:
-    """(reduction floats, staged-x floats) of K1's LDS at width ``s``."""
-    xs = s * HIDDEN // 2 if s <= XS_LDS_MAX else 4
-    return token_tiles(s) * RED_FLOATS, xs
+def k1_lds_floats(s: int) -> int:
+    """K1's LDS floats at width ``s``: a reduction row set a (row tile, token tile)."""
+    return G_TILES * token_tiles(s) * RED_FLOATS
 
 
 def k1_lds_bytes(s: int) -> int:
-    return 4 * sum(k1_lds_floats(s))
+    return 4 * k1_lds_floats(s)
 
 # ---------------------------------------------------------------- K-attn (attention)
 GQA = 8  # query heads a KV head on a rank
