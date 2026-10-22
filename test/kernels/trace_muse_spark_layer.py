@@ -76,6 +76,7 @@ def main():
     layer = build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, trace=True)) if merged else None
     try:
         def step():
+            stream = torch.cuda.current_stream()  # the capture stream inside a graph capture
             _k1(k1, L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream)
             if merged:
                 layer(
