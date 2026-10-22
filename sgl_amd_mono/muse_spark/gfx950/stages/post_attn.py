@@ -27,9 +27,9 @@ unqueued; the other CTAs (the stream CTAs) issue the pooler's weights after
 their o tasks and wait on the tokens' flags behind them, as they must anyway::
 
     og      S tasks, stream CTA OG0 + t: token t's normed, gated o -> ``og``
-    o       512 tasks (16 rows each), two a stream CTA, three on CTAs 0 ..
-            O_THIRD: o_proj partial rows -> every rank's ``attn`` region
-    a_part  a_parts(S) tasks a token, stream CTAs AP0 ..: the all-reduce sum of
+    o       512 tasks (16 rows each), two a CTA on every CTA: o_proj partial
+            rows -> every rank's ``attn`` region
+    a_part  a_parts(S) tasks a token, chain CTAs AP0 ..: the all-reduce sum of
             the part's columns, the boundary with the row's sums of squares
             exchanged through ``ss``, x -> ``xbuf`` (plain bf16 words), the
             stream in place, part 0 the token's ``xflag``
@@ -120,12 +120,11 @@ XT = 8  # tokens a router / pooler pass: their x in LDS (16 KB a token)
 A_PARTS_MAX = 8  # CTAs a token's attention boundary at most
 A_PAIRS_MAX = HIDDEN // (2 * THREADS)  # 8: a thread's column pairs with the whole row on one CTA
 CHAIN0 = BLOCKS - MAX_TOKENS  # 192: the chain CTAs, token bid - CHAIN0's route and xn
-O_THIRD = O_TASKS - 2 * CHAIN0  # 128: CTAs 0 .. O_THIRD take a third o task
-AP0 = O_THIRD  # the boundary tasks: the stream CTAs with two o tasks
-OG0 = AP0  # the og tasks: the same CTAs, before their weights go out
-A_TASKS_MAX = CHAIN0 - AP0  # 64 boundary tasks at most
+AP0 = CHAIN0  # the boundary tasks: the chain CTAs, before their pooler weights go out
+OG0 = 0  # the og tasks: stream CTAs 0 .. S, before their o weights go out
+A_TASKS_MAX = BLOCKS - CHAIN0  # 64 boundary tasks at most
 R0 = 0  # the router tasks
-assert 2 * CHAIN0 < O_TASKS <= 3 * CHAIN0 and R0 + R_TASKS <= CHAIN0
+assert O_TASKS == 2 * BLOCKS and R0 + R_TASKS <= CHAIN0  # two o tasks a CTA, every CTA
 assert MAX_TOKENS <= CHAIN0 and MAX_TOKENS <= A_TASKS_MAX
 assert K_STEPS % STEP_BATCH == 0 and K_STEPS % WAVES == 0 and O_K_PER_WAVE % K_STEP == 0
 assert EXPERTS == 4 * 64 and TOP_K <= 64  # a lane holds 4 routing keys; the picks on one wave
@@ -722,15 +721,28 @@ def stage_xn(c, t, xin_flag=None):
 # ---------------------------------------------------------------- the CTAs' roles
 @flyc.jit
 def run_chain(c, route_flag=None, xin_flag=None):
-    """A chain CTA (``bid >= CHAIN0``): its pooler rows' weights at once, the
-    tokens' flags, the pooler passes, then token ``bid - CHAIN0``'s route and xn."""
+    """A chain CTA (``bid >= CHAIN0``): its two o tasks (``bid`` and ``bid +
+    BLOCKS``), its boundary part (the 64 boundary tasks sit here: a part's polls
+    then wait behind no pooler weights, and the stream CTAs' weights go out right
+    after their o tasks), then its pooler rows' weights, the tokens' flags, the
+    pooler passes, and token ``bid - CHAIN0``'s route and xn."""
     S, bid, misc = c["S"], c["bid"], c["misc"]
     a = c["args"]
+    A_PARTS = a_parts(S)
     tok = bid - CHAIN0
 
     def put_pooled(r, tk, total):
         fx.ptr_store(bf16_round(total), misc + (tk * ROWS + r))
 
+    w_first = o_w_loads(c, bid)
+    w_second = o_w_loads(c, bid + BLOCKS)
+    stage_og_rows(c)
+    stage_o(c, bid, w_first)
+    stage_o(c, bid + BLOCKS, w_second)
+    stamp(c, 2)  # the o tasks done
+    if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
+        stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
+    stamp(c, 3)  # the boundary part done (a_part CTAs)
     pool_w = x_w_loads(c, a["w_pool"], bid)
     rocdl.sched_barrier(0)
     wait_x(c)
@@ -750,12 +762,11 @@ def run_chain(c, route_flag=None, xin_flag=None):
 
 @flyc.jit
 def run_stream(c, o_flag=None, QL=8):
-    """A stream CTA (``bid < CHAIN0``): its og task, its o tasks (``bid``, ``bid +
-    CHAIN0`` and, below O_THIRD, ``bid + 2 CHAIN0``; every CTA issues the third's
-    loads, past the buffer on the rest), its boundary part, then its pooler
-    weights, the tokens' flags, and the router / pooler passes (a router task's
-    rows on CTAs R0 ..: every stream CTA loads a tile's rows, the index clamped;
-    they stream while the first pass is staged)."""
+    """A stream CTA (``bid < CHAIN0``): its og task (CTAs 0 .. S), its two o tasks
+    (``bid`` and ``bid + BLOCKS``), then its pooler weights, the tokens' flags, and
+    the router / pooler passes (a router task's rows on CTAs R0 ..: every stream CTA
+    loads a tile's rows, the index clamped; they stream while the first pass is
+    staged)."""
     S, bid, misc, put, logits = c["S"], c["bid"], c["misc"], c["put"], c["logits"]
     a = c["args"]
     A_PARTS = a_parts(S)
@@ -763,19 +774,12 @@ def run_stream(c, o_flag=None, QL=8):
         stage_og(c, bid - OG0, o_flag, QL)
     stamp(c, 1)  # the og task done (og CTAs)
     w_first = o_w_loads(c, bid)
-    w_second = o_w_loads(c, bid + CHAIN0)
-    w_third = o_w_loads(c, bid + 2 * CHAIN0)
+    w_second = o_w_loads(c, bid + BLOCKS)
     stage_og_rows(c)
     stage_o(c, bid, w_first)
-    stage_o(c, bid + CHAIN0, w_second)
-    if bid < O_THIRD:
-        stage_o(c, bid + 2 * CHAIN0, w_third)
+    stage_o(c, bid + BLOCKS, w_second)
     stamp(c, 2)  # the o tasks done
-    # the boundary parts, before this CTA's pooler weights go out (its poll
-    # would wait behind them)
-    if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
-        stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
-    stamp(c, 3)  # the boundary part done (a_part CTAs)
+    stamp(c, 3)  # (the boundary parts run on the chain CTAs)
     pool_w = x_w_loads(c, a["w_pool"], bid)
     rocdl.sched_barrier(0)
     wait_x(c)
