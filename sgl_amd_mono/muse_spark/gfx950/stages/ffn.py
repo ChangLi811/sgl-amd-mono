@@ -84,7 +84,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     TOP_K,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, poll_flags, release_stores, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, lds_atomic_add, poll_flags, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import (
     e2m1_code,
     lanes_before,
@@ -473,47 +473,36 @@ def unp_scale(c, row):
 # ---------------------------------------------------------------- 0. the plan
 @flyc.jit
 def stage_plan(c):
-    """The step's plan in LDS, by wave 0, the same on every CTA: lane p = pick p
-    (token p / TOP_K, slot p % TOP_K) in rounds of 64 picks; a pick's column is
-    its rank among its expert's picks in pick order (a ballot an expert, the
-    64-lane count by halves); lane e then holds local expert e's count, and the
-    experts' column tiles of 16 are listed in expert order. Returns the tiles."""
-    S, lane, wave = c["S"], c["lane"], c["wave"]
+    """The step's plan in LDS, the same on every CTA: every thread takes picks
+    (token p / TOP_K, slot p % TOP_K) and claims its pick's column with an atomic
+    add on its local expert's count (a pick's column is its order of arrival among
+    the expert's picks: any order serves, the consumers look picks up by column);
+    then wave 0 lists the experts' column tiles of 16 in expert order. Returns the
+    tiles. (A ballot an expert a round of 64 picks, on one wave, took 11 us at 64
+    rows; this is one round of 512 picks on 512 threads.)"""
+    S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     pick_of, cnt_of, tile_of, nt = c["pick_of"], c["cnt_of"], c["tile_of"], c["nt"]
     a = c["args"]
     local_start = a["local_start"]
+    PICKS = S * TOP_K
+    if tid < LOCAL_EXPERTS:
+        fx.ptr_store(fx.Int32(0), cnt_of + tid)
+    gpu.barrier()
+    r_ids = rsrc(a["ids"])
+    for rr in range_constexpr(cdiv(PICKS, THREADS)):
+        p = rr * THREADS + tid
+        if p < PICKS:
+            le = fx.Int32(bo.buffer_load(r_ids, p, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) - local_start
+            # EP 8: a pick of another rank's expert is not this rank's
+            if (le >= 0) & (le < LOCAL_EXPERTS):
+                col = lds_atomic_add(cnt_of + le, 1)
+                if col < COLS:
+                    fx.ptr_store(p, pick_of + (le * COLS + col))
+    gpu.barrier()
     if wave == 0:
-        r_ids = rsrc(a["ids"])
-        PICKS = S * TOP_K
-        ROUNDS = cdiv(PICKS, 64)
-        # every round's ids, in flight at once
-        p_ids = [
-            fx.Int32(bo.buffer_load(r_ids, fx.min(rr * 64 + lane, PICKS - 1), vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))  # fmt: skip
-            for rr in range(ROUNDS)
-        ]
-        cnt = fx.Int32(0)  # lane e: local expert e's picks so far
-        for rr in range_constexpr(ROUNDS):
-            p = rr * 64 + lane
-            le = p_ids[rr] - local_start
-            # EP 8: a pick of another rank's expert is not this rank's (lanes 32 .. 63
-            # of the count hold nothing)
-            ok = (p < PICKS) & (le >= 0) & (le < LOCAL_EXPERTS)
-            col = fx.Int32(0)
-            for e in range_constexpr(LOCAL_EXPERTS):
-                hit = ok & (le == e)
-                m = ballot(hit)
-                if const_expr(rr > 0):
-                    base = uniform(lane_gather(cnt, e))
-                else:
-                    base = fx.Int32(0)
-                col = hit.select(base + lanes_before(m, lane), col)
-                cnt = (lane == e).select(cnt + popcount(m), cnt)
-            if ok & (col < COLS):
-                fx.ptr_store(p, pick_of + (le * COLS + col))
         # lane e < LOCAL_EXPERTS: expert e's count, its tiles and their first index
         mine = lane < LOCAL_EXPERTS
-        if mine:
-            fx.ptr_store(cnt, cnt_of + lane)
+        cnt = mine.select(fx.ptr_load(cnt_of + fx.min(lane, LOCAL_EXPERTS - 1)), fx.Int32(0))
         tiles = mine.select((fx.min(cnt, COLS) + TILE_COLS - 1) // TILE_COLS, fx.Int32(0))
         incl = lane_prefix(tiles, lane)
         tile0 = incl - tiles

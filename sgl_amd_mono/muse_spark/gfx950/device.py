@@ -72,3 +72,12 @@ def poll_flags(c, regions):
         assert off <= THREADS, off
     gpu.barrier()
     acquire_loads()
+
+
+def lds_atomic_add(ptr, val):
+    """Atomic add of ``val`` to the LDS word at ``ptr`` (workgroup scope); the word's
+    previous value."""
+    op = llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add, ptr.llvm_ptr, as_ir_value(fx.Int32(val)), llvm.AtomicOrdering.monotonic, syncscope="workgroup"
+    )
+    return fx.Int32(op.result)
