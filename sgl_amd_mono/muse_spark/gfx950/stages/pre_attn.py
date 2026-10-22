@@ -62,6 +62,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
 from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, poll_flags, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ELEMS,
+    GEMV_TASKS,
     G_ROWS,
     G_TILES,
     GATE_TASKS,
@@ -94,10 +95,11 @@ def gemv_k(lane, wave, kpart, kc):
 
 def gemv_w_loads(c, rg, kpart, w):
     """GEMV task (``rg``, ``kpart``)'s weight loads, this lane's: row tile ``it``'s
-    row l16, K_STEPS steps of 16 B, in flight (64 VGPRs). Row-major bf16, read once
-    a layer (nontemporal). ``[tile][step]``."""
+    row l16, K_STEPS steps of 16 B, in flight (72 VGPRs). Row-major bf16, read once
+    a layer (nontemporal). ``[tile][step]``. A row group past the last reads past
+    the buffer: zeros, no traffic (a CTA without the task)."""
     lane, wave = c["lane"], c["wave"]
-    r_w = rsrc(w)
+    r_w = rsrc(w, QKVG_ROWS * HIDDEN * 2)
     return [
         [
             fx.Vector(
@@ -296,15 +298,32 @@ def stage_gate(c, g):
 def run_k1(c, bid, x_flag=None):
     """K1's stages on this CTA: its GEMV task, then its head or gate task. ``x_flag`` (a mailbox region): x was written earlier in this
     launch (the previous layer's boundary), flagged a token each; the first task's
-    weights go out before the wait."""
+    weights go out before the wait. In that launch the boundary CTAs (0 .. S) reach
+    K1 last (their weights would land ~7 us after everyone's x): their GEMV tasks
+    run on the last S CTAs, idle since K3's experts, which issue both tasks' weights
+    on arrival."""
+    S = c["S"]
     stamp(c, 0)
     first = None
+    extra = None
     if const_expr(x_flag is not None):
-        first = gemv_w_loads(c, bid // K_PARTS, bid % K_PARTS, c["args"]["w"])
+        moved = bid < S  # a boundary CTA: its task runs on CTA BLOCKS - S + bid
+        spare = bid >= BLOCKS - S
+        own = moved.select(fx.Int32(GEMV_TASKS), bid)  # past the last task: zero loads
+        t2 = spare.select(bid - (BLOCKS - S), fx.Int32(GEMV_TASKS))
+        first = gemv_w_loads(c, own // K_PARTS, own % K_PARTS, c["args"]["w"])
+        extra = gemv_w_loads(c, t2 // K_PARTS, t2 % K_PARTS, c["args"]["w"])
         rocdl.sched_barrier(0)
-        poll_flags(c, [(x_flag, c["S"])])
+        poll_flags(c, [(x_flag, S)])
     stamp(c, 1)  # x arrived (a merged launch) / entry
-    stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first)
+    if const_expr(x_flag is not None):
+        if bid >= S:
+            stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first)
+        if bid >= BLOCKS - S:
+            t2 = bid - (BLOCKS - S)
+            stage_gemv(c, t2 // K_PARTS, t2 % K_PARTS, extra)
+    else:
+        stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first)
     if const_expr(SECOND_TASKS > 0):
         if (bid >= QT0) & (bid < QT0 + SECOND_TASKS):
             q = BLOCKS + bid - QT0  # the tasks past one a CTA, on idle CTAs
