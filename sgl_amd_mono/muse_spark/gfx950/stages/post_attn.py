@@ -426,33 +426,52 @@ def stage_o(c, task, wts):
 @flyc.jit
 def stage_a_part(c, t, part):
     """Part ``part`` of token ``t``'s attention boundary (columns HIDDEN / A_PARTS
-    part .., 2 PAIRS a thread): the ranks' partial o rows summed in rank order
-    (``sum_partials``), one bf16 rounding; the post norm without weight and the
-    pre-FFN norm with the row's sums of squares exchanged through ``ss``; the
-    stream updated in place (fp32); x out as plain bf16 words; part 0 raises the
-    token's flag once every part's x is out."""
+    part .., 2 PAIRS a thread) on the CTA's last ``boundary_waves(S)`` waves (the
+    others carry the pooler prefetch and take part in the barriers only): the
+    ranks' partial o rows summed in rank order, one bf16 rounding; the post norm
+    without weight and the pre-FFN norm with the row's sums of squares exchanged
+    through ``ss``; the stream updated in place (fp32); x out as plain bf16 words
+    and the (token, part) flag."""
     S, tid, W = c["S"], c["tid"], c["W"]
     put, poll = c["put"], c["poll"]
-    own, ss_mb, xpart, xflag, xbuf = c["own_attn"], c["ss"], c["xpart"], c["xflag"], c["xbuf"]
+    own, ss_mb, xpart, xbuf = c["own_attn"], c["ss"], c["xpart"], c["xbuf"]
     a = c["args"]
     A_PARTS = a_parts(S)
-    PAIRS = A_PAIRS_MAX // A_PARTS
+    BW = boundary_waves(S)
+    BASE = (WAVES - BW) * 64  # the first boundary thread
+    PAIRS = (HIDDEN // A_PARTS) // 2 // (BW * 64)
     NC = 2 * PAIRS  # columns a thread
-    e0 = part * (HIDDEN // A_PARTS) + tid * NC
-    # the operands first: after the poll each would be a dependent round trip
-    prw = ld_bf(a["pre_w"], e0, NC)
-    al = ld_f32(a["alpha"], e0, NC)
-    be = ld_f32(a["beta"], e0, NC)
-    st = ld_f32(a["res"], t * HIDDEN + e0, NC)
-    rocdl.sched_barrier(0)
-    # the all-reduce: this thread's PAIRS pairs from every rank in one poll round (two
-    # adjacent pairs a spec), each pair summed in rank order, one bf16 rounding
+    act = tid >= BASE
+    tb = fx.max(tid - BASE, fx.Int32(0))
+    e0 = part * (HIDDEN // A_PARTS) + tb * NC
     pb = t * (HIDDEN // 2) + e0 // 2
     PW = 2 if PAIRS % 2 == 0 else 1  # pairs a spec
-    ws = poll(
-        [(own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW) for q in range(PAIRS // PW) for src in range(W)],
-        batch=max(8, (PAIRS // PW) * W),
-    )
+    specs = [(own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW) for q in range(PAIRS // PW) for src in range(W)]
+    # the operands first: after the poll each would be a dependent round trip; then
+    # the all-reduce: this thread's PAIRS pairs from every rank in one poll round
+    # (two adjacent pairs a spec), each pair summed in rank order, one bf16 rounding.
+    # A prefetching wave issues no load here: its loads would wait behind the weights.
+    if const_expr(BW == WAVES):
+        prw = ld_bf(a["pre_w"], e0, NC)
+        al = ld_f32(a["alpha"], e0, NC)
+        be = ld_f32(a["beta"], e0, NC)
+        st = ld_f32(a["res"], t * HIDDEN + e0, NC)
+        rocdl.sched_barrier(0)
+        ws = poll(specs, batch=max(8, (PAIRS // PW) * W))
+    else:
+        if act:
+            prw = ld_bf(a["pre_w"], e0, NC)
+            al = ld_f32(a["alpha"], e0, NC)
+            be = ld_f32(a["beta"], e0, NC)
+            st = ld_f32(a["res"], t * HIDDEN + e0, NC)
+            rocdl.sched_barrier(0)
+            ws = poll(specs, batch=max(8, (PAIRS // PW) * W))
+        else:
+            prw = [fx.Float32(0.0) for _ in range(NC)]
+            al = [fx.Float32(0.0) for _ in range(NC)]
+            be = [fx.Float32(0.0) for _ in range(NC)]
+            st = [fx.Float32(0.0) for _ in range(NC)]
+            ws = [[fx.Int32(0) for _ in range(PW)] for _ in specs]
     v = []
     for j in range_constexpr(PAIRS):
         acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
@@ -477,9 +496,17 @@ def stage_a_part(c, t, part):
     B_ = block_sum(c, B_, 2)
     C_ = block_sum(c, C_, 3)
     if const_expr(A_PARTS > 1):
-        if tid < 4:
-            put(ss_mb, (t * A_PARTS_MAX + part) * 4 + tid, (tid == 0).select(ssp, (tid == 1).select(A_, (tid == 2).select(B_, C_))))
-        got = poll([(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)] + [(ss_mb, (t * A_PARTS_MAX + q) * 4 + 2, 2) for q in range(A_PARTS)], batch=2 * A_PARTS)  # fmt: skip
+        k4 = tid - BASE
+        if (k4 >= 0) & (k4 < 4):
+            put(ss_mb, (t * A_PARTS_MAX + part) * 4 + k4, (k4 == 0).select(ssp, (k4 == 1).select(A_, (k4 == 2).select(B_, C_))))
+        sspecs = [(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)] + [(ss_mb, (t * A_PARTS_MAX + q) * 4 + 2, 2) for q in range(A_PARTS)]  # fmt: skip
+        if const_expr(BW == WAVES):
+            got = poll(sspecs, batch=2 * A_PARTS)
+        else:
+            if act:
+                got = poll(sspecs, batch=2 * A_PARTS)
+            else:
+                got = [[fx.Int32(0) for _ in range(2)] for _ in sspecs]
         tot, At, Bt, Ct = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
         for q in range_constexpr(A_PARTS):
             tot = tot + got[q][0].bitcast(fx.Float32)
@@ -491,40 +518,58 @@ def stage_a_part(c, t, part):
     rstd = hw_rsq(tot / float(HIDDEN) + POST_EPS)
     n = [bf16_round(v[k] * rstd) for k in range(NC)]
     new = [al[k] * st[k] + be[k] * n[k] for k in range(NC)]
-    st_f32(a["res"], t * HIDDEN + e0, new, CM_DEV)
     tot2 = At + fx.Float32(2.0) * rstd * Bt + rstd * rstd * Ct
     rstd2 = hw_rsq(tot2 / float(HIDDEN) + RMS_EPS)
     words = [
         bf16_pair(new[2 * k] * rstd2 * prw[2 * k], new[2 * k + 1] * rstd2 * prw[2 * k + 1]).bitcast(fx.Int32)  # fmt: skip
         for k in range(PAIRS)
     ]
-    st_words(xbuf, (t * HIDDEN + e0) // 2, words, CM_DEV)
+    if act:
+        st_f32(a["res"], t * HIDDEN + e0, new, CM_DEV)
+        st_words(xbuf, (t * HIDDEN + e0) // 2, words, CM_DEV)
     release_stores()
     gpu.barrier()
-    if tid == 0:
+    if tid == BASE:
         put(xpart, t * A_PARTS + part, fx.Int32(1))  # the consumers poll every (token, part)
 
 
 # ---------------------------------------------------------------- router and pooler GEMVs
-def pool_w_loads(c, tile, part):
+def boundary_waves(s: int) -> int:
+    """Waves a boundary task runs on at width ``s``: the fewest that keep its
+    columns at eight a thread. A chain CTA's other waves issue its pooler weights
+    before the boundary (their loads would otherwise queue the boundary's polls:
+    loads complete in order), so the weights stream while the boundary waits."""
+    return max(1, min(WAVES, (HIDDEN // a_parts(s)) // (64 * 8)))
+
+
+def pool_w_loads(c, tile, part, waves=None):
     """The pooler weights of task (``tile``, ``part``): its P_SUB row tiles over this
     wave's P_STEPS k-steps of K eighth ``part``, this lane's, in flight (128 VGPRs
     bf16, 64 FP8). Row-major, 8 values a lane a step (16 B bf16, 8 B of E4M3 codes
-    with ``c["fp8_pool"]``), read once a layer (nontemporal)."""
+    with ``c["fp8_pool"]``), read once a layer (nontemporal). ``waves`` = (lo, hi):
+    only those waves' loads; the others read past the buffer (zeros, no traffic),
+    so two calls over complementary ranges sum to the task's weights."""
     lane, wave = c["lane"], c["wave"]
     l16, g4 = lane % 16, lane // 16
-    r_w = rsrc(c["args"]["w_pool"])
     fp8 = c["fp8_pool"]
+    nbytes = MOE_HIDDEN * HIDDEN * (1 if fp8 else 2) + (MOE_HIDDEN * 4 if fp8 else 0)
+    r_w = rsrc(c["args"]["w_pool"], nbytes)
+    oob = fx.Int32(nbytes // 4 + 64)
+    if waves is not None:
+        lo, hi = waves
+        inside = (wave >= lo) & (wave < hi)
     out = []
     for sub in range(P_SUB):
         row = tile * P_ROWS + sub * ROWS + l16
+        offs = []
+        for kc in range(P_STEPS):
+            o = (row * HIDDEN + part * K_PER_WAVE + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // (4 if fp8 else 2)
+            offs.append(o if waves is None else inside.select(o, oob))
         out.append(
             [
                 fx.Vector(
                     bo.buffer_load(
-                        r_w,
-                        (row * HIDDEN + part * K_PER_WAVE + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // (4 if fp8 else 2),
-                        vec_width=2 if fp8 else 4, dtype=T.i32, cache_modifier=CM_NT,
+                        r_w, offs[kc], vec_width=2 if fp8 else 4, dtype=T.i32, cache_modifier=CM_NT,
                     )  # fmt: skip
                 )
                 for kc in range(P_STEPS)
@@ -766,11 +811,21 @@ def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     stage_o(c, bid, w_first)
     stage_o(c, bid + BLOCKS, w_second)
     stamp(c, 2)  # the o tasks done
-    if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
-        stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
-    stamp(c, 3)  # the boundary part done (boundary CTAs)
+    # every chain CTA holds a boundary task at the served widths (a_parts); its
+    # pooler weights: the prefetching waves' before the boundary (they stream while it
+    # waits on the ranks), the boundary waves' after (loads complete in order)
+    assert A_PARTS * S == A_TASKS_MAX, (A_PARTS, S)
     tile, part = bid // P_PARTS, bid % P_PARTS
-    pool_w = pool_w_loads(c, tile, part)
+    BW = boundary_waves(S)
+    if const_expr(BW < WAVES):
+        pre = pool_w_loads(c, tile, part, waves=(0, WAVES - BW))
+    stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
+    stamp(c, 3)  # the boundary part done
+    if const_expr(BW < WAVES):
+        late = pool_w_loads(c, tile, part, waves=(WAVES - BW, WAVES))
+        pool_w = [[pre[sub][kc] + late[sub][kc] for kc in range(P_STEPS)] for sub in range(P_SUB)]
+    else:
+        pool_w = pool_w_loads(c, tile, part)
     rocdl.sched_barrier(0)
     wait_x(c)
     stamp(c, 4)  # every token's x arrived
