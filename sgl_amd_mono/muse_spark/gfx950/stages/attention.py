@@ -416,13 +416,27 @@ def run_kattn(c, o_flag=None):
         if tid == 0:
             put(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS + p, fx.Int32(1))
 
-    for job in range(bid, R * LOCAL_KV_HEADS * TASK_TILES * n_parts, BLOCKS):
-        p = job % n_parts
-        rt0 = ((job // n_parts) % TASK_TILES) * NT
-        h = (job // (n_parts * TASK_TILES)) % LOCAL_KV_HEADS
-        r = job // (n_parts * TASK_TILES * LOCAL_KV_HEADS)
-        if p < n_parts_of(r):
-            attn_task(r, h, rt0, p)
+    # the tasks, request-major over the requests' own partition counts (a short
+    # request has few): job -> (request, head, tile pair, partition) through the
+    # requests' cumulative task counts, so a CTA iterates real tasks only
+    counts = [n_parts_of(fx.Int32(rr)) * (LOCAL_KV_HEADS * TASK_TILES) for rr in range(R)]
+    starts = [fx.Int32(0)]
+    for rr in range(1, R):
+        starts.append(starts[-1] + counts[rr - 1])
+    total = starts[-1] + counts[-1]
+    for job in range(bid, total, BLOCKS):
+        r = fx.Int32(0)
+        for rr in range(1, R):
+            r = (job >= starts[rr]).select(fx.Int32(rr), r)
+        base = starts[0]
+        for rr in range(1, R):
+            base = (r == rr).select(starts[rr], base)
+        np_r = n_parts_of(r)
+        local = job - base
+        p = local % np_r
+        rt0 = ((local // np_r) % TASK_TILES) * NT
+        h = (local // (np_r * TASK_TILES)) % LOCAL_KV_HEADS
+        attn_task(r, h, rt0, p)
     stamp(c, 1)  # the attention tasks done
 
     # ============================================ merge jobs
