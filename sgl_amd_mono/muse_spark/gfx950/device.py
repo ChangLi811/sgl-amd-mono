@@ -50,12 +50,14 @@ def stamp(c, idx: int):
     (``c["trace"]``, a pair a stamp), written by thread 0."""
     if const_expr(not c.get("trace_on", False)):
         return
+    layer = c.get("layer")
+    if const_expr(layer is None):
+        base = c["bid"] * TRACE_SLOTS
+    else:
+        base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + c["bid"] * TRACE_SLOTS
     if c["tid"] == 0:
         now = clock()
-        slot = c["bid"] * TRACE_SLOTS + idx
-        if c.get("layer") is not None:
-            slot = slot + (c["layer"] % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS)
-        addr = c["trace"].value + fx.Int64(slot * 8)
+        addr = c["trace"].value + fx.Int64((base + idx) * 8)
         ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
         llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
 
