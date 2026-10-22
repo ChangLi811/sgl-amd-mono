@@ -459,6 +459,12 @@ def stage_a_part(c, t, part):
         rocdl.sched_barrier(0)
         ws = poll(specs, batch=max(8, (PAIRS // PW) * W))
     else:
+        # (a dynamic if yields its assignments: zeros of the same shape first)
+        prw = [fx.Float32(0.0) for _ in range(NC)]
+        al = [fx.Float32(0.0) for _ in range(NC)]
+        be = [fx.Float32(0.0) for _ in range(NC)]
+        st = [fx.Float32(0.0) for _ in range(NC)]
+        ws = [[fx.Int32(0) for _ in range(PW)] for _ in specs]
         if act:
             prw = ld_bf(a["pre_w"], e0, NC)
             al = ld_f32(a["alpha"], e0, NC)
@@ -466,12 +472,6 @@ def stage_a_part(c, t, part):
             st = ld_f32(a["res"], t * HIDDEN + e0, NC)
             rocdl.sched_barrier(0)
             ws = poll(specs, batch=max(8, (PAIRS // PW) * W))
-        else:
-            prw = [fx.Float32(0.0) for _ in range(NC)]
-            al = [fx.Float32(0.0) for _ in range(NC)]
-            be = [fx.Float32(0.0) for _ in range(NC)]
-            st = [fx.Float32(0.0) for _ in range(NC)]
-            ws = [[fx.Int32(0) for _ in range(PW)] for _ in specs]
     v = []
     for j in range_constexpr(PAIRS):
         acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
@@ -503,10 +503,9 @@ def stage_a_part(c, t, part):
         if const_expr(BW == WAVES):
             got = poll(sspecs, batch=2 * A_PARTS)
         else:
+            got = [[fx.Int32(0) for _ in range(2)] for _ in sspecs]
             if act:
                 got = poll(sspecs, batch=2 * A_PARTS)
-            else:
-                got = [[fx.Int32(0) for _ in range(2)] for _ in sspecs]
         tot, At, Bt, Ct = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
         for q in range_constexpr(A_PARTS):
             tot = tot + got[q][0].bitcast(fx.Float32)
