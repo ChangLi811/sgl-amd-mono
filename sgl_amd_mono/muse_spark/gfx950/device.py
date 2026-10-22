@@ -74,6 +74,29 @@ def poll_flags(c, regions):
     acquire_loads()
 
 
+def lds_dma_16(rsrc_v, lds_ptr, voffset):
+    """``buffer_load_dwordx4 ... lds``: 16 B a lane from the buffer resource
+    ``rsrc_v`` at byte ``voffset`` into LDS at ``lds_ptr`` (wave-uniform) + 16 lane,
+    by inline asm so the compiler's wait counting does not see it (it waits for a
+    visible LDS DMA before every LDS read, which serializes a ring): the caller
+    counts them (``s_waitcnt vmcnt``, loads retire in order)."""
+    r = as_ir_value(rsrc_v)
+    if "ptr<8>" in str(r.type):
+        r = bo._ptr8_to_v4i32(r)
+    # the SGPR operands as values the compiler knows are uniform (readfirstlane each
+    # word): a VGPR-held 128-bit resource has no legal copy into an SGPR quad
+    rv = fx.Vector(r, (4,), fx.Int32)
+    rs = fx.Vector.from_elements([uniform(fx.Int32(rv[i])) for i in range(4)], fx.Int32)
+    base = uniform(fx.Int32(llvm.ptrtoint(T.i32, lds_ptr.llvm_ptr)))
+    llvm.inline_asm(
+        None,
+        [as_ir_value(rs), as_ir_value(base), as_ir_value(fx.Int32(voffset)), as_ir_value(uniform(fx.Int32(0)))],
+        "s_mov_b32 m0, $1\n\ts_nop 0\n\tbuffer_load_dwordx4 $2, $0, $3 offen lds",
+        "s,s,v,s,~{m0},~{memory}",
+        has_side_effects=True,
+    )
+
+
 def lds_atomic_add(ptr, val):
     """Atomic add of ``val`` to the LDS word at ``ptr`` (workgroup scope); the word's
     previous value."""

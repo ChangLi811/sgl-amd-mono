@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_muse_spark_layer import LAYER, LENS, Buffers, Layer, _attn_args, _epoch, _k1, _k1_next_args, _k2_args, _k3_args  # noqa: E402
 
 K1_STAMPS = ["entry", "x ready", "gemv done", "head/gate done"]
-KA_STAMPS = ["entry", "attention tasks done", "merge done"]
+KA_STAMPS = ["entry", "attention tasks done", "merge done", "loop begins", "first chunk done", "loop done"]
 K2_STAMPS = ["entry", "og done", "o tasks done", "a_part done", "x arrived", "passes done", "pooled out", "end"]
 K3_STAMPS = ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end", "unp flags", "unp dma", "unp mfma", "unp pushed"]
 

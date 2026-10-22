@@ -37,28 +37,32 @@ so every wait points to work that is already running.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import rocdl as rocdl_raw
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    ballot,
     butterfly,
     fp8_to_bf16x8,
     hw_exp2,
     mfma_bf16,
+    permlane_swap,
     rsrc,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
 from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, LOG2E, Q_K
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, poll_flags, release_stores, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, lds_dma_16, poll_flags, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ATTN_CHUNK as CHUNK,
     ATTN_KEY_SPLITS as KEY_SPLITS,
     ATTN_KEY_TILES as KEY_TILES,
     ATTN_KEYS_PER_WAVE as KEYS_PER_WAVE,
+    ATTN_IDS_CHUNKS as IDS_CHUNKS,
     ATTN_MAX_PARTS as MAX_PARTS,
+    ATTN_RING_DEPTH as RING_DEPTH,
     ATTN_MERGE_GROUPS as GROUPS,
-    ATTN_P_PITCH as P_PITCH,
     ATTN_PART_ROW as PART_ROW,
     ATTN_Q_PITCH as Q_PITCH,
     ATTN_V_PITCH as V_PITCH,
@@ -73,6 +77,10 @@ NO_MAX = -1.0e29  # a running max below this is "no key yet": exp2 then takes 0
 O_OFF = 4  # a partial row: m, l, pad, pad, O[64] (O 16 B aligned)
 COMB_ROW = PART_ROW  # a tile row's (m, l, pad, pad, O[64]) in the LDS tree
 MERGE_LANES = 4  # partitions folded side by side a (row, 8 dims): 16 x 8 x 4 = THREADS
+PAGE_WORDS = 16 * HEAD_DIM // 4  # a 16-key fp8 page of one head in LDS: 1 KB, chunk-major (dims 16 c .., key)
+V_SKEW = 16  # words between the two V pages beyond a page: the transposed reads of both hit distinct banks
+SLOT_WORDS = 2 * KEY_TILES * PAGE_WORDS + V_SKEW  # a ring slot: a wave's chunk, its K pages then its V pages
+TAU = 8.0  # a row's reference max moves only when a chunk's max exceeds it by this (log2 units): P <= 256
 DIRECT_MAX = 16  # partitions a level-2 job folds itself (four a lane); more go through level 1
 
 
@@ -90,8 +98,8 @@ def kattn_lds(nt: int):
     class Loop:
         qs: fx.Array[fx.BFloat16, nt * 16 * Q_PITCH, 16]  # the task's Q rows (its row tiles)
         red: fx.Array[fx.Float32, THREADS * 10, 16]  # the merge jobs' lane combine
-        pt: fx.Array[fx.BFloat16, WAVES * nt * 16 * P_PITCH, 16]  # each wave's P tiles
-        vt: fx.Array[fx.BFloat16, WAVES * HEAD_DIM * V_PITCH, 16]  # each wave's V^T
+        ring: fx.Array[fx.Int32, WAVES * RING_DEPTH * SLOT_WORDS, 16]  # each wave's K / V chunks (DMA ring)
+        ids: fx.Array[fx.Int32, IDS_CHUNKS * 16, 16]  # the task's page ids, a block of chunks
 
     @fx.struct
     class Tree:
@@ -104,7 +112,7 @@ def kattn_lds(nt: int):
 
 def lds_views(loop, tree):
     """``c`` entries of the two ``kattn_lds`` views (``.peek()`` of union members)."""
-    return {"qs": loop.qs.ptr, "red": loop.red.ptr, "pt": loop.pt.ptr, "vt": loop.vt.ptr, "comb": tree.comb.ptr}
+    return {"qs": loop.qs.ptr, "red": loop.red.ptr, "ring": loop.ring.ptr, "ids": loop.ids.ptr, "comb": tree.comb.ptr}  # fmt: skip
 
 
 @flyc.jit
@@ -125,10 +133,10 @@ def run_kattn(c, o_flag=None):
     l16 = lane % 16
     g4 = lane // 16
     V8B = fx.Vector.make_type(8, fx.BFloat16)
+    V2I = fx.Vector.make_type(2, fx.Int32)
     V4F = fx.Vector.make_type(4, fx.Float32)
-    qs, pt0, vt0, comb, red = c["qs"], c["pt"], c["vt"], c["comb"], c["red"]
-    pt = pt0 + wave * (NT * 16 * P_PITCH)
-    vt = vt0 + wave * (HEAD_DIM * V_PITCH)
+    qs, ring, ids, comb, red = c["qs"], c["ring"], c["ids"], c["comb"], c["red"]
+    wring = ring + wave * (RING_DEPTH * SLOT_WORDS)  # this wave's K / V ring
     table_stride, extra, window, part_in = a["table_stride"], a["extra"], a["window"], a["part_in"]
     lens64 = a["lens64"]
     qk_scale = a["scale_bits"].bitcast(fx.Float32) * fx.Float32(LOG2E)
@@ -174,13 +182,24 @@ def run_kattn(c, o_flag=None):
         max_span = fx.max(max_span, sp)
         total_span = total_span + sp
     # the partition (chunks a task) from the step's total chunk work, so that the
-    # step has about two equal tasks a CTA whatever the request mix (a task costs
-    # ~6 us beside its chunks: eight 95k requests at 128 partitions each were 15
-    # tasks a CTA, 212 us; one partition a request for all would starve the CTAs
-    # on a mixed step), and at least what keeps the longest request within MAX_PARTS
-    per_cta = (total_span * (LOCAL_KV_HEADS * TASK_TILES) + 2 * BLOCKS - 1) // (2 * BLOCKS)
+    # step has one task a CTA whatever the request mix (a task costs ~12 us beside
+    # its chunks of ~1.8 us: its Q and page ids, the first chunk's exposed
+    # latency, the key-split tree and the publish; eight 95k requests at 128
+    # partitions each were 15 tasks a CTA, 212 us), the per-request rounding
+    # checked so that no CTA gets a second task, and at least what keeps the
+    # longest request within MAX_PARTS
+    def tasks_of(pc_):
+        n = fx.Int32(0)
+        for rr in range_constexpr(R):
+            lo_r, hi_r = chunk_range(seq_len_of(fx.Int32(rr)), 0)
+            n = n + ((hi_r - lo_r) + pc_ - 1) // pc_
+        return n * (LOCAL_KV_HEADS * TASK_TILES)
+
+    per_cta = (total_span * (LOCAL_KV_HEADS * TASK_TILES) + BLOCKS - 1) // BLOCKS
     floor_ = (max_span + MAX_PARTS - 1) // MAX_PARTS
     pc = fx.max(fx.max(per_cta, floor_), fx.Int32(1))
+    for _ in range_constexpr(3):
+        pc = (tasks_of(pc) > BLOCKS).select(pc + 1, pc)
     part = (part_in > 0).select(part_in, pc * CHUNK)
     n_parts = (max_span * CHUNK + part - 1) // part  # partitions a (request, head) at most
 
@@ -235,155 +254,151 @@ def run_kattn(c, o_flag=None):
             ]
             for it in range(NT)
         ]
-        # this lane's rows 4 g4 + e of each tile; their query positions
-        qpos = [[fx.min(((rt0 + it) * 16 + 4 * g4 + e) // GQA, QL - 1) for e in range(4)] for it in range(NT)]  # fmt: skip
-        live = [[((rt0 + it) * 16 + 4 * g4 + e) < ROWS for e in range(4)] for it in range(NT)]
-        # each tile's running row statistics and O, carried through the chunk loop
-        m_run = [fx.Vector.filled(4, NEG, fx.Float32) for _ in range(NT)]
-        l_run = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NT)]
+        # S^T tiles: K is the MFMA's A operand (key l16, dims 8 g4 ..), Q^T its B
+        # (row l16): a lane holds row l16 of each row tile and keys 4 g4 .. 4 g4 + 3 of
+        # each key tile, so a row's running statistics are one lane's (four lanes
+        # share a row), and its P values are packed in registers straight into the
+        # PV MFMA's A operand (keys of tile 0 then tile 1; the V^T reads use the
+        # same key order). The reference max of a row moves only when a chunk's max
+        # exceeds it by TAU (lazy rescale, every row of the wave at once).
+        r_lane = [(rt0 + it) * 16 + l16 for it in range(NT)]
+        qpos = [fx.min(fx.min(r_lane[it], ROWS - 1) // GQA, QL - 1) for it in range(NT)]
+        row_live = [r_lane[it] < ROWS for it in range(NT)]
+        m_ref = [fx.Float32(NEG) for _ in range(NT)]  # the row's reference max (its running max, lazily)
+        l_lane = [fx.Float32(0.0) for _ in range(NT)]  # this lane's keys' share of the row sum
         accs = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)] for _ in range(NT)]
         lo, hi = chunk_range(keys, 0)
         c_lo = fx.max(lo, lo + p * (part // CHUNK))
         c_hi = fx.min(hi, lo + (p + 1) * (part // CHUNK))
 
-        # The chunk loop is software-pipelined: chunk cc + 1's K / V loads and
-        # chunk cc + 2's page ids are in flight while chunk cc computes (each
-        # would otherwise be a dependent round trip: the page id, then the
-        # slots). A wave's 32 keys of a chunk are two pages, its two K tiles,
-        # and its V passes read the same two pages.
+        # The chunk loop: a wave's 32 keys of a chunk are two K pages and two V pages
+        # (1 KB each, one head), landed in LDS by DMA (16 B a lane; chunk-major: dims
+        # 16 c .. of key k at bytes 256 c + 16 k, conflict-free for both the K reads
+        # and the transposed V reads) in the wave's ring slot; two chunks are in
+        # flight while one computes. (A VGPR-destination software pipeline was
+        # drained by the compiler at every loop head: 6 us a chunk at 300k keys.)
+        # The page ids of a block of IDS_CHUNKS chunks are staged in LDS first.
         assert KEY_TILES == 2 and V_STEPS == 1
-
-        def pages_of(cc):
-            """The chunk's two page ids, left in VGPRs (every lane loads the same one)."""
-            key0 = cc * CHUNK + ks * KEYS_PER_WAVE
-            return [
-                fx.Int32(bo.buffer_load(r_pt, r * table_stride + (key0 + kt * TILE) // 16, vec_width=1, dtype=T.i32))  # fmt: skip
-                for kt in range(KEY_TILES)
-            ]
-
-        def kv_of(pg0, pg1):
-            """The chunk's K words (tile kt, step) and V words (pass ps) of this lane."""
-            kws = []
-            for pg in (pg0, pg1):
-                slot = pg * 16 + l16  # the tile is one page
-                for step in range_constexpr(2):
-                    kws.append(
-                        fx.Vector(
-                            bo.buffer_load(
-                                r_k, ((slot * LOCAL_KV_HEADS + h) * HEAD_DIM + 32 * step + 8 * g4) // 4,
-                                vec_width=2, dtype=T.i32,
-                            )  # fmt: skip
-                        )
-                    )
-            vws = []
-            for pg in (pg0, pg1):
-                slot = pg * 16 + lane // 4
-                vws.append(
-                    fx.Vector(
-                        bo.buffer_load(
-                            r_v, ((slot * LOCAL_KV_HEADS + h) * HEAD_DIM + (lane % 4) * 16) // 4, vec_width=4, dtype=T.i32
-                        )  # fmt: skip
-                    )
-                )
-            return kws + vws
-
-        # Two chunks of K / V in flight (chunk cc + 2's words go out as chunk cc
-        # computes, two chunk computes to land) and their page ids one chunk ahead
-        # of that: a one-deep pipeline exposed most of the memory latency on every
-        # chunk (6 us a chunk at 300k keys; the loads themselves are ~1.5 us).
         c_last = fx.max(c_hi - 1, c_lo)
-        pa0, pa1 = pages_of(c_lo)
-        pb0, pb1 = pages_of(fx.min(c_lo + 1, c_last))
-        k00, k01, k10, k11, v0, v1 = kv_of(pa0, pa1)
-        n00, n01, n10, n11, w0, w1 = kv_of(pb0, pb1)
-        pc0, pc1 = pages_of(fx.min(c_lo + 2, c_last))
-        for cc in range(c_lo, c_hi):
-            key0 = cc * CHUNK + ks * KEYS_PER_WAVE
-            kw_cur = [k00, k01, k10, k11]
-            vw_cur = [v0, v1]
-            # chunk cc + 2's words and chunk cc + 3's pages go out first
-            k00, k01, k10, k11, v0, v1 = n00, n01, n10, n11, w0, w1
-            n00, n01, n10, n11, w0, w1 = kv_of(pc0, pc1)
-            pc0, pc1 = pages_of(fx.min(cc + 3, c_last))
-            # the chunk's K operands, decoded once for every tile
-            kb = [fp8_to_bf16x8(kw[0], kw[1]) for kw in kw_cur]
-            m_next, l_next, acc_scaled = [], [], []
-            for it in range_constexpr(NT):
-                # ---- QK: S tile kt, key l16 of it; dims 8 g4 + 32 step
-                s_t = []
+        l16d, c16d = lane % 16, lane // 16  # the DMA lane: key l16d, dims chunk c16d of a page
+        # the transposed V read: this lane addresses key 4 g4 + (l16 / 2) % 4 of page (l16 / 2) / 4
+        v_page = (l16 // 2) // 4
+        v_key = 4 * g4 + (l16 // 2) % 4
+
+        def issue(cc, sl, b_lo):
+            """Chunk cc's four pages -> ring slot sl (always four loads: the counts)."""
+            slot = wring + sl * SLOT_WORDS
+            for kt in range_constexpr(KEY_TILES):
+                pg = fx.ptr_load(ids + ((cc - b_lo) * 16 + 2 * ks + kt))  # uniform
+                voff = ((pg * 16 + l16d) * LOCAL_KV_HEADS + h) * HEAD_DIM + c16d * 16
+                lds_dma_16(r_k, slot + kt * PAGE_WORDS, voff)
+                lds_dma_16(r_v, slot + ((KEY_TILES + kt) * PAGE_WORDS + kt * V_SKEW), voff)
+
+        def quad_max(v):
+            """The max over the four lanes sharing a row (l16, l16 + 16, + 32, + 48)."""
+            for off in (32, 16):
+                x, y = permlane_swap(off, v.bitcast(fx.Int32), v.bitcast(fx.Int32))
+                v = fx.max(x.bitcast(fx.Float32), y.bitcast(fx.Float32))
+            return v
+
+        def quad_sum(v):
+            for off in (32, 16):
+                x, y = permlane_swap(off, v.bitcast(fx.Int32), v.bitcast(fx.Int32))
+                v = x.bitcast(fx.Float32) + y.bitcast(fx.Float32)
+            return v
+
+        n_blk = (c_hi - c_lo + IDS_CHUNKS - 1) // IDS_CHUNKS
+        stamp(c, 3)  # a task's chunk loop begins (the last task's stamps survive)
+        for b in range(0, n_blk):
+            b_lo = c_lo + b * IDS_CHUNKS
+            b_hi = fx.min(b_lo + IDS_CHUNKS, c_hi)
+            b_last = b_hi - 1
+            gpu.barrier()  # the previous block's ids are consumed
+            for i in range_constexpr(IDS_CHUNKS * 16 // THREADS):
+                idx = tid + THREADS * i
+                cc_i = fx.min(b_lo + idx // 16, c_last)
+                pg = fx.Int32(bo.buffer_load(r_pt, r * table_stride + cc_i * 16 + idx % 16, vec_width=1, dtype=T.i32))
+                fx.ptr_store(pg, ids + idx)
+            gpu.barrier()
+            issue(b_lo, 0, b_lo)
+            issue(fx.min(b_lo + 1, b_last), 1, b_lo)
+            for cc in range(b_lo, b_hi):
+                sl = (cc - b_lo) % 2
+                slot = wring + sl * SLOT_WORDS
+                key0 = cc * CHUNK + ks * KEYS_PER_WAVE
+                rocdl.s_waitcnt(vmcnt=2 * KEY_TILES)  # chunk cc's pages landed (cc + 1's in flight)
+                # the chunk's K operands (tile kt, step: key l16, dims 32 step + 8 g4)
+                kb = []
                 for kt in range_constexpr(KEY_TILES):
-                    st = fx.Vector.filled(4, 0.0, fx.Float32)
                     for step in range_constexpr(2):
-                        st = mfma_bf16(qa[it][step], kb[kt * 2 + step], st)
-                    s_t.append(st)
-                # ---- scale and mask: lane's rows 4 g4 + e, key l16 of tile kt
-                sc = []
-                for kt in range_constexpr(KEY_TILES):
-                    kidx = key0 + kt * TILE + l16
-                    vals = []
-                    for e in range_constexpr(4):
-                        ok = live[it][e] & (kidx < ctx + qpos[it][e] + 1)
-                        ok = ok & ((window == 0) | ((ctx + qpos[it][e] - kidx) < window))
-                        vals.append(ok.select(fx.Float32(s_t[kt][e]) * qk_scale, fx.Float32(NEG)))
-                    sc.append(vals)
-                # ---- row max over the wave's keys (16 lanes x KEY_TILES); a row
-                # without a key yet takes 0 (the verify kernels' guard)
-                m_new, m_g = [], []
-                for e in range_constexpr(4):
-                    mx = sc[0][e]
-                    for kt in range_constexpr(1, KEY_TILES):
-                        mx = fx.max(mx, sc[kt][e])
-                    mx = butterfly(mx, (1, 2, 4, 8), fx.max)
-                    mn = fx.max(fx.Float32(m_run[it][e]), mx)
-                    m_new.append(mn)
-                    m_g.append((mn > fx.Float32(NO_MAX)).select(mn, fx.Float32(0.0)))
-                # ---- P = exp2(S - m) -> LDS (bf16), its row sums, the rescale
-                l_c = [fx.Float32(0.0) for _ in range(4)]
-                for kt in range_constexpr(KEY_TILES):
-                    for e in range_constexpr(4):
-                        pe = hw_exp2(sc[kt][e] - m_g[e])
-                        l_c[e] = l_c[e] + pe
-                        fx.ptr_store(
-                            pe.to(fx.BFloat16),
-                            pt + ((it * 16 + 4 * g4 + e) * P_PITCH + kt * TILE + l16),
-                        )
-                alphas = []
-                for e in range_constexpr(4):
-                    l_c[e] = butterfly(l_c[e], (1, 2, 4, 8))
-                    alphas.append(hw_exp2(fx.Float32(m_run[it][e]) - m_g[e]))
-                l_next.append(
-                    fx.Vector.from_elements([fx.Float32(l_run[it][e]) * alphas[e] + l_c[e] for e in range(4)], fx.Float32)  # fmt: skip
-                )
-                m_next.append(fx.Vector.from_elements(m_new, fx.Float32))
-                al = fx.Vector.from_elements(alphas, fx.Float32)
-                acc_scaled.append([accs[it][dt] * al for dt in range(4)])
-            m_run = m_next
-            l_run = l_next
-            accs = acc_scaled
-            # ---- PV over 32-key steps: V^T staged in LDS once, 16 keys a pass
-            for vs in range_constexpr(V_STEPS):
-                for ps in range_constexpr(2):
-                    d0 = (lane % 4) * 16
-                    vw = vw_cur[ps]  # keys key0 + 16 ps + lane / 4, dims d0 ..
-                    vb_lo = fp8_to_bf16x8(vw[0], vw[1])  # dims d0 .. d0 + 8 as bf16
-                    vb_hi = fp8_to_bf16x8(vw[2], vw[3])
-                    for j in range_constexpr(8):
-                        fx.ptr_store(vb_lo[j], vt + ((d0 + j) * V_PITCH + ps * 16 + lane // 4))
-                        fx.ptr_store(vb_hi[j], vt + ((d0 + 8 + j) * V_PITCH + ps * 16 + lane // 4))
-                rocdl.s_waitcnt(lgkmcnt=0)
-                b_v = [
-                    fx.Vector(fx.ptr_load(vt + ((dt * 16 + l16) * V_PITCH + 8 * g4), result_type=V8B))
-                    for dt in range(4)
-                ]
-                acc_pv = []
+                        widx = slot + kt * PAGE_WORDS + ((2 * step + g4 // 2) * 256 + l16 * 16 + (g4 % 2) * 8) // 4
+                        w = fx.Vector(fx.ptr_load(widx, result_type=V2I))
+                        kb.append(fp8_to_bf16x8(w[0], w[1]))
+                # ---- S^T: tile (it, kt): row l16, keys 4 g4 + e of key tile kt; scaled and masked
+                inner = (cc != c_last) & (cc != lo)  # a chunk with no masked key
+                sc = []  # [it][kt * 4 + e]
+                mx = []
                 for it in range_constexpr(NT):
-                    a_p = fx.Vector(
-                        fx.ptr_load(pt + ((it * 16 + l16) * P_PITCH + vs * 32 + 8 * g4), result_type=V8B)
-                    )
-                    acc_pv.append([mfma_bf16(a_p, b_v[dt], accs[it][dt]) for dt in range(4)])
-                accs = acc_pv
-                rocdl.s_waitcnt(lgkmcnt=0)  # the next pass rewrites vt
-        gpu.barrier()  # every wave is done with pt / vt: the merge reuses them
+                    vals = []
+                    for kt in range_constexpr(KEY_TILES):
+                        st = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for step in range_constexpr(2):
+                            st = mfma_bf16(kb[kt * 2 + step], qa[it][step], st)
+                        for e in range_constexpr(4):
+                            kidx = key0 + kt * TILE + 4 * g4 + e
+                            ok = row_live[it] & (inner | ((kidx < ctx + qpos[it] + 1) & ((window == 0) | ((ctx + qpos[it] - kidx) < window))))  # fmt: skip
+                            vals.append(ok.select(fx.Float32(st[e]) * qk_scale, fx.Float32(NEG)))
+                    sc.append(vals)
+                    m8 = vals[0]
+                    for j in range_constexpr(1, 2 * KEY_TILES * 4 // 2):
+                        m8 = fx.max(m8, vals[j])
+                    mx.append(quad_max(m8))
+                # ---- the lazy rescale: when any row's chunk max exceeds its reference by TAU,
+                # every row takes its new max and its sum and O are rescaled (selects:
+                # the step is wave-uniform, the values are loop-carried)
+                need = mx[0] > m_ref[0] + TAU
+                for it in range_constexpr(1, NT):
+                    need = need | (mx[it] > m_ref[it] + TAU)
+                move = ballot(need) != 0
+                alphas_acc = []
+                for it in range_constexpr(NT):
+                    m_new = move.select(fx.max(m_ref[it], mx[it]), m_ref[it])
+                    m_g = (m_new > fx.Float32(NO_MAX)).select(m_new, fx.Float32(0.0))
+                    alpha = hw_exp2(m_ref[it] - m_g)  # 0 from NEG (a first chunk), 1 when nothing moved
+                    l_lane[it] = l_lane[it] * alpha
+                    m_ref[it] = m_new
+                    # O rows 4 g4 + e take the alpha of row 4 g4 + e: from lane 4 g4 + e (its g4 = 0 copy)
+                    a_rows = [
+                        fx.Int32(rocdl.ds_bpermute(T.i32, (4 * g4 + e) * 4, alpha.bitcast(fx.Int32))).bitcast(fx.Float32)
+                        for e in range(4)
+                    ]
+                    al = fx.Vector.from_elements(a_rows, fx.Float32)
+                    accs[it] = [accs[it][dt] * al for dt in range(4)]
+                # ---- P = exp2(S - m) as the PV A operand (eight bf16 a lane), the lane's row sums
+                p_ops = []
+                for it in range_constexpr(NT):
+                    m_g = (m_ref[it] > fx.Float32(NO_MAX)).select(m_ref[it], fx.Float32(0.0))
+                    ps = [hw_exp2(sc[it][j] - m_g) for j in range(2 * KEY_TILES * 4 // 2)]
+                    acc_l = ps[0]
+                    for j in range_constexpr(1, len(ps)):
+                        acc_l = acc_l + ps[j]
+                    l_lane[it] = l_lane[it] + acc_l
+                    p_ops.append(fx.Vector.from_elements(ps, fx.Float32).to(fx.BFloat16))
+                # ---- PV: V^T operands by transposed LDS reads (dim tile dt: lane (g4, l16) gets
+                # dim 16 dt + l16 at keys 4 g4 .. of page 0 then of page 1)
+                b_v = []
+                for dt in range_constexpr(4):
+                    widx = slot + ((KEY_TILES + v_page) * PAGE_WORDS + v_page * V_SKEW) + (dt * 256 + v_key * 16 + (l16 % 2) * 8) // 4  # fmt: skip
+                    w = fx.Vector(rocdl_raw.ds_read_tr8_b64(T.vec(2, T.i32), widx.llvm_ptr).result, (2,), fx.Int32)  # gfx950 ds_read_b64_tr_b8
+                    b_v.append(fp8_to_bf16x8(w[0], w[1]))
+                accs = [[mfma_bf16(p_ops[it], b_v[dt], accs[it][dt]) for dt in range(4)] for it in range(NT)]
+                rocdl.s_waitcnt(lgkmcnt=0)  # every read of the slot is done
+                issue(fx.min(cc + 2, b_last), sl, b_lo)  # chunk cc + 2 into this slot
+                if cc == b_lo:
+                    stamp(c, 4)  # the first chunk done
+            rocdl.s_waitcnt(vmcnt=0)  # the tail's repeated loads land before the LDS is reused
+        stamp(c, 5)  # the chunk loop done
+        gpu.barrier()  # every wave is done with the ring: the merge tree reuses the LDS
 
         # ---- the key splits merge in LDS in one round: every wave writes its
         # (m, l, O) rows (a (split, tile, row) record is COMB_ROW floats, O from
@@ -393,12 +408,13 @@ def run_kattn(c, o_flag=None):
             return comb + ((slot * NT + it) * 16 + row) * COMB_ROW
 
         for it in range_constexpr(NT):
+            l_row = quad_sum(l_lane[it])
+            if g4 == 0:
+                base = comb_at(ks, it, l16)
+                fx.ptr_store(m_ref[it], base)
+                fx.ptr_store(l_row, base + 1)
             for e in range_constexpr(4):
-                row = 4 * g4 + e
-                base = comb_at(ks, it, row)
-                if l16 == 0:
-                    fx.ptr_store(fx.Float32(m_run[it][e]), base)
-                    fx.ptr_store(fx.Float32(l_run[it][e]), base + 1)
+                base = comb_at(ks, it, 4 * g4 + e)
                 for dt in range_constexpr(4):
                     fx.ptr_store(fx.Float32(accs[it][dt][e]), base + (O_OFF + dt * 16 + l16))
         gpu.barrier()
