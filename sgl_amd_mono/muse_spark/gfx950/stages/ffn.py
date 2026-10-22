@@ -711,10 +711,7 @@ def stage_dn(c, n_tiles, first=None):
     TD = n_tiles * DN_T
     q0 = (bid * TD) // BLOCKS
     n_items = ((bid + 1) * TD) // BLOCKS - q0
-    if const_expr(first is not None):
-        cur = first
-    else:
-        cur = dn_pair_loads(c, q0, n_tiles)
+    cur = first if first is not None else dn_pair_loads(c, q0, n_tiles)  # (a trace-time choice)
     cur_t = fx.Int32(-1)
     # the finalize's sum of squares (v = bf16(bf16(y) pen_w), the fin stage's values)
     # of each item's 32 rows of each column: a wave partial a column in LDS (two
