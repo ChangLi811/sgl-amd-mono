@@ -126,7 +126,6 @@ A_PARTS_MAX = 8  # CTAs a token's attention boundary at most
 A_PAIRS_MAX = HIDDEN // (2 * THREADS)  # 8: a thread's column pairs with the whole row on one CTA
 CHAIN0 = BLOCKS - MAX_TOKENS  # 192: the chain CTAs, token bid - CHAIN0's route and xn
 AP0 = CHAIN0  # the boundary tasks: the chain CTAs, before their pooler weights go out
-OG0 = 0  # the og tasks: stream CTAs 0 .. S, before their o weights go out
 A_TASKS_MAX = BLOCKS - CHAIN0  # 64 boundary tasks at most
 R0 = 0  # the router tasks
 assert O_TASKS == 2 * BLOCKS and R0 + R_TASKS <= CHAIN0  # two o tasks a CTA, every CTA
@@ -317,40 +316,6 @@ def st_words(ptr, d, words, cm=0):
 
 
 # ---------------------------------------------------------------- og tasks
-@flyc.jit
-def stage_og(c, t, o_flag=None, QL=8):
-    """og task: token ``t``'s o (16 heads of 64), per-head RMSNorm without weight
-    x sigmoid(gate), one bf16 rounding, to the ``og`` mailbox; thread tid holds
-    head tid / 16, dims 4 (tid % 16) ... ``o_flag`` (a merged launch): the
-    request's (KV head, row tile) flags first, then device-scope loads."""
-    tid, lane = c["tid"], c["lane"]
-    put_bf, poll, og = c["put_bf"], c["poll"], c["og"]
-    a = c["args"]
-    o_cm = 0  # o from memory the host wrote: the default cache policy
-    if const_expr(o_flag is not None):
-        o_cm = CM_DEV  # the attention's device-scope stores, earlier in this launch
-    if tid < OG_THREADS:
-        e = (tid // 16) * HEAD_DIM + (lane % 16) * 4
-        if const_expr(o_flag is not None):
-            rocdl.sched_barrier(0)
-            RT = (QL * GQA + 15) // 16  # the attention's row tiles a (request, KV head)
-            poll(
-                [
-                    (o_flag, (t // QL) * LOCAL_KV_HEADS * RT + 2 * j, 2)
-                    for j in range(LOCAL_KV_HEADS * RT // 2)
-                ]
-            )
-            acquire_loads()
-        ov = ld_bf(a["o"], t * Q_K + e, 4, o_cm)
-        gv = ld_bf(a["g"], t * Q_K + e, 4)
-        ss = fx.Float32(0.0)
-        for j in range_constexpr(4):
-            ss = ss + ov[j] * ov[j]
-        ss = butterfly(ss, (8, 4, 2, 1))
-        rstd = hw_rsq(ss / float(HEAD_DIM) + RMS_EPS)
-        put_bf(og, t * Q_K + e, [ov[j] * rstd * sigmoid(gv[j]) for j in range(4)])
-
-
 # ---------------------------------------------------------------- o tasks
 def o_w_loads(c, task):
     """The o_proj weight words of o task ``task``'s rows, this lane's: in flight
