@@ -158,6 +158,13 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     trace: bool = False
 
 
+def _attn_views(lds):
+    """The K-attn LDS views of a union holding them as (loop, tree) or (aloop, atree)."""
+    if hasattr(lds, "aloop"):
+        return lds.aloop.peek(), lds.atree.peek()
+    return lds.loop.peek(), lds.tree.peek()
+
+
 def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict) -> dict:
     """K-attn's context: LDS views, the mailbox, the scratch region and arguments."""
     tid = fx.thread_idx.x
@@ -170,18 +177,14 @@ def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict) 
         "bid": fx.block_idx.x,
         "lane": tid % 64,
         "wave": tid // 64,
-        "qs": lds.qs.ptr,
-        "pt": lds.pt.ptr,
-        "vt": lds.vt.ptr,
-        "comb": lds.comb.ptr,
-        "red": lds.red.ptr,
+        **attention.lds_views(*_attn_views(lds)),
         "put": mb.put,
         "poll": mb.poll,
         "args": args,
         "trace_on": key.trace,
     }
-    c["part"] = sreg(scratch, layout["attn_part"][0], "attn_part")
-    c["trace"] = sreg(scratch, layout["attn_trace"][0], "attn_trace")
+    for region in ("attn_part", "attn_pflag", "attn_l2", "attn_l2flag", "attn_trace"):
+        c[region[5:]] = sreg(scratch, layout[region][0], region)  # "attn_part" -> c["part"]
     return c
 
 
@@ -190,12 +193,18 @@ def build_kattn(key: KAttnBuild):
     S, QL, NT = key.tokens, key.q_len, key.nt
     assert QL in (1, 8) and S % QL == 0 and 1 <= S <= MAX_TOKENS
     row_tiles = (attn_rows(QL) + 15) // 16
-    assert row_tiles % NT == 0, (row_tiles, NT)
+    assert NT in (1, row_tiles), (row_tiles, NT)  # a task covers every row tile
     name = kernel_symbol("muse_spark_kattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = kattn_scratch_layout(S, QL)
-    Lds = attention.kattn_lds(NT)
+    Loop, Tree = attention.kattn_lds(row_tiles)
+
+    @fx.union
+    class Lds:
+        loop: Loop  # type: ignore[valid-type]
+        tree: Tree  # type: ignore[valid-type]
+
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kattn(
@@ -219,7 +228,7 @@ def build_kattn(key: KAttnBuild):
         with guard.scope(
             guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
         ):
-            lds = fx.SharedAllocator().allocate(Lds).peek()
+            lds = fx.SharedAllocator().allocate(Lds)
             args = {
                 "q": q, "o": o, "k_cache": k_cache, "v_cache": v_cache, "page_table": page_table,
                 "table_stride": table_stride, "table_bytes": table_bytes, "seq_lens": seq_lens,
@@ -306,11 +315,13 @@ def build_layer(key: LayerBuild):
     k2_layout, k3_layout = k2_scratch_layout(), ffn.k3_scratch_layout()
     sy = ffn.k3_sym_layout(W)
     flags_offset = sym_bytes(W)
-    ALds, K2Lds, K3Lds, K1Lds = attention.kattn_lds(1), post_attn.k2_lds(S), ffn.k3_lds(S), pre_attn.k1_lds(S)
+    ALoop, ATree = attention.kattn_lds((attn_rows(QL) + 15) // 16)
+    K2Lds, K3Lds, K1Lds = post_attn.k2_lds(S), ffn.k3_lds(S), pre_attn.k1_lds(S)
 
     @fx.union
     class Lds:
-        a: ALds  # type: ignore[valid-type]
+        aloop: ALoop  # type: ignore[valid-type]
+        atree: ATree  # type: ignore[valid-type]
         k2: K2Lds  # type: ignore[valid-type]
         k3: K3Lds  # type: ignore[valid-type]
         k1: K1Lds  # type: ignore[valid-type]
@@ -364,7 +375,7 @@ def build_layer(key: LayerBuild):
             }  # fmt: skip
             c2 = k2_context(k2_key, lds.k2.peek(), k2_args, scratch2, sym, peers, rank, tag, k2_layout)
             oflag, rflag, xinflag = c2["oflag"], c2["rflag"], c2["xinflag"]
-            ca = kattn_context(ka_key, lds.a.peek(), a_args, scratch_a, tag, ka_layout)
+            ca = kattn_context(ka_key, lds, a_args, scratch_a, tag, ka_layout)
             attention.run_kattn(ca, o_flag=oflag)
             gpu.barrier()  # this CTA is done with the attention's LDS
             post_attn.run_k2(c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL)

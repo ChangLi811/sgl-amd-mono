@@ -57,16 +57,18 @@ def stamp(c, idx: int):
 
 @flyc.jit
 def poll_flags(c, regions):
-    """Wait for the flags ``regions`` = [(region, n), ...] (flags 0 .. n of each),
-    one flag a thread, then a barrier and an acquire: one round trip whatever the
-    count (a thread polling every flag takes a round trip per ``POLL_MAX`` specs).
-    Every thread of the CTA must call it (the barrier)."""
+    """Wait for the flags ``regions`` = [(region, n) | (region, base, n), ...] (flags
+    base .. base + n of each), one flag a thread, then a barrier and an acquire: one
+    round trip whatever the count (a thread polling every flag takes a round trip
+    per ``POLL_MAX`` specs). Every thread of the CTA must call it (the barrier)."""
     tid = c["tid"]
     off = 0
-    for region, n in regions:
+    for spec in regions:
+        region, base, n = spec if len(spec) == 3 else (spec[0], 0, spec[1])
         if (tid >= off) & (tid < off + n):
-            c["poll"]([(region, tid - off, 1)])
+            c["poll"]([(region, base + tid - off, 1)])
         off += n
-    assert off <= THREADS, off
+    if isinstance(off, int):
+        assert off <= THREADS, off
     gpu.barrier()
     acquire_loads()

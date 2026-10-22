@@ -46,4 +46,5 @@ def test_kattn_lds_fits(nt):
 def test_kattn_scratch_covers_every_partial(s, ql):
     lay = L.kattn_scratch_layout(s, ql)
     rows = L.attn_rows(ql)
-    assert lay["attn_part"][1] == (s // ql) * 2 * L.ATTN_MAX_PARTS * rows * L.ATTN_PART_ROW * 8
+    assert lay["attn_part"][1] == (s // ql) * 2 * L.ATTN_MAX_PARTS * rows * L.ATTN_PART_ROW * 4  # fp32 words
+    assert lay["attn_pflag"][1] == (s // ql) * 2 * L.ATTN_MAX_PARTS * 8

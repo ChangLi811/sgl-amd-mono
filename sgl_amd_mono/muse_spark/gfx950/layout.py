@@ -85,10 +85,11 @@ def k1_lds_bytes(s: int) -> int:
 # ---------------------------------------------------------------- K-attn (attention)
 GQA = 8  # query heads a KV head on a rank
 ATTN_CHUNK = 256  # keys a chunk of the task loop
-ATTN_MAX_PARTS = 64  # partitions a request at most (the host sizes ``part`` to fit)
+ATTN_MAX_PARTS = 128  # partitions a request at most (the kernel sizes ``part`` to fit)
+ATTN_MERGE_GROUPS = 8  # level-1 merge jobs a (request, KV head, row tile) when it has more partitions
 ATTN_Q_PITCH = HEAD_DIM + 4  # LDS pitches (bf16 elements), 16 B aligned, bank-spread
 ATTN_V_PITCH = 40  # keys: a 32-key V^T sub-block's row
-ATTN_PART_ROW = 2 + HEAD_DIM  # fp32 pairs a partial row: (m, l, O[64])
+ATTN_PART_ROW = 4 + HEAD_DIM  # fp32 words a partial row: (m, l, pad, pad, O[64]), O 16 B aligned
 ATTN_KEY_SPLITS = WAVES  # the waves share a task's keys
 ATTN_KEYS_PER_WAVE = ATTN_CHUNK // ATTN_KEY_SPLITS  # 32
 ATTN_KEY_TILES = ATTN_KEYS_PER_WAVE // 16  # 2
@@ -103,16 +104,33 @@ def attn_rows(q_len: int) -> int:
 
 
 def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
-    """K-attn's scratch: (request, head, partition)'s (m, l, O[64]) a row, fp32 pairs."""
+    """K-attn's scratch (a "pair" is 8 bytes): the tasks' partial rows ((request, head,
+    partition, row) x ATTN_PART_ROW fp32 words) and a flag a task; the level-2 records
+    ((request, head, row tile, group, row16) x ATTN_PART_ROW words) and a flag each."""
+    R = tokens // q_len
     rows = attn_rows(q_len)
-    pairs = (tokens // q_len) * LOCAL_KV_HEADS * ATTN_MAX_PARTS * rows * ATTN_PART_ROW
-    return pair_layout([("attn_part", pairs), ("attn_trace", BLOCKS * TRACE_SLOTS)], align=256)
+    tiles = (rows + 15) // 16
+    part_words = R * LOCAL_KV_HEADS * ATTN_MAX_PARTS * rows * ATTN_PART_ROW
+    l2_words = R * LOCAL_KV_HEADS * tiles * ATTN_MERGE_GROUPS * 16 * ATTN_PART_ROW
+    return pair_layout(
+        [
+            ("attn_part", part_words // 2),
+            ("attn_pflag", R * LOCAL_KV_HEADS * ATTN_MAX_PARTS),
+            ("attn_l2", l2_words // 2),
+            ("attn_l2flag", R * LOCAL_KV_HEADS * tiles * ATTN_MERGE_GROUPS),
+            ("attn_trace", BLOCKS * TRACE_SLOTS),
+        ],
+        align=256,
+    )
 
 
 def kattn_lds_bytes(nt: int) -> int:
+    """The LDS of a task of ``nt`` row tiles: Q and the merge jobs' reduction, then the
+    larger of the chunk loop's P / V^T and the key-split tree (they alias)."""
     qs = nt * 16 * ATTN_Q_PITCH * 2
+    red = THREADS * 10 * 4
     pt = WAVES * nt * 16 * ATTN_P_PITCH * 2
     vt = WAVES * HEAD_DIM * ATTN_V_PITCH * 2
-    comb = nt * 16 * (ATTN_KEY_SPLITS - 1) * (2 + HEAD_DIM) * 4
-    return qs + pt + vt + comb + RED_FLOATS * 4
+    comb = (WAVES // 2) * nt * 16 * ATTN_PART_ROW * 4
+    return qs + red + max(pt + vt, comb)
 
