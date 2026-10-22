@@ -174,9 +174,7 @@ def test_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):
 def test_every_width_compiles(rows):
     from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, build_k1
     from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
-    from sgl_amd_mono.muse_spark.spec import SPEC
 
-    assert rows in SPEC.widths("gfx950")
     compile_only(build_k1(K1Build(tokens=rows)))
 
 

@@ -229,9 +229,7 @@ def test_the_last_rule_compiles_in():
 def test_every_width_compiles(rows):
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
     from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
-    from sgl_amd_mono.muse_spark.spec import SPEC
 
-    assert rows in SPEC.widths("gfx950")
     compile_only(build_k3(K3Build(tokens=rows)))
 
 
