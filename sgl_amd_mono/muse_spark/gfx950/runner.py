@@ -163,6 +163,7 @@ class MuseMonoRunner:
         # the pooler / unpooler as FP8 copies when every kernel layer carries them
         self.fp8_dense = all(v.w_pool_fp8 is not None and v.w_unpool_fp8 is not None for v in views if v.kind == "mxfp4")
         self._k1_done = -1  # the layer whose K1 the previous merged launch ran
+        self._trace_shape, self._trace_captured, self._trace_started = None, False, False
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         dev, bf16 = self.device, torch.bfloat16
         self.deadline_s = None
@@ -336,8 +337,6 @@ class MuseMonoRunner:
             self.windows.append(w if w > 0 else 0)
         self.swa_map = pool.full_to_swa_index_mapping
         self.backend, self.pool = backend, pool
-        if TRACE_DIR:
-            self._start_trace_thread()
 
     # ---------------------------------------------------------------- stage trace
     def _start_trace_thread(self) -> None:
@@ -350,7 +349,7 @@ class MuseMonoRunner:
         from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import k2_scratch_layout
 
         os.makedirs(TRACE_DIR, exist_ok=True)
-        self._trace_shape = None  # (rows, q_len) of the last launch
+        self._trace_started = True
 
         def region(buf, layout, name):
             off, nbytes = layout[name]
@@ -430,7 +429,13 @@ class MuseMonoRunner:
         if SKIP_LAYERS:
             return stream, attn_input
         if TRACE_DIR:
+            # the snapshot thread's copies would invalidate a graph capture (global
+            # capture mode): it starts at the first launch after the captures
             self._trace_shape = (rows, q_len)
+            if torch.cuda.is_current_stream_capturing():
+                self._trace_captured = True
+            elif getattr(self, "_trace_captured", False) and not getattr(self, "_trace_started", False):
+                self._start_trace_thread()
         k_cache, v_cache, is_swa = self.caches[i]
         m = self.swa_map
         cur = torch.cuda.current_stream()
