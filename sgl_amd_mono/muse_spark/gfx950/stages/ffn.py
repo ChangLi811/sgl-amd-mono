@@ -473,37 +473,49 @@ def unp_scale(c, row):
 # ---------------------------------------------------------------- 0. the plan
 @flyc.jit
 def stage_plan(c):
-    """The step's plan in LDS, the same on every CTA: every thread takes picks
-    (token p / TOP_K, slot p % TOP_K) and claims its pick's column with an atomic
-    add on its local expert's count (a pick's column is its order of arrival among
-    the expert's picks: any order serves, the consumers look picks up by column);
-    then wave 0 lists the experts' column tiles of 16 in expert order. Returns the
-    tiles. (A ballot an expert a round of 64 picks, on one wave, took 11 us at 64
-    rows; this is one round of 512 picks on 512 threads.)"""
+    """The step's plan in LDS, the same on every CTA: wave w owns local experts
+    4 w .. 4 w + 4 and walks every pick (token p / TOP_K, slot p % TOP_K) in rounds
+    of 64; a pick's column is its rank among its expert's picks in pick order (a
+    ballot an expert a round, the count a uniform scalar); then wave 0 lists the
+    experts' column tiles of 16 in expert order. Returns the tiles. (One wave over
+    all 32 experts took 11 us at 64 rows; LDS atomics broke the multi-tile experts.)"""
     S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     pick_of, cnt_of, tile_of, nt = c["pick_of"], c["cnt_of"], c["tile_of"], c["nt"]
     a = c["args"]
     local_start = a["local_start"]
-    PICKS = S * TOP_K
-    if tid < LOCAL_EXPERTS:
-        fx.ptr_store(fx.Int32(0), cnt_of + tid)
-    gpu.barrier()
+    EPW = LOCAL_EXPERTS // WAVES  # experts a wave: 4
     r_ids = rsrc(a["ids"])
-    for rr in range_constexpr(cdiv(PICKS, THREADS)):
-        p = rr * THREADS + tid
-        if p < PICKS:
-            le = fx.Int32(bo.buffer_load(r_ids, p, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) - local_start
-            # EP 8: a pick of another rank's expert is not this rank's
-            if (le >= 0) & (le < LOCAL_EXPERTS):
-                col = lds_atomic_add(cnt_of + le, 1)
-                if col < COLS:
-                    fx.ptr_store(p, pick_of + (le * COLS + col))
+    PICKS = S * TOP_K
+    ROUNDS = cdiv(PICKS, 64)
+    # every round's ids, in flight at once (every wave loads them: 8 x 64 ids a round)
+    p_ids = [
+        fx.Int32(bo.buffer_load(r_ids, fx.min(rr * 64 + lane, PICKS - 1), vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))  # fmt: skip
+        for rr in range(ROUNDS)
+    ]
+    cnts = [fx.Int32(0) for _ in range(EPW)]  # this wave's experts' picks so far (uniform)
+    for rr in range_constexpr(ROUNDS):
+        p = rr * 64 + lane
+        le = p_ids[rr] - local_start
+        ok = (p < PICKS) & (le >= 0) & (le < LOCAL_EXPERTS)
+        col = fx.Int32(0)
+        mine = fx.Int32(0) == fx.Int32(1)
+        for k in range_constexpr(EPW):
+            hit = ok & (le == wave * EPW + k)
+            m = ballot(hit)
+            col = hit.select(cnts[k] + lanes_before(m, lane), col)
+            cnts[k] = cnts[k] + uniform(popcount(m))
+            mine = mine | hit
+        if mine & (col < COLS):
+            fx.ptr_store(p, pick_of + (le * COLS + col))
+    for k in range_constexpr(EPW):
+        if lane == 0:
+            fx.ptr_store(cnts[k], cnt_of + (wave * EPW + k))
     gpu.barrier()
     if wave == 0:
         # lane e < LOCAL_EXPERTS: expert e's count, its tiles and their first index
-        mine = lane < LOCAL_EXPERTS
-        cnt = mine.select(fx.ptr_load(cnt_of + fx.min(lane, LOCAL_EXPERTS - 1)), fx.Int32(0))
-        tiles = mine.select((fx.min(cnt, COLS) + TILE_COLS - 1) // TILE_COLS, fx.Int32(0))
+        mine0 = lane < LOCAL_EXPERTS
+        cnt = mine0.select(fx.ptr_load(cnt_of + fx.min(lane, LOCAL_EXPERTS - 1)), fx.Int32(0))
+        tiles = mine0.select((fx.min(cnt, COLS) + TILE_COLS - 1) // TILE_COLS, fx.Int32(0))
         incl = lane_prefix(tiles, lane)
         tile0 = incl - tiles
         n_tiles = lane_gather(incl, 63)
