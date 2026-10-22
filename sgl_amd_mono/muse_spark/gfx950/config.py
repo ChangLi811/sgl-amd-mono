@@ -37,9 +37,9 @@ LAYERS = 62
 LAYER_SLOTS = 128  # mailbox tags: step * LAYER_SLOTS + layer + 1
 MAX_TOKENS = 64  # C8 x 8 draft tokens
 # The verify widths the monokernels serve (rows = 8 draft tokens x running requests).
-# Default: C1's 8 rows only. At 16 rows and above the launches lose to SGLang's own
-# path (300k, 机器2: 13.24 vs 12.93 ms at 16 rows, 17.30 vs 16.22 at 32; the expert
-# bytes double while the ~100 us a layer of hand-offs stay), so those steps route
-# to it. SGLANG_AMD_MONO_MUSE_WIDTHS="8,16,32,64" serves them all.
+# Default: 8 and 16 rows (C1 and C2 verify steps). With the 10-22 layer changes 16
+# rows beat SGLang's own path (95k, 机器2: 11.88 vs 12.26 ms a step at n = 2); 32 and
+# 64 rows are under test (the expert bytes grow with the rows while the hand-offs
+# stay). SGLANG_AMD_MONO_MUSE_WIDTHS="8,16,32,64" serves them all, "8" only C1.
 WIDTHS = tuple(int(x) for x in os.environ.get("SGLANG_AMD_MONO_MUSE_WIDTHS", "8,16").split(","))
 assert all(w in (8, 16, 32, 64) for w in WIDTHS) and WIDTHS, WIDTHS
