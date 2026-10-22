@@ -147,12 +147,12 @@ def build_k1(key: K1Build):
 
 class KAttnBuild(msgspec.Struct, frozen=True):
     """A K-attn build: the step's row count and rows a request, the row tiles a
-    task shares its K / V loads over (1; 2 won +8 % on full layers and lost 48 % on
-    sliding ones in the old branch), and the fault injection site."""
+    task shares its K / V loads over (clamped to the row tiles of ``q_len``; four
+    spill registers, two fit), and the fault injection site."""
 
     tokens: int
     q_len: int = 8
-    nt: int = 1
+    nt: int = 2
     fault_site: int = 0
     fault_after: int = 0
     trace: bool = False
@@ -172,7 +172,7 @@ def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict) 
     c = {
         "S": key.tokens,
         "QL": key.q_len,
-        "NT": key.nt,
+        "NT": min(key.nt, (attn_rows(key.q_len) + 15) // 16),
         "tid": tid,
         "bid": fx.block_idx.x,
         "lane": tid % 64,
@@ -193,12 +193,13 @@ def build_kattn(key: KAttnBuild):
     S, QL, NT = key.tokens, key.q_len, key.nt
     assert QL in (1, 8) and S % QL == 0 and 1 <= S <= MAX_TOKENS
     row_tiles = (attn_rows(QL) + 15) // 16
-    assert NT in (1, row_tiles), (row_tiles, NT)  # a task covers every row tile
+    NT = min(NT, row_tiles)
+    assert row_tiles % NT == 0, (row_tiles, NT)
     name = kernel_symbol("muse_spark_kattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = kattn_scratch_layout(S, QL)
-    Loop, Tree = attention.kattn_lds(row_tiles)
+    Loop, Tree = attention.kattn_lds(NT)
 
     @fx.union
     class Lds:
@@ -308,14 +309,14 @@ def build_layer(key: LayerBuild):
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
     k1_key = K1Build(S, fault_site, fault_after, tr)
-    ka_key = KAttnBuild(S, QL, 1, fault_site, fault_after, tr)
+    ka_key = KAttnBuild(S, QL, fault_site=fault_site, fault_after=fault_after, trace=tr)
     k2_key = K2Build(S, W, fault_site, fault_after, tr)
     k3_key = K3Build(S, W, last, fault_site, fault_after, tr)
     k1_layout, ka_layout = k1_scratch_layout(), kattn_scratch_layout(S, QL)
     k2_layout, k3_layout = k2_scratch_layout(), ffn.k3_scratch_layout()
     sy = ffn.k3_sym_layout(W)
     flags_offset = sym_bytes(W)
-    ALoop, ATree = attention.kattn_lds((attn_rows(QL) + 15) // 16)
+    ALoop, ATree = attention.kattn_lds(min(ka_key.nt, (attn_rows(QL) + 15) // 16))
     K2Lds, K3Lds, K1Lds = post_attn.k2_lds(S), ffn.k3_lds(S), pre_attn.k1_lds(S)
 
     @fx.union

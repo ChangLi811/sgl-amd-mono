@@ -12,10 +12,10 @@ and aiter's unified attention compute them::
     online softmax in the exp2 domain, P -> bf16, O += P V (V upcast)
     O / l -> bf16
 
-Tasks. An attention task is one (request, KV head, partition of ``part`` keys;
-the partitions a sliding window masks whole are skipped) over every row of the
-(request, KV head): QL = 8 is 64 rows = four MFMA row tiles, so a chunk's K / V
-loads and its V^T staging serve four tiles. Each is a loop over 256-key chunks
+Tasks. An attention task is one (request, KV head, ``nt`` row tiles, partition
+of ``part`` keys; the partitions a sliding window masks whole are skipped): a
+chunk's K / V loads and its V^T staging serve the task's tiles (QL = 8 is 64
+rows = four tiles; two a task fit the registers, four spill). Each is a loop over 256-key chunks
 with the waves splitting the keys: QK on wave-local key tiles, the row
 statistics, P through LDS, V transposed through LDS, PV; the waves' key splits
 merge in LDS as a tree (8 -> 4 -> 2 -> 1); the partial (m, l, O) a row goes out
@@ -117,7 +117,9 @@ def run_kattn(c, o_flag=None):
     a = c["args"]
     R = S // QL
     ROWS = QL * GQA  # rows a (request, KV head): 64 or 8
-    NT = (ROWS + 15) // 16  # row tiles: 4 or 1, all in one task
+    ROW_TILES = (ROWS + 15) // 16  # 4 or 1
+    NT = c["NT"]  # row tiles a task (the build's; 4 spills registers, 2 fits)
+    TASK_TILES = ROW_TILES // NT
     l16 = lane % 16
     g4 = lane // 16
     V8B = fx.Vector.make_type(8, fx.BFloat16)
@@ -181,7 +183,7 @@ def run_kattn(c, o_flag=None):
 
     def l2_row(r, h, rt, g, row16):
         """Float index of (request r, head h, row tile rt, group g)'s level-2 row record."""
-        return ((((r * LOCAL_KV_HEADS + h) * NT + rt) * GROUPS + g) * 16 + row16) * PART_ROW
+        return ((((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS + g) * 16 + row16) * PART_ROW
 
     def fold(m, l, ov, m2, l2, v2, ok):
         """(m, l, O) with a partial folded in (``ok``: it exists)."""
@@ -192,17 +194,17 @@ def run_kattn(c, o_flag=None):
         return ok.select(mn, m), l * a1 + l2 * a2, ov * a1 + v2 * a2
 
     # ============================================ attention tasks
-    def attn_task(r, h, p):
-        """The NT row tiles of (request r, KV head h) over partition p: one K / V
-        load and one V^T staging a chunk serve every tile."""
+    def attn_task(r, h, rt0, p):
+        """Row tiles rt0 .. rt0 + NT of (request r, KV head h) over partition p: one
+        K / V load and one V^T staging a chunk serve every tile of the task."""
         keys = seq_len_of(r)
         ctx = keys - QL
         ks = wave  # this wave's key split
-        # Q: rows 16 it + i = 8 qpos + hg of (request r, head h) into LDS, 16 B a thread
+        # Q: rows 16 (rt0 + it) + i = 8 qpos + hg of (request r, head h) into LDS, 16 B a thread
         if tid < NT * 16 * HEAD_DIM // 8:
             i_t = tid // (16 * HEAD_DIM // 8)
             q_row = (tid % (16 * HEAD_DIM // 8)) // (HEAD_DIM // 8)
-            row = i_t * 16 + q_row
+            row = (rt0 + i_t) * 16 + q_row
             d0 = (tid % (HEAD_DIM // 8)) * 8
             t = r * QL + fx.min(row, ROWS - 1) // GQA
             qv = fx.Vector(
@@ -222,8 +224,8 @@ def run_kattn(c, o_flag=None):
             for it in range(NT)
         ]
         # this lane's rows 4 g4 + e of each tile; their query positions
-        qpos = [[fx.min((it * 16 + 4 * g4 + e) // GQA, QL - 1) for e in range(4)] for it in range(NT)]  # fmt: skip
-        live = [[(it * 16 + 4 * g4 + e) < ROWS for e in range(4)] for it in range(NT)]
+        qpos = [[fx.min(((rt0 + it) * 16 + 4 * g4 + e) // GQA, QL - 1) for e in range(4)] for it in range(NT)]  # fmt: skip
+        live = [[((rt0 + it) * 16 + 4 * g4 + e) < ROWS for e in range(4)] for it in range(NT)]
         # each tile's running row statistics and O, carried through the chunk loop
         m_run = [fx.Vector.filled(4, NEG, fx.Float32) for _ in range(NT)]
         l_run = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NT)]
@@ -415,7 +417,7 @@ def run_kattn(c, o_flag=None):
         if ks == 0:
             for it in range_constexpr(NT):
                 for e in range_constexpr(4):
-                    row = it * 16 + 4 * g4 + e
+                    row = (rt0 + it) * 16 + 4 * g4 + e
                     if row < ROWS:
                         base = part_row(r, h, p, row)
                         if l16 == 0:
@@ -428,12 +430,13 @@ def run_kattn(c, o_flag=None):
         if tid == 0:
             put(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS + p, fx.Int32(1))
 
-    for job in range(bid, R * LOCAL_KV_HEADS * n_parts, BLOCKS):
+    for job in range(bid, R * LOCAL_KV_HEADS * TASK_TILES * n_parts, BLOCKS):
         p = job % n_parts
-        h = (job // n_parts) % LOCAL_KV_HEADS
-        r = job // (n_parts * LOCAL_KV_HEADS)
+        rt0 = ((job // n_parts) % TASK_TILES) * NT
+        h = (job // (n_parts * TASK_TILES)) % LOCAL_KV_HEADS
+        r = job // (n_parts * TASK_TILES * LOCAL_KV_HEADS)
         if p < n_parts_of(r):
-            attn_task(r, h, p)
+            attn_task(r, h, rt0, p)
     stamp(c, 1)  # the attention tasks done
 
     # ============================================ merge jobs
@@ -443,8 +446,8 @@ def run_kattn(c, o_flag=None):
     pl = tid % 4
     d0 = dch * 8
     mbid = BLOCKS - 1 - bid  # the last CTAs: the task loop's extra tasks sit on the first
-    n_l1 = R * LOCAL_KV_HEADS * NT * GROUPS
-    n_l2 = R * LOCAL_KV_HEADS * NT
+    n_l1 = R * LOCAL_KV_HEADS * ROW_TILES * GROUPS
+    n_l2 = R * LOCAL_KV_HEADS * ROW_TILES
 
     def load_rec(r_src, base):
         """A record's (m, l) and this thread's 8 dims of O (plain words)."""
@@ -520,7 +523,7 @@ def run_kattn(c, o_flag=None):
         release_stores()
         gpu.barrier()
         if tid == 0:
-            put(l2flag, ((r * LOCAL_KV_HEADS + h) * NT + rt) * GROUPS + g, fx.Int32(1))
+            put(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS + g, fx.Int32(1))
 
     def merge_l2(r, h, rt):
         """Level-2 job: the groups' records (or, with at most GROUPS partitions, the
@@ -537,7 +540,7 @@ def run_kattn(c, o_flag=None):
         if direct:
             poll_flags(c, [(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS, np_r)])
         else:
-            poll_flags(c, [(l2flag, ((r * LOCAL_KV_HEADS + h) * NT + rt) * GROUPS, GROUPS)])
+            poll_flags(c, [(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS, GROUPS)])
         r_src = rsrc(direct.select(part_w.value, l2_w.value))
         for k in range_constexpr(GROUPS // MERGE_LANES):
             g = k * MERGE_LANES + pl
@@ -560,18 +563,18 @@ def run_kattn(c, o_flag=None):
             release_stores()
             gpu.barrier()
             if tid == 0:
-                put(o_flag, (r * LOCAL_KV_HEADS + h) * NT + rt, fx.Int32(1))
+                put(o_flag, (r * LOCAL_KV_HEADS + h) * ROW_TILES + rt, fx.Int32(1))
 
     for j in range(mbid, n_l1, BLOCKS):
         g = j % GROUPS
-        rt = (j // GROUPS) % NT
-        h = (j // (GROUPS * NT)) % LOCAL_KV_HEADS
-        r = j // (GROUPS * NT * LOCAL_KV_HEADS)
+        rt = (j // GROUPS) % ROW_TILES
+        h = (j // (GROUPS * ROW_TILES)) % LOCAL_KV_HEADS
+        r = j // (GROUPS * ROW_TILES * LOCAL_KV_HEADS)
         if n_parts_of(r) > GROUPS:  # else the level-2 job folds the partitions itself
             merge_l1(r, h, rt, g)
     if mbid < n_l2:
-        rt = mbid % NT
-        h = (mbid // NT) % LOCAL_KV_HEADS
-        r = mbid // (NT * LOCAL_KV_HEADS)
+        rt = mbid % ROW_TILES
+        h = (mbid // ROW_TILES) % LOCAL_KV_HEADS
+        r = mbid // (ROW_TILES * LOCAL_KV_HEADS)
         merge_l2(r, h, rt)
     stamp(c, 2)  # the merge done (end)
