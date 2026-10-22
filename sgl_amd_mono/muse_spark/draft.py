@@ -74,6 +74,11 @@ SGLANG_READS = {
     ),
     "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "next_token_logits", "hidden_states"),
     "srt/runtime_context.py": ("get_parallel", "get_spec"),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/layers/attention/triton_backend.py": ("token_to_kv_pool", "req_to_token_pool"),
+    "srt/mem_cache/memory_pool.py": ("get_kv_buffer", "req_to_token"),
+    "srt/layers/radix_attention.py": ("layer_id", "scaling", "k_scale", "v_scale"),
+    "srt/model_executor/forward_batch_info.py": ("out_cache_loc", "req_pool_indices", "seq_lens"),
 }
 
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_DRAFT_KERNELS", "0") == "1"
@@ -222,11 +227,18 @@ class DraftRunner:
             for k in self.attn_kernels(rows):
                 compile_only(k)
 
-    def _check_cache(self, forward_batch) -> None:
+    def _backend(self):
+        """The draft's attention backend (the forward context's: the draft runner is forwarding),
+        which holds its KV pool and its request-to-token table."""
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        return get_attn_backend()
+
+    def _check_cache(self, backend) -> None:
         """D-pre / D-attn read the draft's fp8 [slots, 1, 128] caches and its int32 page table once."""
         from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
 
-        pool = forward_batch.token_to_kv_pool
+        pool = backend.token_to_kv_pool
         for i, layer in enumerate(self.layers):
             k, v = pool.get_kv_buffer(layer.self_attn.attn.layer_id)
             for t, what in ((k, "K"), (v, "V")):
@@ -235,7 +247,7 @@ class DraftRunner:
             a = layer.self_attn.attn
             if a.k_scale is not None or a.v_scale is not None:
                 raise RuntimeError(f"Muse Spark draft layer {i}: a K / V cache scale; the kernels write fp8 at unit scale")
-        table = forward_batch.req_to_token_pool.req_to_token
+        table = backend.req_to_token_pool.req_to_token
         if table.dtype != torch.int32 or table.dim() != 2 or not table.is_contiguous():
             raise RuntimeError(f"Muse Spark draft: page table {table.dtype} {tuple(table.shape)}, the kernels take a contiguous int32 [pool, ctx]")
         self._cache_checked = True
@@ -251,13 +263,14 @@ class DraftRunner:
                 torch.cuda.synchronize()
                 logger.info("monokernel check: draft layer %d %s done (seq_lens %s, slots %s, table %s)", i, what, lens.tolist()[:4], slots.tolist()[:4], tuple(table.shape))  # fmt: skip
 
+        backend = self._backend()
         if not self._cache_checked:
-            self._check_cache(forward_batch)
+            self._check_cache(backend)
         v = self.aviews[i]
         attn = self.layers[i].self_attn.attn
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(attn.layer_id)
+        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(attn.layer_id)
         slots = forward_batch.out_cache_loc
-        table = forward_batch.req_to_token_pool.req_to_token
+        table = backend.req_to_token_pool.req_to_token
         rpi = forward_batch.req_pool_indices
         lens = forward_batch.seq_lens
         if slots.numel() < rows or positions.numel() < rows or lens.numel() * DRAFT_TOKENS < rows:
