@@ -262,6 +262,25 @@ def block_sum(c, v, slot):
     return tot
 
 
+@flyc.jit
+def block_sum4(c, v0, v1, v2, v3):
+    """Four CTA sums at once (one barrier): each wave's four sums to ``red`` slots 0
+    .. 3, every thread adds the waves in wave order."""
+    lane, wave, red = c["lane"], c["wave"], c["red"]
+    ws = [butterfly(v, (32, 16, 8, 4, 2, 1)) for v in (v0, v1, v2, v3)]
+    if lane == 0:
+        for k in range_constexpr(4):
+            fx.ptr_store(ws[k], red + (k * WAVES + wave))
+    gpu.barrier()
+    outs = []
+    for k in range_constexpr(4):
+        tot = fx.ptr_load(red + k * WAVES)
+        for w in range_constexpr(1, WAVES):
+            tot = tot + fx.ptr_load(red + (k * WAVES + w))
+        outs.append(tot)
+    return outs
+
+
 def ld_bf(ptr, e, n, cm=0):
     """``n`` (2, 4, 8 or 16) bf16 at element ``e`` (even) of a bf16 buffer, as
     f32; at most 4 dwords a load."""
@@ -480,10 +499,7 @@ def stage_a_part(c, t, part):
         A_ = A_ + (al[k] * st[k]) * (al[k] * st[k])
         B_ = B_ + al[k] * be[k] * st[k] * v[k]
         C_ = C_ + (be[k] * v[k]) * (be[k] * v[k])
-    ssp = block_sum(c, ssp, 0)
-    A_ = block_sum(c, A_, 1)
-    B_ = block_sum(c, B_, 2)
-    C_ = block_sum(c, C_, 3)
+    ssp, A_, B_, C_ = block_sum4(c, ssp, A_, B_, C_)  # one barrier for the four
     if const_expr(A_PARTS > 1):
         if tid < 4:
             put(ss_mb, (t * A_PARTS_MAX + part) * 4 + tid, (tid == 0).select(ssp, (tid == 1).select(A_, (tid == 2).select(B_, C_))))
