@@ -339,42 +339,58 @@ class MuseMonoRunner:
         self.backend, self.pool = backend, pool
 
     # ---------------------------------------------------------------- stage trace
-    def _start_trace_thread(self) -> None:
-        """Snapshot the launches' stage stamps (every layer's slot set) to
-        ``TRACE_DIR/rank<r>.pt`` every two seconds; a daemon thread on a side stream."""
-        import threading
-        import time
-
+    def _trace_regions(self):
         from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_scratch_layout
         from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import k2_scratch_layout
 
-        os.makedirs(TRACE_DIR, exist_ok=True)
-        self._trace_started = True
+        rows, q_len = self._trace_shape
 
         def region(buf, layout, name):
             off, nbytes = layout[name]
             return buf[off : off + nbytes]
 
+        return {
+            "k1": region(self.scratch_k1, k1_scratch_layout(), "k1_trace"),
+            "attn": region(self.scratch_attn, kattn_scratch_layout(rows, q_len), "attn_trace"),
+            "k2": region(self.scratch_k2, k2_scratch_layout(), "k2_trace"),
+            "k3": region(self.scratch_k3, k3_scratch_layout(), "k3_trace"),
+        }
+
+    def _trace_copy_out(self) -> None:
+        """Enqueue, in stream order after the step's last launch (inside the graph when
+        capturing), the stamp regions' copies to pinned host buffers. A side thread's
+        own device copies stalled the ranks' chains (blit kernels / the GIL) and
+        skewed what they measured; these copies cost the step ~0.2 ms and nothing
+        inside a launch."""
+        if self._trace_shape is None:
+            return
+        if not hasattr(self, "_trace_host"):
+            self._trace_host = {k: torch.empty(v.numel(), dtype=torch.uint8, pin_memory=True) for k, v in self._trace_regions().items()}
+            self._trace_epoch_host = torch.empty_like(self.epoch, device="cpu", pin_memory=True)
+        for k, v in self._trace_regions().items():
+            self._trace_host[k].copy_(v, non_blocking=True)
+        self._trace_epoch_host.copy_(self.epoch, non_blocking=True)
+
+    def _start_trace_thread(self) -> None:
+        """Save the host copies of the stamps to ``TRACE_DIR/rank<r>.pt`` every two
+        seconds (a daemon thread that never touches the device)."""
+        import threading
+        import time
+
+        os.makedirs(TRACE_DIR, exist_ok=True)
+        self._trace_started = True
+
         def loop():
-            torch.cuda.set_device(self.device)
-            side = torch.cuda.Stream(device=self.device)
             path = os.path.join(TRACE_DIR, f"rank{self.rank}.pt")
             while True:
                 time.sleep(2.0)
-                shape = self._trace_shape
-                if shape is None:
+                host = getattr(self, "_trace_host", None)
+                if host is None or self._trace_shape is None:
                     continue
-                rows, q_len = shape
+                rows, q_len = self._trace_shape
                 try:
-                    with torch.cuda.stream(side):
-                        snap = {
-                            "k1": region(self.scratch_k1, k1_scratch_layout(), "k1_trace").cpu(),
-                            "attn": region(self.scratch_attn, kattn_scratch_layout(rows, q_len), "attn_trace").cpu(),
-                            "k2": region(self.scratch_k2, k2_scratch_layout(), "k2_trace").cpu(),
-                            "k3": region(self.scratch_k3, k3_scratch_layout(), "k3_trace").cpu(),
-                            "epoch": self.epoch.cpu(),
-                        }
-                    side.synchronize()
+                    snap = {k: v.clone() for k, v in host.items()}
+                    snap["epoch"] = self._trace_epoch_host.clone()
                     snap.update(
                         rank=self.rank, npes=self.npes, time=time.time(), rows=rows, q_len=q_len,
                         windows=list(self.windows), swa=[bool(c[2]) for c in self.caches],
@@ -492,5 +508,7 @@ class MuseMonoRunner:
 
     def end_step(self) -> None:
         """The next step's epoch, enqueued after this step's last launch."""
+        if TRACE_DIR:
+            self._trace_copy_out()
         self.epoch[0].add_(1)
         self._k1_done = -1
