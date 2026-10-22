@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The shapes the Muse Spark gfx950 kernels are built for: one rank at TP8 / EP8."""
 
+import os
+
 HIDDEN = 8192
 HEAD_DIM = 64
 LOCAL_Q_HEADS = 16  # 128 / TP8
@@ -34,4 +36,10 @@ GATE_TEMPERATURE = 0.3
 LAYERS = 62
 LAYER_SLOTS = 128  # mailbox tags: step * LAYER_SLOTS + layer + 1
 MAX_TOKENS = 64  # C8 x 8 draft tokens
-WIDTHS = (8, 16, 32, 64)  # C1 / C2 / C4 / C8 verify steps at 8 draft tokens
+# The verify widths the monokernels serve (rows = 8 draft tokens x running requests).
+# Default: C1's 8 rows only. At 16 rows and above the launches lose to SGLang's own
+# path (300k, 机器2: 13.24 vs 12.93 ms at 16 rows, 17.30 vs 16.22 at 32; the expert
+# bytes double while the ~100 us a layer of hand-offs stay), so those steps route
+# to it. SGLANG_AMD_MONO_MUSE_WIDTHS="8,16,32,64" serves them all.
+WIDTHS = tuple(int(x) for x in os.environ.get("SGLANG_AMD_MONO_MUSE_WIDTHS", "8").split(","))
+assert all(w in (8, 16, 32, 64) for w in WIDTHS) and WIDTHS, WIDTHS
