@@ -777,13 +777,25 @@ def stage_fin(c, t, part):
     a1 = fx.Float32(0.0)
     a2 = fx.Float32(0.0)
     a3 = fx.Float32(0.0)
+    # the slot this wave sums the squares of (a slot this rank does not hold: a held one's, taken as 0)
+    psl = fx.Int32(fb)
+    held_w = fx.Int32(0) == fx.Int32(1)
+    for s_ in range_constexpr(TOP_K):
+        hit = (wave == s_) & (es[s_] >= 0)
+        psl = hit.select(fx.Int32(s_), psl)
+        held_w = held_w | hit
     if fb >= 0:
+        # the slots' y columns and this wave's slot's sum of squares in one poll round
+        # (the ss publish trails its item's y by one item: polled apart it was a
+        # second round trip)
         got = poll(
             [
                 (y_mb, (t * TOP_K + (es[sl] >= 0).select(fx.Int32(sl), fb)) * (MOE_HIDDEN // 2) + col // 2, PPT)
                 for sl in range(TOP_K)
             ]
+            + [(ss_mb, (t * TOP_K + psl) * DN_T + 2 * lane, 2)]
         )  # fmt: skip
+        got_ss = got[TOP_K]
         vs = []
         for sl in range_constexpr(TOP_K):
             held = es[sl] >= 0
@@ -795,16 +807,8 @@ def stage_fin(c, t, part):
                 v.append(held.select(bf16_round(hi * pw[2 * q + 1]), fx.Float32(0.0)))
             vs.append(v)
         # every slot's sum of squares over its whole row: the dn items' DN_T publishes,
-        # two a lane, a wave a slot (a slot this rank does not hold polls a held
-        # one's and takes 0); 1 / rms a slot to LDS
-        psl = fx.Int32(fb)
-        held_w = fx.Int32(0) == fx.Int32(1)
-        for s_ in range_constexpr(TOP_K):
-            hit = (wave == s_) & (es[s_] >= 0)
-            psl = hit.select(fx.Int32(s_), psl)
-            held_w = held_w | hit
-        got_ss = poll([(ss_mb, (t * TOP_K + psl) * DN_T + 2 * lane, 2)])
-        tot = held_w.select(got_ss[0][0].bitcast(fx.Float32) + got_ss[0][1].bitcast(fx.Float32), fx.Float32(0.0))
+        # two a lane, a wave a slot; 1 / rms a slot to LDS
+        tot = held_w.select(got_ss[0].bitcast(fx.Float32) + got_ss[1].bitcast(fx.Float32), fx.Float32(0.0))
         tot = butterfly(tot, (1, 2, 4, 8, 16, 32))
         if lane == 0:
             rinv = fx.Float32(1.0) / fmath.sqrt(tot / float(MOE_HIDDEN) + POST_EPS)

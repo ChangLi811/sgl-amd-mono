@@ -76,7 +76,7 @@ from sgl_amd_mono.common.ops import (
     sum_partials,
 )
 from sgl_amd_mono.common.plan import BLOCKS, PAIR_BYTES, THREADS, WAVES, pair_layout
-from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_SLOTS
+from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_LAYERS, TRACE_SLOTS
 from sgl_amd_mono.common.sync import preg
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
@@ -176,7 +176,7 @@ def k2_scratch_layout() -> dict:
             ("k2_rflag", MAX_TOKENS),
             ("k2_xinflag", MAX_TOKENS),
             ("k2_oflag", MAX_TOKENS * LOCAL_KV_HEADS * 4),
-            ("k2_trace", BLOCKS * TRACE_SLOTS),
+            ("k2_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )
