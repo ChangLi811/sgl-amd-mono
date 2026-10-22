@@ -240,10 +240,16 @@ class DraftRunner:
             raise RuntimeError(f"Muse Spark draft: page table {table.dtype} {tuple(table.shape)}, the kernels take a contiguous int32 [pool, ctx]")
         self._cache_checked = True
 
-    def launch_attn(self, i: int, rows: int, hidden, residual, first: bool, positions, forward_batch, stream):
+    def launch_attn(self, i: int, rows: int, hidden, residual, first: bool, positions, forward_batch, stream, trace: bool = False):
         """Layer ``i``'s attention half on ``rows`` rows (D-pre, D-attn, D-post): (attn_out,
-        the residual after the input norm's fused add), bf16."""
+        the residual after the input norm's fused add), bf16. ``trace`` (check mode):
+        every launch synchronized and logged, so a hang names its launch."""
         from sgl_amd_mono.muse_spark.gfx950.runner import _f32_bits, _ptr
+
+        def mark(what):
+            if trace:
+                torch.cuda.synchronize()
+                logger.info("monokernel check: draft layer %d %s done (seq_lens %s, slots %s, table %s)", i, what, lens.tolist()[:4], slots.tolist()[:4], tuple(table.shape))  # fmt: skip
 
         if not self._cache_checked:
             self._check_cache(forward_batch)
@@ -264,6 +270,7 @@ class DraftRunner:
             _ptr(slots), int(slots.dtype == torch.int64), _ptr(k_cache), _ptr(v_cache), _ptr(res_pre), _ptr(q), _ptr(coef),
             _ptr(self.scratch_pre), _ptr(self.epoch), i, stream=stream,
         )  # fmt: skip
+        mark("D-pre")
         # the draft batch is a TARGET_VERIFY batch: seq_lens is the (compact) prefix, the
         # block's DRAFT_TOKENS keys follow it; the compact cache holds the window, so no
         # window mask (the window is the cache)
@@ -272,10 +279,12 @@ class DraftRunner:
             int(rpi.dtype == torch.int64), _ptr(lens), int(lens.dtype == torch.int64), DRAFT_TOKENS, 0, 0,
             _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn), _ptr(self.epoch), i, stream=stream,
         )  # fmt: skip
+        mark("D-attn")
         post(
             _ptr(o), _ptr(v["w_o"]), _ptr(coef), _ptr(v["base_a"]), _ptr(attn_out), _ptr(self.scratch_post),
             self.peers_post.local, _ptr(self.peers_post.addresses), self.rank, _ptr(self.epoch), i, stream=stream,
         )  # fmt: skip
+        mark("D-post")
         return attn_out, res_pre
 
     def launch(self, i: int, rows: int, attn_out: torch.Tensor, residual: torch.Tensor, stream):
@@ -380,7 +389,7 @@ class _Draft:
                 first = residual is None
                 h_in, r_in = hidden, (hidden if first else residual)
                 attn_out, residual = self.runner.launch_attn(
-                    i, rows, h_in.contiguous(), r_in.contiguous(), first, positions, forward_batch, stream
+                    i, rows, h_in.contiguous(), r_in.contiguous(), first, positions, forward_batch, stream, trace=check
                 )
                 if check:
                     _log_check_pair(i, "attn", (attn_out, residual), self._attention_reference(layer, h_in, None if first else r_in, positions, forward_batch))  # fmt: skip
