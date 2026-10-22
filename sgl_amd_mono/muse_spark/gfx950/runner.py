@@ -96,9 +96,9 @@ SGLANG_READS = {
 FP8_CACHE = torch.float8_e4m3fn
 # SGLANG_AMD_MONO_MUSE_KERNELS=0: every layer on SGLang's modules (the stage-0 plugin)
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
-# SGLANG_AMD_MONO_MUSE_LAYER=1: an MXFP4 layer's attention, K2, K3 and the next layer's
-# K1 as one launch (else the four launches)
-USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "1") == "1"  # the whole-layer launch, on by default (=0: four launches a layer)
+# an MXFP4 layer's attention, K2, K3 and the next layer's K1 as one launch (the
+# default); SGLANG_AMD_MONO_MUSE_LAYER=0: the four launches
+USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "1") == "1"
 # SGLANG_AMD_MONO_MUSE_SKIP=1: a timing diagnostic, the MXFP4 layers skipped (garbage
 # output): the step's cost outside the kernel layers
 SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_MUSE_SKIP", "0") == "1"

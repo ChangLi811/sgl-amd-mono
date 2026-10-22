@@ -9,13 +9,18 @@ turns into the draft tokens. The draft is a dense Qwen3-style stack (5 sliding
 layers, hidden 8192, 64 / 8 heads of 128, intermediate 28672, a grouped two-tap
 convolution around each sublayer) with no head of its own.
 
-Stage 0 (``SGLANG_AMD_MONO_DRAFT_KERNELS=0``, the default while the kernels are
-built): the forward is the model's own, so the wiring (attach, widths, block rows,
-graph capture) is exercised with an output identical to the normal path. Stage 1
-(``=1``): each layer's attention half runs SGLang's modules and its MLP half (the
-post norm's fused add, the convolutions, gate / up / down, the TP sum) runs the
-D-MLP launch (``gfx950/draft_mlp.py``). Check mode (``SGLANG_AMD_MONO_CHECK=1``,
-graphs off) runs SGLang's MLP half on copies and logs each layer's cosine.
+Stage 2 (the default): each layer runs as four launches, D-pre (the input norm's
+fused add, the attention convolution's coefficients and conv0, the qkv projection,
+the per-head q / k norm + table RoPE, q out and k / v into the fp8 cache), D-attn
+(the block attention over the compact windowed cache), D-post (the o projection,
+the TP sum, conv1) and D-MLP (the post norm's fused add, the convolutions, gate /
+up / down, the TP sum) — ``gfx950/draft_attn_half.py``, ``draft_attn.py``,
+``draft_mlp.py``. ``SGLANG_AMD_MONO_DRAFT_STAGE=1`` keeps the attention half on
+SGLang's modules; ``SGLANG_AMD_MONO_DRAFT_KERNELS=0`` (stage 0) runs the model's
+own forward, so the wiring (attach, widths, block rows, graph capture) can be
+exercised with an output identical to the normal path. Check mode
+(``SGLANG_AMD_MONO_CHECK=1``, graphs off) runs SGLang's halves on copies and logs
+each layer's cosines (attn_out, the residual, the MLP output).
 """
 
 from __future__ import annotations
