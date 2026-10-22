@@ -161,7 +161,7 @@ def k2_scratch_layout() -> dict:
         [
             ("k2_og", MAX_TOKENS * Q_K // 2),
             ("k2_xflag", MAX_TOKENS),
-            ("k2_ss", 2 * MAX_TOKENS * A_PARTS_MAX),
+            ("k2_ss", 4 * MAX_TOKENS * A_PARTS_MAX),
             ("k2_xpart", MAX_TOKENS * A_PARTS_MAX),
             ("k2_logits", R_PARTS * MAX_TOKENS * EXPERTS),
             ("k2_pool", P_PARTS * MAX_TOKENS * MOE_HIDDEN // 2),
@@ -374,23 +374,37 @@ def o_w_loads(c, task):
 
 
 @flyc.jit
-def stage_og_rows(c):
-    """Every token's normed gated o, polled from ``og`` into LDS: the o tasks' B
-    rows (16 B a thread a token, OG_POLL tokens a poll)."""
-    S, tid, xs = c["S"], c["tid"], c["xs"]
-    poll, og = c["poll"], c["og"]
-    rocdl.sched_barrier(0)
-    if tid < OG_THREADS:
-        for t0 in range_constexpr(0, S, OG_POLL):
-            n = min(OG_POLL, S - t0)
-            got = poll([(og, (t0 + j) * (Q_K // 2) + tid * 2, 2) for j in range(n)])
-            for j in range_constexpr(n):
-                fx.ptr_store(
-                    got[j][0].bitcast(fx.Float32), xs + ((t0 + j) * (Q_K // 2) + tid * 2)
-                )
-                fx.ptr_store(
-                    got[j][1].bitcast(fx.Float32), xs + ((t0 + j) * (Q_K // 2) + tid * 2 + 1)
-                )
+def stage_og_rows(c, o_flag=None, QL=8):
+    """Every token's normed gated o into LDS, computed here from o and the gate (16
+    heads of 64: per-head RMSNorm without weight x sigmoid(gate), one bf16
+    rounding; thread tid holds head (tid / 16) % 16, dims 4 (tid % 16) .. of
+    token 2 round + tid / 256): the o tasks' B rows. It used to be an og task a
+    token and a mailbox hop. ``o_flag`` (a merged launch): the requests' (KV head,
+    row tile) flags first, then device-scope loads."""
+    S, tid, lane, xs = c["S"], c["tid"], c["lane"], c["xs"]
+    a = c["args"]
+    o_cm = 0  # o from memory the host wrote: the default cache policy
+    if const_expr(o_flag is not None):
+        o_cm = CM_DEV  # the attention's device-scope stores, earlier in this launch
+        rocdl.sched_barrier(0)
+        RT = (QL * GQA + 15) // 16  # the attention's row tiles a (request, KV head)
+        poll_flags(c, [(o_flag, (S // QL) * LOCAL_KV_HEADS * RT)])
+        acquire_loads()
+    TPR = THREADS // OG_THREADS  # tokens a round: 2
+    e = ((tid % OG_THREADS) // 16) * HEAD_DIM + (lane % 16) * 4
+    for t0 in range_constexpr(0, S, TPR):
+        t = fx.min(t0 + tid // OG_THREADS, S - 1)
+        ov = ld_bf(a["o"], t * Q_K + e, 4, o_cm)
+        gv = ld_bf(a["g"], t * Q_K + e, 4)
+        ss = fx.Float32(0.0)
+        for j in range_constexpr(4):
+            ss = ss + ov[j] * ov[j]
+        ss = butterfly(ss, (8, 4, 2, 1))
+        rstd = hw_rsq(ss / float(HEAD_DIM) + RMS_EPS)
+        vals = [ov[j] * rstd * sigmoid(gv[j]) for j in range(4)]
+        if t0 + tid // OG_THREADS < S:
+            fx.ptr_store(bf16_pair(vals[0], vals[1]), xs + (t * (Q_K // 2) + e // 2))
+            fx.ptr_store(bf16_pair(vals[2], vals[3]), xs + (t * (Q_K // 2) + e // 2 + 1))
     gpu.barrier()
 
 
@@ -482,36 +496,38 @@ def stage_a_part(c, t, part):
             acc0 = acc0 + lo
             acc1 = acc1 + hi
         v += [bf16_round(acc0), bf16_round(acc1)]
-    ssp = v[0] * v[0]
-    for k in range_constexpr(1, NC):
+    # the two norms' statistics in one exchange: the row's sum of squares of v and,
+    # for the pre-FFN norm of new = alpha st + beta v rstd, the sums A = (alpha st)^2,
+    # B = alpha beta st v, C = (beta v)^2 (its sum of squares is A + 2 rstd B + rstd^2 C
+    # up to the bf16 rounding of v rstd: a 1e-5 relative difference), so the parts
+    # exchange once (two round trips before)
+    ssp, A_, B_, C_ = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
+    for k in range_constexpr(NC):
         ssp = ssp + v[k] * v[k]
+        A_ = A_ + (al[k] * st[k]) * (al[k] * st[k])
+        B_ = B_ + al[k] * be[k] * st[k] * v[k]
+        C_ = C_ + (be[k] * v[k]) * (be[k] * v[k])
     ssp = block_sum(c, ssp, 0)
+    A_ = block_sum(c, A_, 1)
+    B_ = block_sum(c, B_, 2)
+    C_ = block_sum(c, C_, 3)
     if const_expr(A_PARTS > 1):
-        if tid == 0:
-            put(ss_mb, (t * A_PARTS_MAX + part) * 2, ssp)
-        got = poll([(ss_mb, (t * A_PARTS_MAX + q) * 2, 1) for q in range(A_PARTS)])
-        tot = got[0][0].bitcast(fx.Float32)
-        for q in range_constexpr(1, A_PARTS):
+        if tid < 4:
+            put(ss_mb, (t * A_PARTS_MAX + part) * 4 + tid, (tid == 0).select(ssp, (tid == 1).select(A_, (tid == 2).select(B_, C_))))
+        got = poll([(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)] + [(ss_mb, (t * A_PARTS_MAX + q) * 4 + 2, 2) for q in range(A_PARTS)], batch=2 * A_PARTS)  # fmt: skip
+        tot, At, Bt, Ct = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
+        for q in range_constexpr(A_PARTS):
             tot = tot + got[q][0].bitcast(fx.Float32)
+            At = At + got[q][1].bitcast(fx.Float32)
+            Bt = Bt + got[A_PARTS + q][0].bitcast(fx.Float32)
+            Ct = Ct + got[A_PARTS + q][1].bitcast(fx.Float32)
     else:
-        tot = ssp
+        tot, At, Bt, Ct = ssp, A_, B_, C_
     rstd = hw_rsq(tot / float(HIDDEN) + POST_EPS)
     n = [bf16_round(v[k] * rstd) for k in range(NC)]
     new = [al[k] * st[k] + be[k] * n[k] for k in range(NC)]
     st_f32(a["res"], t * HIDDEN + e0, new, CM_DEV)
-    ss2 = new[0] * new[0]
-    for k in range_constexpr(1, NC):
-        ss2 = ss2 + new[k] * new[k]
-    ss2 = block_sum(c, ss2, 1)
-    if const_expr(A_PARTS > 1):
-        if tid == 0:
-            put(ss_mb, (t * A_PARTS_MAX + part) * 2 + 1, ss2)
-        got2 = poll([(ss_mb, (t * A_PARTS_MAX + q) * 2 + 1, 1) for q in range(A_PARTS)])
-        tot2 = got2[0][0].bitcast(fx.Float32)
-        for q in range_constexpr(1, A_PARTS):
-            tot2 = tot2 + got2[q][0].bitcast(fx.Float32)
-    else:
-        tot2 = ss2
+    tot2 = At + fx.Float32(2.0) * rstd * Bt + rstd * rstd * Ct
     rstd2 = hw_rsq(tot2 / float(HIDDEN) + RMS_EPS)
     words = [
         bf16_pair(new[2 * k] * rstd2 * prw[2 * k], new[2 * k + 1] * rstd2 * prw[2 * k + 1]).bitcast(fx.Int32)  # fmt: skip
@@ -520,16 +536,8 @@ def stage_a_part(c, t, part):
     st_words(xbuf, (t * HIDDEN + e0) // 2, words, CM_DEV)
     release_stores()
     gpu.barrier()
-    if const_expr(A_PARTS > 1):
-        if tid == 0:
-            put(xpart, t * A_PARTS_MAX + part, fx.Int32(1))
-        if part == 0:
-            poll([(xpart, t * A_PARTS_MAX + q, 1) for q in range(A_PARTS)])
-            if tid == 0:
-                put(xflag, t, fx.Int32(1))
-    else:
-        if tid == 0:
-            put(xflag, t, fx.Int32(1))
+    if tid == 0:
+        put(xpart, t * A_PARTS + part, fx.Int32(1))  # the consumers poll every (token, part)
 
 
 # ---------------------------------------------------------------- router and pooler GEMVs
@@ -676,10 +684,10 @@ def stage_passes(c, tile, part, pool_w, router_w, r_tile, is_router):
 
 @flyc.jit
 def wait_x(c):
-    """The tokens' x flags, then device-scope loads."""
-    S, xflag = c["S"], c["xflag"]
+    """Every (token, part)'s x flag, then device-scope loads."""
+    S, xpart = c["S"], c["xpart"]
     rocdl.sched_barrier(0)
-    poll_flags(c, [(xflag, S)])
+    poll_flags(c, [(xpart, S * a_parts(S))])
 
 
 # ---------------------------------------------------------------- route and xn tasks
@@ -774,7 +782,7 @@ def stage_xn(c, t, xin_flag=None):
 
 # ---------------------------------------------------------------- the CTAs' roles
 @flyc.jit
-def run_chain(c, route_flag=None, xin_flag=None):
+def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     """A chain CTA (``bid >= CHAIN0``): its two o tasks (``bid`` and ``bid +
     BLOCKS``), its boundary part (the 64 boundary tasks sit here), then its pooler
     weights, the tokens' flags, the pooler passes, and token ``bid - CHAIN0``'s
@@ -789,7 +797,7 @@ def run_chain(c, route_flag=None, xin_flag=None):
     # +1.1 ms a step)
     w_first = o_w_loads(c, bid)
     w_second = o_w_loads(c, bid + BLOCKS)
-    stage_og_rows(c)
+    stage_og_rows(c, o_flag, QL)
     stage_o(c, bid, w_first)
     stage_o(c, bid + BLOCKS, w_second)
     stamp(c, 2)  # the o tasks done
@@ -817,12 +825,10 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None):
     loads a tile's rows, the index clamped; they stream while the first pass is
     staged)."""
     S, bid = c["S"], c["bid"]
-    if (bid >= OG0) & (bid < OG0 + S):
-        stage_og(c, bid - OG0, o_flag, QL)
-    stamp(c, 1)  # the og task done (og CTAs)
+    stamp(c, 1)  # entry (the og rows are computed below, no og task)
     w_first = o_w_loads(c, bid)
     w_second = o_w_loads(c, bid + BLOCKS)
-    stage_og_rows(c)
+    stage_og_rows(c, o_flag, QL)
     stage_o(c, bid, w_first)
     stage_o(c, bid + BLOCKS, w_second)
     stamp(c, 2)  # the o tasks done
@@ -853,7 +859,7 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     bid = c["bid"]
     stamp(c, 0)
     if bid >= CHAIN0:
-        run_chain(c, route_flag, xin_flag)
+        run_chain(c, route_flag, xin_flag, o_flag, QL)
     else:
         run_stream(c, o_flag, QL, xin_flag)
     stamp(c, 7)  # end
