@@ -5,7 +5,7 @@ and the whole layer (``build_layer``: attention, K2, K3 and the next layer's K1 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
-from flydsl.expr import const_expr, gpu, rocdl
+from flydsl.expr import const_expr, gpu
 from flydsl.expr.typing import Int32, Int64
 
 from sgl_amd_mono.common import guard
@@ -376,11 +376,9 @@ def build_layer(key: LayerBuild):
             c2 = k2_context(k2_key, lds.k2.peek(), k2_args, scratch2, sym, peers, rank, tag, k2_layout)
             oflag, rflag, xinflag = c2["oflag"], c2["rflag"], c2["xinflag"]
             ca = kattn_context(ka_key, lds, a_args, scratch_a, tag, ka_layout)
-            o_w = post_attn.o_w_prefetch(c2)  # K2's o weights stream while the attention runs
-            rocdl.sched_barrier(0)
             attention.run_kattn(ca, o_flag=oflag)
             gpu.barrier()  # this CTA is done with the attention's LDS
-            post_attn.run_k2(c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL, o_w=o_w)
+            post_attn.run_k2(c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL)
             gpu.barrier()
             c3 = k3_context(k3_key, lds.k3.peek(), k3_args, scratch3, sym, peers, rank, tag, k3_layout, sy)
             if const_expr(next_k1):

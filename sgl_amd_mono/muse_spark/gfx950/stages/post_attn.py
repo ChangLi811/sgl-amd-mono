@@ -352,12 +352,6 @@ def stage_og(c, t, o_flag=None, QL=8):
 
 
 # ---------------------------------------------------------------- o tasks
-def o_w_prefetch(c):
-    """The CTA's two o tasks' weights, issued ahead of the attention in a merged
-    launch (32 VGPRs in flight across it): the o tasks then start on landed weights."""
-    return o_w_loads(c, c["bid"]), o_w_loads(c, c["bid"] + BLOCKS)
-
-
 def o_w_loads(c, task):
     """The o_proj weight words of o task ``task``'s rows, this lane's: in flight
     (a task past the last reads past the buffer: zeros, no traffic). Row-major
@@ -780,7 +774,7 @@ def stage_xn(c, t, xin_flag=None):
 
 # ---------------------------------------------------------------- the CTAs' roles
 @flyc.jit
-def run_chain(c, route_flag=None, xin_flag=None, o_w=None):
+def run_chain(c, route_flag=None, xin_flag=None):
     """A chain CTA (``bid >= CHAIN0``): its two o tasks (``bid`` and ``bid +
     BLOCKS``), its boundary part (the 64 boundary tasks sit here), then its pooler
     weights, the tokens' flags, the pooler passes, and token ``bid - CHAIN0``'s
@@ -793,11 +787,8 @@ def run_chain(c, route_flag=None, xin_flag=None, o_w=None):
     # them, the weights (~15 us to land) delay the o tasks, and in the TP 8 server
     # every rank's boundary then waits for the slowest rank's o partials (measured
     # +1.1 ms a step)
-    if const_expr(o_w is not None):
-        w_first, w_second = o_w  # issued before the attention (a merged launch)
-    else:
-        w_first = o_w_loads(c, bid)
-        w_second = o_w_loads(c, bid + BLOCKS)
+    w_first = o_w_loads(c, bid)
+    w_second = o_w_loads(c, bid + BLOCKS)
     stage_og_rows(c)
     stage_o(c, bid, w_first)
     stage_o(c, bid + BLOCKS, w_second)
@@ -819,7 +810,7 @@ def run_chain(c, route_flag=None, xin_flag=None, o_w=None):
 
 
 @flyc.jit
-def run_stream(c, o_flag=None, QL=8, xin_flag=None, o_w=None):
+def run_stream(c, o_flag=None, QL=8, xin_flag=None):
     """A stream CTA (``bid < CHAIN0``): its og task (CTAs 0 .. S), its two o tasks
     (``bid`` and ``bid + BLOCKS``), then its pooler weights, the tokens' flags, and
     the router / pooler passes (a router task's rows on CTAs R0 ..: every stream CTA
@@ -829,11 +820,8 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None, o_w=None):
     if (bid >= OG0) & (bid < OG0 + S):
         stage_og(c, bid - OG0, o_flag, QL)
     stamp(c, 1)  # the og task done (og CTAs)
-    if const_expr(o_w is not None):
-        w_first, w_second = o_w  # issued before the attention (a merged launch)
-    else:
-        w_first = o_w_loads(c, bid)
-        w_second = o_w_loads(c, bid + BLOCKS)
+    w_first = o_w_loads(c, bid)
+    w_second = o_w_loads(c, bid + BLOCKS)
     stage_og_rows(c)
     stage_o(c, bid, w_first)
     stage_o(c, bid + BLOCKS, w_second)
@@ -856,7 +844,7 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None, o_w=None):
 
 
 @flyc.jit
-def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8, o_w=None):
+def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     """K2's stages on this CTA. ``route_flag`` / ``xin_flag`` (mailbox regions):
     in a launch that goes on to the experts, the route and xn tasks raise a
     token's flag once its routing / expert input is out. ``o_flag``: the
@@ -865,7 +853,7 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8, o_w=None):
     bid = c["bid"]
     stamp(c, 0)
     if bid >= CHAIN0:
-        run_chain(c, route_flag, xin_flag, o_w)
+        run_chain(c, route_flag, xin_flag)
     else:
-        run_stream(c, o_flag, QL, xin_flag, o_w)
+        run_stream(c, o_flag, QL, xin_flag)
     stamp(c, 7)  # end
