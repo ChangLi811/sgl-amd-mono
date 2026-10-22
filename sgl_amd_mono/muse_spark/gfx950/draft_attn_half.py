@@ -299,7 +299,7 @@ def stage_heads(c, bid):
                         rote = (de < 64).select(xe1 * cse - xe2 * sne, xe2 * cse + xe1 * sne)
                         vals.append(is_v.select(fx.ptr_load(hrow + de), bf16_round(rote)))
                     packed = fp8_pack4(clamp_fp8(vals[0]), clamp_fp8(vals[1]), clamp_fp8(vals[2]), clamp_fp8(vals[3]))
-                    bo.buffer_store(packed, is_v.select(r_v, r_k), (slot * HEAD_DIM + d) // 4)
+                    bo.buffer_store(packed, rsrc(is_v.select(a["v_cache"], a["k_cache"])), (slot * HEAD_DIM + d) // 4)
         gpu.barrier()  # ``hrow`` / ``hss`` are reused by the next head-row
 
 
