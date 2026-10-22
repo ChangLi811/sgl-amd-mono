@@ -85,7 +85,7 @@ def main():
         print(f"S={S} lens={lens} window={window}; ids of token 0: {B.ids[0].tolist()}")
         cta = torch.arange(BLOCKS)
         _report("K1", _stamps(B.scratch_k1, k1_scratch_layout(), "k1_trace", BLOCKS, TRACE_SLOTS), K1_STAMPS, [
-            ("head tasks", (cta >= 32) & (cta < 52)), ("gate tasks", (cta >= 52) & (cta < 68)), ("2 gemv tasks", (cta >= 68) & (cta < 100)), ("1 gemv task", (cta < 32) | (cta >= 100)),
+            ("head tasks", (cta >= 32) & (cta < 52)), ("gate tasks", (cta >= 52) & (cta < 68)), ("gemv only", (cta < 32) | (cta >= 68)),
         ])  # fmt: skip
         _report("K-attn", _stamps(B.scratch_a, kattn_scratch_layout(S, ql), "attn_trace", BLOCKS, TRACE_SLOTS), KA_STAMPS, [
             ("merge CTAs", cta >= BLOCKS - (S // ql) * 2 * 4), ("other CTAs", cta < BLOCKS - (S // ql) * 2 * 4),

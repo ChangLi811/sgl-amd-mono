@@ -23,17 +23,17 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
 ROWS = 16  # projection rows an MFMA tile: the MFMA's M
 TILE = 16  # tokens an MFMA B operand holds: a token tile
 K_STEP = 32  # the bf16 MFMA's K
-G_ROWS = 64  # projection rows a GEMV task: four MFMA tiles
-G_TILES = G_ROWS // ROWS  # 4
-K_PARTS = 8  # a task covers one eighth of K: x a task is S x 2 KB (not S x 16 KB), a slot a part
+G_ROWS = 144  # projection rows a GEMV task: nine MFMA tiles
+G_TILES = G_ROWS // ROWS  # 9
+K_PARTS = 16  # a task covers one sixteenth of K: 16 groups x 16 parts = one task a CTA, 147 KB each
 PARTS = K_PARTS  # partial slots a (token, row)
-K_PART = HIDDEN // K_PARTS  # 1024
-K_PER_WAVE = K_PART // WAVES  # 128: each wave's contiguous K range of a part
-K_STEPS = K_PER_WAVE // K_STEP  # 4 MFMAs a wave a (row tile, token tile)
-STEP_BATCH = K_STEPS  # one batch: a task's weights all in flight (64 VGPRs)
-GEMV_GROUPS = QKVG_ROWS // G_ROWS  # 36 row groups
-GEMV_TASKS = GEMV_GROUPS * K_PARTS  # 288 tasks: one a CTA, a second on 32 CTAs
-SECOND_TASKS = GEMV_TASKS - BLOCKS  # 32
+K_PART = HIDDEN // K_PARTS  # 512
+K_PER_WAVE = K_PART // WAVES  # 64: each wave's contiguous K range of a part
+K_STEPS = K_PER_WAVE // K_STEP  # 2 MFMAs a wave a (row tile, token tile)
+STEP_BATCH = K_STEPS  # one batch: a task's weights all in flight (72 VGPRs)
+GEMV_GROUPS = QKVG_ROWS // G_ROWS  # 16 row groups
+GEMV_TASKS = GEMV_GROUPS * K_PARTS  # 256 tasks: exactly one a CTA
+SECOND_TASKS = GEMV_TASKS - BLOCKS  # 0
 HEAD_TASKS = LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS  # 20: a CTA a q, k or v head
 GATE_TASKS = Q_K // HEAD_DIM  # 16: the gate rows' part sums, 64 rows a task
 HT0 = 32  # the first head task's CTA
@@ -44,7 +44,7 @@ TOKEN_LANES = 16
 TOKENS_PER_PASS = THREADS // TOKEN_LANES  # 32 tokens a head / gate pass
 RED_FLOATS = WAVES * 64 * 4  # one (row tile, token tile)'s MFMA accumulators in LDS
 assert QKVG_ROWS % G_ROWS == 0 and K_STEPS % STEP_BATCH == 0 and GEMV_GROUPS * G_ROWS == QKVG_ROWS
-assert QT0 + SECOND_TASKS <= BLOCKS and 0 < SECOND_TASKS <= BLOCKS
+assert QT0 + SECOND_TASKS <= BLOCKS and 0 <= SECOND_TASKS <= BLOCKS
 assert MAX_TOKENS % TILE == 0
 
 
@@ -73,8 +73,9 @@ def scratch_bytes(layout: dict) -> int:
 
 
 def k1_lds_floats(s: int) -> int:
-    """K1's LDS floats at width ``s``: a reduction row set a (row tile, token tile)."""
-    return G_TILES * token_tiles(s) * RED_FLOATS
+    """K1's LDS floats at width ``s``: a reduction row set a row tile (the token tiles
+    go one at a time)."""
+    return G_TILES * RED_FLOATS
 
 
 def k1_lds_bytes(s: int) -> int:

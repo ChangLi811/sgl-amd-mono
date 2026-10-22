@@ -13,14 +13,14 @@ cache write, for S = ``tokens`` rows (a token each; 8 consecutive rows a request
          (unit KV scale, checked at bind; the sliding layers' slots through the
          SWA pool's full-to-SWA table)
 
-Stage 1 is the GEMV tasks: 36 row groups of 64 rows (four MFMA tiles) x 8 K parts
-= 288 tasks, one a CTA and a second on 32 CTAs past the head / gate CTAs; a task
-streams 128 KB of weights and S x 2 KB of x (the K eighth of every token, straight
-from memory: no staging), its fp32 partials go to slot ``part`` of the ``k1_part``
-mailbox (a pair a (part, token, row)). Stage 2 is a head task a q, k or v head on
-CTAs ``HT0`` .. and a gate task a q head after them, each summing a row's eight
-slots in order (one poll round) and rounding once, 32 tokens a pass on 16 lanes of
-4 dims. Dependencies only point
+Stage 1 is the GEMV tasks: 16 row groups of 144 rows (nine MFMA tiles) x 16 K
+parts = 256 tasks, exactly one a CTA; a task streams 147 KB of weights (held in
+registers over the token tiles, one token tile at a time) and S x 1 KB of x (its K
+sixteenth of every token, straight from memory), its fp32 partials go to slot
+``part`` of the ``k1_part`` mailbox (a pair a (part, token, row)). Stage 2 is a head
+task a q, k or v head on CTAs ``HT0`` .. and a gate task a q head after them, each
+summing a row's sixteen slots in order (one poll round) and rounding once, 32
+tokens a pass on 16 lanes of 4 dims. Dependencies only point
 from stage 2 to stage 1 and all CTAs are co-resident, so every wait makes
 progress.
 """
@@ -134,7 +134,8 @@ def stage_gemv(c, rg, kpart, first=None):
         w = first
     else:
         w = gemv_w_loads(c, rg, kpart, a["w"])
-    accs = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(tiles)] for _ in range(G_TILES)]
+    # a token tile at a time: the weights stay in registers, the accumulators are a
+    # tile's nine; the waves' accumulators sum through a reduction row set a row tile
     for t in range_constexpr(tiles):
         tok = fx.min(t * TILE + lane % 16, S - 1)
         xb = [
@@ -146,23 +147,22 @@ def stage_gemv(c, rg, kpart, first=None):
             for kc in range(K_STEPS)
         ]
         for it in range_constexpr(G_TILES):
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for kc in range_constexpr(K_STEPS):
-                accs[it][t] = mfma_bf16(w[it][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), accs[it][t])
-    # the waves' accumulators: a reduction row set a (row tile, token tile)
-    for it in range_constexpr(G_TILES):
-        for t in range_constexpr(tiles):
-            fx.ptr_store(accs[it][t], red + ((it * tiles + t) * RED_FLOATS + (wave * 64 + lane) * 4))
-    gpu.barrier()
-    # this part's fp32 partials: thread (row of the group, token)
-    n_out = G_ROWS * S
-    for p in range_constexpr(-(-n_out // THREADS)):
-        idx = tid + p * THREADS
-        if idx < n_out:
-            r = idx % G_ROWS
-            tk = idx // G_ROWS
-            v = row_sum(red + ((r // ROWS) * tiles + tk // TILE) * RED_FLOATS, r % ROWS, tk % TILE)
-            put(part, (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * G_ROWS + r, v)
-    gpu.barrier()  # ``red`` is reused by the CTA's next task
+                acc = mfma_bf16(w[it][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), acc)
+            fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
+        gpu.barrier()
+        # this token tile's partials of the part: thread (row of the group, token of the tile)
+        nt = min(TILE, S - t * TILE)
+        n_out = G_ROWS * nt
+        for p in range_constexpr(-(-n_out // THREADS)):
+            idx = tid + p * THREADS
+            if idx < n_out:
+                r = idx % G_ROWS
+                tk = t * TILE + idx // G_ROWS
+                v = row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // G_ROWS)
+                put(part, (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * G_ROWS + r, v)
+        gpu.barrier()  # ``red`` is reused by the next token tile / task
 
 
 def half_sum(poll, part, tk, pb):
@@ -175,7 +175,7 @@ def half_sum(poll, part, tk, pb):
             for hf in range(PARTS)
             for p in range(2)
         ],
-        batch=2 * PARTS,  # the eight parts' pairs in one round
+        batch=2 * PARTS,  # the parts' pairs in one round
     )
     out = []
     for j in range_constexpr(ELEMS):
@@ -294,8 +294,7 @@ def stage_gate(c, g):
 
 @flyc.jit
 def run_k1(c, bid, x_flag=None):
-    """K1's stages on this CTA: its GEMV task (and a second on 32 CTAs), then its
-    head or gate task. ``x_flag`` (a mailbox region): x was written earlier in this
+    """K1's stages on this CTA: its GEMV task, then its head or gate task. ``x_flag`` (a mailbox region): x was written earlier in this
     launch (the previous layer's boundary), flagged a token each; the first task's
     weights go out before the wait."""
     stamp(c, 0)
@@ -306,9 +305,10 @@ def run_k1(c, bid, x_flag=None):
         poll_flags(c, [(x_flag, c["S"])])
     stamp(c, 1)  # x arrived (a merged launch) / entry
     stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first)
-    if (bid >= QT0) & (bid < QT0 + SECOND_TASKS):
-        q = BLOCKS + bid - QT0  # the 32 tasks past one a CTA, on idle CTAs
-        stage_gemv(c, q // K_PARTS, q % K_PARTS)
+    if const_expr(SECOND_TASKS > 0):
+        if (bid >= QT0) & (bid < QT0 + SECOND_TASKS):
+            q = BLOCKS + bid - QT0  # the tasks past one a CTA, on idle CTAs
+            stage_gemv(c, q // K_PARTS, q % K_PARTS)
     stamp(c, 2)  # the GEMV task(s) done
     if (bid >= HT0) & (bid < HT0 + HEAD_TASKS):
         stage_head(c, bid - HT0)
@@ -318,10 +318,10 @@ def run_k1(c, bid, x_flag=None):
 
 
 def k1_lds(tokens: int):
-    """K1's LDS for a step of ``tokens`` rows: a reduction row set a (row tile, token tile)."""
+    """K1's LDS: a reduction row set a row tile (a token tile at a time)."""
 
     @fx.struct
     class Lds:
-        red: fx.Array[fx.Float32, G_TILES * token_tiles(tokens) * RED_FLOATS, 16]
+        red: fx.Array[fx.Float32, G_TILES * RED_FLOATS, 16]
 
     return Lds

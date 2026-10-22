@@ -12,10 +12,9 @@ LDS_BYTES = 160 * 1024
 
 def test_k1_tasks_fit_the_grid():
     # 36 row groups of 64 rows x 8 K parts: a task a CTA, a second on 32 CTAs past the head / gate tasks
-    assert L.GEMV_GROUPS * L.G_ROWS == QKVG_ROWS and L.GEMV_TASKS == 288 and L.SECOND_TASKS == 32
+    assert L.GEMV_GROUPS * L.G_ROWS == QKVG_ROWS and L.GEMV_TASKS == BLOCKS and L.SECOND_TASKS == 0
     assert L.GT0 == L.HT0 + L.HEAD_TASKS and L.QT0 == L.GT0 + L.GATE_TASKS
-    assert L.QT0 + L.SECOND_TASKS <= BLOCKS
-    assert L.K_PARTS * L.K_PER_WAVE * 8 == HIDDEN and L.PARTS == L.K_PARTS == 8
+    assert L.K_PARTS * L.K_PER_WAVE * 8 == HIDDEN and L.PARTS == L.K_PARTS == 16
 
 
 @pytest.mark.parametrize("s", list(WIDTHS) + [1, 5, 24, 63])
