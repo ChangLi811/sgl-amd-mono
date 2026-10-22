@@ -36,7 +36,7 @@ co-resident)::
     ug      n_tiles x 128 items of (gate pair, up pair): mids -> ``k3_mid`` blocks
     dn      n_tiles x 128 items: y rows -> ``k3_y``
     fin     S x AR_PARTS tasks on CTAs S ..: a part's columns of the token's slots,
-            the finalize (slot sums of squares through ``k3_pss``), the push to
+            the finalize (slot sums of squares from the dn items' ``k3_ss``), the push to
             every rank's ``ffn`` region, the rank-ordered sum -> ``k3_fbuf`` + a flag
     unpool  the rank's 64 row tiles on the CTAs past the fin tasks (weights issued
             before the fin flags' wait): rows pushed to every rank's ``unp`` region
@@ -171,15 +171,16 @@ def k3_bases(tokens: int, npes: int) -> dict:
 
 def k3_scratch_layout() -> dict:
     """K3's scratch regions, name -> (byte offset, bytes), sized for MAX_TOKENS: the
-    mid blocks and y rows a (token, slot), a flag a (token, AR part), the fin parts'
-    sums of squares a (token, part, slot), and the all-reduce's result as plain bf16
-    words (``k3_fbuf``: 4 elements a "pair", read by LDS DMA, not polled)."""
+    mid blocks and y rows a (token, slot), a flag a (token, AR part), the dn items'
+    sums of squares of the finalized values a (token, slot, item), and the
+    all-reduce's result as plain bf16 words (``k3_fbuf``: 4 elements a "pair", read
+    by LDS DMA, not polled)."""
     return pair_layout(
         [
             ("k3_mid", MAX_TOKENS * TOP_K * MID_PAIRS),
             ("k3_y", MAX_TOKENS * TOP_K * MOE_HIDDEN // 2),
             ("k3_fflag", MAX_TOKENS * AR_PARTS_MAX),
-            ("k3_pss", MAX_TOKENS * AR_PARTS_MAX * TOP_K),
+            ("k3_ss", MAX_TOKENS * TOP_K * DN_T),
             ("k3_fbuf", MAX_TOKENS * MOE_HIDDEN // 4),
             ("k3_trace", BLOCKS * TRACE_SLOTS),
         ],
@@ -209,7 +210,7 @@ def k3_lds_floats() -> dict:
     return {
         "red": RED_SLOTS * RED_SLOT_FLOATS,
         "xcol": XS_LDS_MAX * MOE_HIDDEN // 2,  # a tile's MXFP4 columns; the unpool passes' rows
-        "misc": UNP_ROWS * XS_LDS_MAX,  # an unpool pass's bf16 row sums
+        "misc": max(UNP_ROWS * XS_LDS_MAX, 2 * WAVES * TILE_COLS),  # an unpool pass's bf16 row sums; dn's wave partials
         "sums": 2 * WAVES,  # ``block_sum``'s wave sums
         "pick_of": LOCAL_EXPERTS * COLS,  # expert e's column j: its pick (token TOP_K + slot)
         "cnt_of": LOCAL_EXPERTS,  # expert e's picks
@@ -682,6 +683,21 @@ def stage_dn(c, n_tiles):
     n_items = ((bid + 1) * TD) // BLOCKS - q0
     cur = dn_pair_loads(c, q0, n_tiles)
     cur_t = fx.Int32(-1)
+    # the finalize's sum of squares (v = bf16(bf16(y) pen_w), the fin stage's values)
+    # of each item's 32 rows of each column: a wave partial a column in LDS (two
+    # parities), summed and published an item later, behind that item's barrier
+    tid, lane, wave, misc, put = c["tid"], c["lane"], c["wave"], c["misc"], c["put"]
+    r_pw = rsrc(c["args"]["pen_w"])
+    j16, rp = tid % TILE_COLS, tid // TILE_COLS
+    prev_q, prev_e, prev_c0, prev_n = fx.Int32(-1), fx.Int32(0), fx.Int32(0), fx.Int32(0)
+
+    def publish_ss(par, pq, pe, pc0, pn):
+        if (pq >= 0) & (tid < TILE_COLS) & (tid < pn):
+            tot = fx.ptr_load(misc + (par * (WAVES * TILE_COLS) + tid))
+            for w in range_constexpr(1, WAVES):
+                tot = tot + fx.ptr_load(misc + (par * (WAVES * TILE_COLS) + w * TILE_COLS + tid))
+            put(c["ss"], pick_at(c, pe, pc0 + tid) * DN_T + pq % DN_T, tot)
+
     for i in range(0, n_items):
         q = q0 + i
         ti = q // DN_T
@@ -697,28 +713,41 @@ def stage_dn(c, n_tiles):
         for t in range_constexpr(2):
             tile_store(c, 2 * par + t, tile_mfmas_a4(cur[t][0], cur[t][1], xb))
         gpu.barrier()
+        publish_ss((i + 1) % 2, prev_q, prev_e, prev_c0, prev_n)  # the previous item's
 
         def y_of(row, j):
             return row_sum(red + pbase + (row // 16) * RED_SLOT_FLOATS, row % 16, j)
 
-        put_rows(c, c["y"], MOE_HIDDEN, q % DN_T, 32, e, col0, n, y_of)
+        ya, yb = y_of(2 * fx.min(rp, fx.Int32(15)), j16), y_of(2 * fx.min(rp, fx.Int32(15)) + 1, j16)
+        put_rows(c, c["y"], MOE_HIDDEN, q % DN_T, 32, e, col0, n, lambda row, j: (row % 2 == 0).select(ya, yb))
+        # (row pairs 16 .. 31 are no rows of the item: threads 256 .. 511 add 0)
+        c0 = (q % DN_T) * 32 + 2 * fx.min(rp, fx.Int32(15))
+        pw0, pw1 = bf2_f32(fx.Int32(bo.buffer_load(r_pw, c0 // 2, vec_width=1, dtype=T.i32)))
+        v0 = bf16_round(bf16_round(ya) * pw0)
+        v1 = bf16_round(bf16_round(yb) * pw1)
+        ss = ((j16 < n) & (rp < 16)).select(v0 * v0 + v1 * v1, fx.Float32(0.0))
+        ss = butterfly(ss, (16, 32))  # the wave's four row pairs of column j16
+        if lane < TILE_COLS:
+            fx.ptr_store(ss, misc + (par * (WAVES * TILE_COLS) + wave * TILE_COLS + lane))
+        prev_q, prev_e, prev_c0, prev_n = q, e, col0, n
         cur = nxt
-    gpu.barrier()  # ``red`` is reused by the fin and unpool stages
+    gpu.barrier()  # ``red`` is reused by the fin and unpool stages; the last item's partials are in
+    publish_ss((n_items + 1) % 2, prev_q, prev_e, prev_c0, prev_n)  # the last item's (parity n_items - 1)
 
 
 # ---------------------------------------------------------------- 3. fin + all-reduce
 @flyc.jit
 def stage_fin(c, t, part):
     """fin task (token t, part): the part's columns of the token's slots (two or
-    four elements a thread), the finalize (v = bf16(y pen_w), the slots' sums of
-    squares exchanged between the token's parts through ``k3_pss``, score / rms
-    weighted sum in slot order), pushed as bf16 pairs to every rank's ``ffn``
+    four elements a thread), the finalize (v = bf16(y pen_w), each slot's sum of
+    squares over its whole row summed from the dn items' publishes in ``k3_ss``,
+    score / rms weighted sum in slot order), pushed as bf16 pairs to every rank's ``ffn``
     region, then the same columns of every rank's partial summed in rank order ->
     ``k3_fbuf`` (plain bf16) and the (token, part) flag. A token none of whose
     picks this rank holds pushes zeros and polls nothing."""
     S, W, tid, lane, wave, red = c["S"], c["W"], c["tid"], c["lane"], c["wave"], c["red"]
     put, put_bf, poll = c["put"], c["put_bf"], c["poll"]
-    y_mb, pss, fbuf, own_ffn = c["y"], c["pss"], c["fbuf"], c["own_ffn"]
+    y_mb, ss_mb, fbuf, own_ffn = c["y"], c["ss"], c["fbuf"], c["own_ffn"]
     a = c["args"]
     rank = c["rank"]
     AP = c["ar_parts"]
@@ -755,7 +784,7 @@ def stage_fin(c, t, part):
                 for sl in range(TOP_K)
             ]
         )  # fmt: skip
-        vs, sss = [], []
+        vs = []
         for sl in range_constexpr(TOP_K):
             held = es[sl] >= 0
             v = []
@@ -764,28 +793,22 @@ def stage_fin(c, t, part):
                 # the post norm with input scale: y x weight -> bf16
                 v.append(held.select(bf16_round(lo * pw[2 * q]), fx.Float32(0.0)))
                 v.append(held.select(bf16_round(hi * pw[2 * q + 1]), fx.Float32(0.0)))
-            ss = v[0] * v[0]
-            for k in range_constexpr(1, NV):
-                ss = ss + v[k] * v[k]
             vs.append(v)
-            sss.append(act.select(ss, fx.Float32(0.0)))
-        # every slot's part sum of squares: one barrier for the eight
-        wss = [butterfly(x, (32, 16, 8, 4, 2, 1)) for x in sss]
+        # every slot's sum of squares over its whole row: the dn items' DN_T publishes,
+        # two a lane, a wave a slot (a slot this rank does not hold polls a held
+        # one's and takes 0); 1 / rms a slot to LDS
+        psl = fx.Int32(fb)
+        held_w = fx.Int32(0) == fx.Int32(1)
+        for s_ in range_constexpr(TOP_K):
+            hit = (wave == s_) & (es[s_] >= 0)
+            psl = hit.select(fx.Int32(s_), psl)
+            held_w = held_w | hit
+        got_ss = poll([(ss_mb, (t * TOP_K + psl) * DN_T + 2 * lane, 2)])
+        tot = held_w.select(got_ss[0][0].bitcast(fx.Float32) + got_ss[0][1].bitcast(fx.Float32), fx.Float32(0.0))
+        tot = butterfly(tot, (1, 2, 4, 8, 16, 32))
         if lane == 0:
-            for sl in range_constexpr(TOP_K):
-                fx.ptr_store(wss[sl], red + (sl * WAVES + wave))
-        gpu.barrier()
-        if tid < TOP_K:
-            tot = fx.ptr_load(red + tid * WAVES)
-            for w in range_constexpr(1, WAVES):
-                tot = tot + fx.ptr_load(red + (tid * WAVES + w))
-            put(pss, (t * AP + part) * TOP_K + tid, tot)
-            got_ss = poll([(pss, (t * AP + q) * TOP_K + tid, 1) for q in range(AP)])
-            tot = got_ss[0][0].bitcast(fx.Float32)
-            for q in range_constexpr(1, AP):
-                tot = tot + got_ss[q][0].bitcast(fx.Float32)
             rinv = fx.Float32(1.0) / fmath.sqrt(tot / float(MOE_HIDDEN) + POST_EPS)
-            fx.ptr_store(rinv, red + (TOP_K * WAVES + tid))
+            fx.ptr_store(rinv, red + (TOP_K * WAVES + wave))
         gpu.barrier()
         for sl in range_constexpr(TOP_K):
             sc = scs[sl] * fx.ptr_load(red + (TOP_K * WAVES + sl))
