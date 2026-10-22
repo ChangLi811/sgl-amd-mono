@@ -77,6 +77,9 @@ SGLANG_READS = {
 }
 
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_DRAFT_KERNELS", "0") == "1"
+# the kernels' reach: 1 = the MLP half as D-MLP launches (the attention half on SGLang's
+# modules); 2 = the attention half too (D-pre, D-attn, D-post: four launches a layer)
+STAGE = int(os.environ.get("SGLANG_AMD_MONO_DRAFT_STAGE", "1")) if USE_KERNELS else 0
 # a timing diagnostic: the routed draft forward returns the normed embeddings (no layer runs):
 # the step time's drop is the whole draft forward's cost (the draft tokens are then garbage)
 SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_DRAFT_SKIP", "0") == "1"
@@ -92,6 +95,40 @@ def _mlp_views(layer) -> dict:
         w_gu=layer.mlp.gate_up_proj.weight,
         w_down=layer.mlp.down_proj.weight,
     )
+
+
+def _attn_views(layer) -> dict:
+    """A draft layer's attention-half weights as D-pre / D-post read them, in place."""
+    conv, attn = layer.attention_conv, layer.self_attn
+    return dict(
+        w_in=layer.input_layernorm.weight,
+        w_kpa=conv.kernel_projection.weight,
+        base_a=conv.base_kernel,
+        w_qkv=attn.qkv_proj.weight,
+        q_norm=attn.q_norm.weight,
+        k_norm=attn.k_norm.weight,
+        cos_sin=attn.rotary_emb.cos_sin_cache,
+        w_o=attn.o_proj.weight,
+    )
+
+
+def _attn_view_reasons(i: int, views: dict) -> list[str]:
+    from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+    from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+
+    shapes = {
+        "w_in": (D.H,), "w_kpa": (D.COEF_ROWS, D.H), "base_a": (2, D.TAPS, D.H), "w_qkv": (DH.QKV_ROWS, D.H),
+        "q_norm": (DH.HEAD_DIM,), "k_norm": (DH.HEAD_DIM,), "w_o": (D.H, DH.Q_K),
+    }  # fmt: skip
+    reasons = []
+    for name, want in shapes.items():
+        t = views[name]
+        if not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16 or not t.is_contiguous() or tuple(t.shape) != want:
+            reasons.append(f"draft layer {i} {name}: {getattr(t, 'dtype', None)} {tuple(getattr(t, 'shape', ()))}, want contiguous bf16 {want}")  # fmt: skip
+    cs = views["cos_sin"]
+    if not isinstance(cs, torch.Tensor) or cs.dtype != torch.bfloat16 or not cs.is_contiguous() or cs.dim() != 2 or cs.shape[1] != DH.HEAD_DIM:
+        reasons.append(f"draft layer {i} rotary table: {getattr(cs, 'dtype', None)} {tuple(getattr(cs, 'shape', ()))}, D-pre reads bf16 [*, {DH.HEAD_DIM}]")  # fmt: skip
+    return reasons
 
 
 def _mlp_view_reasons(i: int, views: dict) -> list[str]:
@@ -131,6 +168,26 @@ class DraftRunner:
         self.res_out = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
         self.out = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
         self._launch: dict = {}
+        self.layers = list(layers)
+        if STAGE >= 2:
+            from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
+            from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+
+            self.aviews = [_attn_views(layer) for layer in layers]
+            self.scratch_pre = torch.zeros(scratch_bytes(DH.dp_scratch_layout()), dtype=torch.uint8, device=dev)
+            self.scratch_attn = torch.zeros(scratch_bytes(DA.dattn_scratch_layout(MAX_TOKENS, DRAFT_TOKENS)), dtype=torch.uint8, device=dev)  # fmt: skip
+            self.scratch_post = torch.zeros(scratch_bytes(DH.do_scratch_layout()), dtype=torch.uint8, device=dev)
+            self.peers_post = PeerBuffer(DH.do_sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev)
+            self.peers_post.bytes.zero_()
+            self.q = torch.empty(MAX_TOKENS, DH.Q_K, dtype=torch.bfloat16, device=dev)
+            self.o = torch.empty(MAX_TOKENS, DH.Q_K, dtype=torch.bfloat16, device=dev)
+            self.coef = torch.empty(MAX_TOKENS, D.COEF_ROWS, dtype=torch.float32, device=dev)
+            self.attn_out = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
+            self.res_pre = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
+            self._pre: dict = {}
+            self._attn: dict = {}
+            self._post: dict = {}
+            self._cache_checked = False
 
     def set_deadline(self, seconds: float) -> None:
         from sgl_amd_mono.common import guard
@@ -147,10 +204,79 @@ class DraftRunner:
             self._launch[rows] = D.build_dmlp(D.DMLPBuild(tokens=rows, npes=self.npes))
         return self._launch[rows]
 
+    def attn_kernels(self, rows: int):
+        from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
+        from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+
+        if rows not in self._pre:
+            self._pre[rows] = DH.build_dpre(DH.DPreBuild(tokens=rows))
+            self._attn[rows] = DA.build_dattn(DA.DAttnBuild(tokens=rows, q_len=DRAFT_TOKENS))
+            self._post[rows] = DH.build_dpost(DH.DPostBuild(tokens=rows, npes=self.npes))
+        return self._pre[rows], self._attn[rows], self._post[rows]
+
     def precompile(self, rows: int) -> None:
         from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
 
         compile_only(self.kernel(rows))
+        if STAGE >= 2:
+            for k in self.attn_kernels(rows):
+                compile_only(k)
+
+    def _check_cache(self, forward_batch) -> None:
+        """D-pre / D-attn read the draft's fp8 [slots, 1, 128] caches and its int32 page table once."""
+        from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
+
+        pool = forward_batch.token_to_kv_pool
+        for i, layer in enumerate(self.layers):
+            k, v = pool.get_kv_buffer(layer.self_attn.attn.layer_id)
+            for t, what in ((k, "K"), (v, "V")):
+                if not (t.dtype == torch.float8_e4m3fn and t.is_contiguous() and t.dim() == 3 and tuple(t.shape[-2:]) == (DA.LOCAL_KV_HEADS, DA.HEAD_DIM)):  # fmt: skip
+                    raise RuntimeError(f"Muse Spark draft layer {i} {what} cache: {t.dtype} {tuple(t.shape)}, the kernels take contiguous fp8 [*, {DA.LOCAL_KV_HEADS}, {DA.HEAD_DIM}]")  # fmt: skip
+            a = layer.self_attn.attn
+            if a.k_scale is not None or a.v_scale is not None:
+                raise RuntimeError(f"Muse Spark draft layer {i}: a K / V cache scale; the kernels write fp8 at unit scale")
+        table = forward_batch.req_to_token_pool.req_to_token
+        if table.dtype != torch.int32 or table.dim() != 2 or not table.is_contiguous():
+            raise RuntimeError(f"Muse Spark draft: page table {table.dtype} {tuple(table.shape)}, the kernels take a contiguous int32 [pool, ctx]")
+        self._cache_checked = True
+
+    def launch_attn(self, i: int, rows: int, hidden, residual, first: bool, positions, forward_batch, stream):
+        """Layer ``i``'s attention half on ``rows`` rows (D-pre, D-attn, D-post): (attn_out,
+        the residual after the input norm's fused add), bf16."""
+        from sgl_amd_mono.muse_spark.gfx950.runner import _f32_bits, _ptr
+
+        if not self._cache_checked:
+            self._check_cache(forward_batch)
+        v = self.aviews[i]
+        attn = self.layers[i].self_attn.attn
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(attn.layer_id)
+        slots = forward_batch.out_cache_loc
+        table = forward_batch.req_to_token_pool.req_to_token
+        rpi = forward_batch.req_pool_indices
+        lens = forward_batch.seq_lens
+        if slots.numel() < rows or positions.numel() < rows or lens.numel() * DRAFT_TOKENS < rows:
+            raise RuntimeError(f"Muse Spark draft: slots {tuple(slots.shape)} positions {tuple(positions.shape)} seq_lens {tuple(lens.shape)} for {rows} rows")  # fmt: skip
+        pre, dattn, post = self.attn_kernels(rows)
+        res_pre, q, o, coef, attn_out = self.res_pre[:rows], self.q[:rows], self.o[:rows], self.coef[:rows], self.attn_out[:rows]
+        pre(
+            _ptr(hidden), _ptr(residual), int(first), _ptr(v["w_in"]), _ptr(v["w_kpa"]), _ptr(v["base_a"]), _ptr(v["w_qkv"]),
+            _ptr(v["q_norm"]), _ptr(v["k_norm"]), _ptr(v["cos_sin"]), _ptr(positions), int(positions.dtype == torch.int64),
+            _ptr(slots), int(slots.dtype == torch.int64), _ptr(k_cache), _ptr(v_cache), _ptr(res_pre), _ptr(q), _ptr(coef),
+            _ptr(self.scratch_pre), _ptr(self.epoch), i, stream=stream,
+        )  # fmt: skip
+        # the draft batch is a TARGET_VERIFY batch: seq_lens is the (compact) prefix, the
+        # block's DRAFT_TOKENS keys follow it; the compact cache holds the window, so no
+        # window mask (the window is the cache)
+        dattn(
+            _ptr(q), _ptr(o), _ptr(k_cache), _ptr(v_cache), _ptr(table), table.shape[1], table.numel() * 4, _ptr(rpi),
+            int(rpi.dtype == torch.int64), _ptr(lens), int(lens.dtype == torch.int64), DRAFT_TOKENS, 0, 0,
+            _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn), _ptr(self.epoch), i, stream=stream,
+        )  # fmt: skip
+        post(
+            _ptr(o), _ptr(v["w_o"]), _ptr(coef), _ptr(v["base_a"]), _ptr(attn_out), _ptr(self.scratch_post),
+            self.peers_post.local, _ptr(self.peers_post.addresses), self.rank, _ptr(self.epoch), i, stream=stream,
+        )  # fmt: skip
+        return attn_out, res_pre
 
     def launch(self, i: int, rows: int, attn_out: torch.Tensor, residual: torch.Tensor, stream):
         """Layer ``i``'s MLP half on ``rows`` rows: (out, the updated residual), bf16."""
@@ -201,6 +327,13 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         for i, layer in enumerate(model.layers):
             if layer.mlp_conv is not None and layer.attention_conv is not None:
                 reasons += _mlp_view_reasons(i, _mlp_views(layer))
+                if STAGE >= 2:
+                    reasons += _attn_view_reasons(i, _attn_views(layer))
+    if STAGE >= 2:
+        from sglang.srt.runtime_context import get_spec
+
+        if get_spec().speculative_draft_window_size is None:
+            reasons.append("draft stage 2 takes the compact (windowed) draft cache: set --speculative-draft-window-size")
     if int(model.block_size) != DRAFT_TOKENS:
         reasons.append(f"draft block {model.block_size}: the kernels take {DRAFT_TOKENS}")
     if getattr(model, "candidate_selector", None) is None:
@@ -243,15 +376,24 @@ class _Draft:
         stream = torch.cuda.current_stream()
         check = self.check and not torch.cuda.is_current_stream_capturing()
         for i, layer in enumerate(m.layers):
-            # the attention half, as DFlashDecoderLayer.forward runs it
-            if residual is None:
-                residual = hidden
-                hidden = layer.input_layernorm(hidden)
+            if STAGE >= 2:
+                first = residual is None
+                h_in, r_in = hidden, (hidden if first else residual)
+                attn_out, residual = self.runner.launch_attn(
+                    i, rows, h_in.contiguous(), r_in.contiguous(), first, positions, forward_batch, stream
+                )
+                if check:
+                    _log_check_pair(i, "attn", (attn_out, residual), self._attention_reference(layer, h_in, None if first else r_in, positions, forward_batch))  # fmt: skip
             else:
-                hidden, residual = layer.input_layernorm(hidden, residual)
-            hidden, kernel = layer.attention_conv.prepare(hidden)
-            attn_out = layer.self_attn(positions=positions, hidden_states=hidden, forward_batch=forward_batch)
-            attn_out = layer.attention_conv.finish(attn_out, kernel)
+                # the attention half, as DFlashDecoderLayer.forward runs it
+                if residual is None:
+                    residual = hidden
+                    hidden = layer.input_layernorm(hidden)
+                else:
+                    hidden, residual = layer.input_layernorm(hidden, residual)
+                hidden, kernel = layer.attention_conv.prepare(hidden)
+                attn_out = layer.self_attn(positions=positions, hidden_states=hidden, forward_batch=forward_batch)
+                attn_out = layer.attention_conv.finish(attn_out, kernel)
             ref = self._reference(layer, attn_out, residual) if check else None
             hidden, residual = self.runner.launch(i, rows, attn_out.contiguous(), residual.contiguous(), stream)
             if ref is not None:
@@ -261,12 +403,34 @@ class _Draft:
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
 
     @staticmethod
+    def _attention_reference(layer, hidden, residual, positions, forward_batch):
+        """Check mode: SGLang's attention half on copies of the launch's inputs (its
+        attention also rewrites the block's K / V cache rows with the same values)."""
+        h = hidden.clone()
+        if residual is None:
+            res = h
+            h = layer.input_layernorm(h)
+        else:
+            h, res = layer.input_layernorm(h, residual.clone())
+        h, kernel = layer.attention_conv.prepare(h)
+        ao = layer.self_attn(positions=positions, hidden_states=h, forward_batch=forward_batch)
+        return layer.attention_conv.finish(ao, kernel), res
+
+    @staticmethod
     def _reference(layer, attn_out, residual):
         """Check mode: SGLang's MLP half on copies of the launch's inputs."""
         h, res = layer.post_attention_layernorm(attn_out.clone(), residual.clone())
         h, kernel = layer.mlp_conv.prepare(h)
         h = layer.mlp(h)
         return layer.mlp_conv.finish(h, kernel), res
+
+
+def _log_check_pair(i: int, what: str, got, ref) -> None:
+    for name, g, r in ((what, got[0], ref[0]), ("residual'", got[1], ref[1])):
+        g, r = g.float(), r.float()
+        cos = torch.nn.functional.cosine_similarity(g, r, dim=-1)
+        rel = ((g - r).norm() / r.norm().clamp_min(1e-6)).item()
+        logger.info("monokernel check: draft layer %d %s: rel %.4f, cosine min %.5f mean %.5f", i, name, rel, cos.min().item(), cos.mean().item())  # fmt: skip
 
 
 def _log_check(i: int, got, ref) -> None:
@@ -291,7 +455,7 @@ def _build(model, hf_config, ctx) -> _Draft:
     start = len(widths) * p.tp_rank // max(p.tp_size, 1)
     for rows in widths[start:] + widths[:start]:
         runner.precompile(rows)
-    logger.info("monokernel: muse_spark DFlash2 draft attached at stage 1 (the MLP half as D-MLP launches)")
+    logger.info("monokernel: muse_spark DFlash2 draft attached at stage %d (%s)", STAGE, "the MLP half as D-MLP launches" if STAGE < 2 else "D-pre, D-attn, D-post and D-MLP launches a layer")  # fmt: skip
     return _Draft(model, original, runner)
 
 
