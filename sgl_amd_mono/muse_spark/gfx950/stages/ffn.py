@@ -411,6 +411,29 @@ def ug_pair_loads(c, q, pr, n_tiles):
     ]
 
 
+def ug_or_dn_pair_loads(c, q, pr, dq, n_tiles, use_dn):
+    """ug item ``q``'s pair ``pr``, or (``use_dn``) dn item ``dq``'s tile pair: the
+    same load shape (gate / up and down rows are both MOE_HIDDEN = INTER wide), the
+    buffer and rows selected, so the ug loop's last prefetch fetches the dn stage's
+    first weights."""
+    assert MOE_HIDDEN == INTER and W13_ROW_BYTES == W2_ROW_BYTES and W13_SCALE_COLS == W2_SCALE_COLS
+    l16 = c["lane"] % 16
+    a = c["args"]
+    e_u, _, _ = tile_info(c, q // UG_T, n_tiles)
+    e_d, _, _ = tile_info(c, dq // DN_T, n_tiles)
+    w_addr = use_dn.select(a["w2"] + fx.Int64(e_d) * (MOE_HIDDEN * W2_ROW_BYTES), a["w13"] + fx.Int64(e_u) * (2 * INTER * W13_ROW_BYTES))  # fmt: skip
+    s_addr = use_dn.select(a["s2"] + fx.Int64(e_d) * (MOE_HIDDEN * W2_SCALE_COLS), a["s13"] + fx.Int64(e_u) * (2 * INTER * W13_SCALE_COLS))  # fmt: skip
+    r_w, r_s = rsrc(w_addr), rsrc(s_addr)
+    return [
+        fp4_tile_loads(
+            c, r_w, r_s,
+            use_dn.select((dq % DN_T) * 32 + t * 16 + l16, pr * INTER + (q % UG_T) * 32 + t * 16 + l16),
+            UG_CHUNKS,
+        )  # fmt: skip
+        for t in range(2)
+    ]
+
+
 def dn_pair_loads(c, q, n_tiles):
     """dn item q's tile pair: 32 rows of the expert's down weight."""
     l16 = c["lane"] % 16
@@ -641,7 +664,12 @@ def stage_ug(c, n_tiles):
     t0 = q0 // UG_T
     e0, c0, n0 = tile_info(c, t0, n_tiles)
     xv0 = xq_loads(c, e0, c0, n0)
-    cur = ug_pair_loads(c, q0, 0, n_tiles)
+    # the dn stage's first item: its weights go out as the loop's last prefetch (a
+    # duplicate of the last pair went out there before; a CTA without ug items
+    # issues them first thing), so they land while the dn stage waits for its mids
+    TD = n_tiles * DN_T
+    dq0 = (bid * TD) // BLOCKS
+    cur = ug_or_dn_pair_loads(c, q0, 0, dq0, n_tiles, n_items == 0)
     stage_xq_cols(c, e0, c0, n0, xv0)
     cur_t = t0
     for i in range(0, n_items):
@@ -654,7 +682,7 @@ def stage_ug(c, n_tiles):
             stage_xq_cols(c, e, col0, n)
             cur_t = ti
         i1 = fx.min(i + 1, n_items - 1)
-        nxt = ug_pair_loads(c, q0 + i1 // 2, i1 % 2, n_tiles)
+        nxt = ug_or_dn_pair_loads(c, q0 + i1 // 2, i1 % 2, dq0, n_tiles, i + 1 >= n_items)
         xb = [xq_b(c, n, UG_CHUNKS, kc) for kc in range(UG_CHUNKS)]
         par = (i // 2) % 2
         pbase = par * (4 * RED_SLOT_FLOATS)
@@ -670,18 +698,23 @@ def stage_ug(c, n_tiles):
 
             put_mid_block(c, q % UG_T, e, col0, n, mid_of)
         cur = nxt
+    return cur  # the dn stage's first item's weights, in flight
 
 
 @flyc.jit
-def stage_dn(c, n_tiles):
+def stage_dn(c, n_tiles, first=None):
     """This CTA's contiguous range of the dn items (tile, 32-row block): the tile's
     mid blocks restaged at a tile boundary, the next item's weights issued before
-    this item's MFMAs, each item's 32 y rows of its columns to ``k3_y``."""
+    this item's MFMAs, each item's 32 y rows of its columns to ``k3_y``. ``first``:
+    the first item's weights, in flight (the ug stage's last prefetch)."""
     S, bid, red = c["S"], c["bid"], c["red"]
     TD = n_tiles * DN_T
     q0 = (bid * TD) // BLOCKS
     n_items = ((bid + 1) * TD) // BLOCKS - q0
-    cur = dn_pair_loads(c, q0, n_tiles)
+    if const_expr(first is not None):
+        cur = first
+    else:
+        cur = dn_pair_loads(c, q0, n_tiles)
     cur_t = fx.Int32(-1)
     # the finalize's sum of squares (v = bf16(bf16(y) pen_w), the fin stage's values)
     # of each item's 32 rows of each column: a wave partial a column in LDS (two
@@ -1001,9 +1034,9 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None):
     stamp(c, 1)  # the routing and expert input arrived (a merged launch) / entry
     n_tiles = stage_plan(c)
     stamp(c, 2)  # the plan built
-    stage_ug(c, n_tiles)
+    dn_first = stage_ug(c, n_tiles)
     stamp(c, 3)  # this CTA's ug items done
-    stage_dn(c, n_tiles)
+    stage_dn(c, n_tiles, dn_first)
     stamp(c, 4)  # this CTA's dn items done
     # the unpool CTAs' first task's weights go out now, behind nothing, so the fin
     # hops stream them; the fin CTAs carry none (their tile is past the buffer)
