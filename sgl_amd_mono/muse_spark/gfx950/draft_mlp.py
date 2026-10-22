@@ -47,7 +47,7 @@ from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
-from sgl_amd_mono.muse_spark.gfx950.device import TRACE_SLOTS, stamp, step_tag
+from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS, stamp, step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import RED_FLOATS, TILE, scratch_bytes, token_tiles
 from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import sigmoid
 
@@ -93,7 +93,7 @@ def dm_scratch_layout() -> dict:
             ("dm_gpart", K_PARTS * MAX_TOKENS * GU_ROWS),
             ("dm_act", MAX_TOKENS * I // 2),
             ("dm_dpart", D_KPARTS * MAX_TOKENS * H),
-            ("dm_trace", BLOCKS * TRACE_SLOTS),
+            ("dm_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )
@@ -534,7 +534,7 @@ class DMLPBuild(msgspec.Struct, frozen=True):
     stages: int = 8  # the stages run (fewer: a bisection build)
 
 
-def dmlp_context(key: DMLPBuild, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict) -> dict:
+def dmlp_context(key: DMLPBuild, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict, layer=None) -> dict:
     s, npes = key.tokens, key.npes
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
@@ -560,6 +560,7 @@ def dmlp_context(key: DMLPBuild, lds, args: dict, scratch, sym, peers, rank, tag
         "args": args,
         "rank": rank,
         "trace_on": key.trace,
+        "layer": layer,
         "stages": key.stages,
         "own_dm": preg(sym, dm_off, "dm"),
         "peer_dm": [preg(base, dm_off, "dm") for base in bases],
@@ -595,7 +596,7 @@ def build_dmlp(key: DMLPBuild):
                 "res": res, "attn_out": attn_out, "w_post": w_post, "w_kp": w_kp, "base": base,
                 "w_gu": w_gu, "w_down": w_down, "res_out": res_out, "out": out,
             }  # fmt: skip
-            c = dmlp_context(key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout, sym_layout)
+            c = dmlp_context(key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout, sym_layout, layer=layer)
             run_dmlp(c)
 
     @flyc.jit

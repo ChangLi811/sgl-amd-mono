@@ -19,7 +19,7 @@ def main():
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.common.plan import BLOCKS
     from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
-    from sgl_amd_mono.muse_spark.gfx950.device import TRACE_SLOTS
+    from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS
     from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
 
     rows = int(sys.argv[1]) if len(sys.argv) > 1 else 8
@@ -53,7 +53,8 @@ def main():
             epoch[0] += 1
             torch.cuda.synchronize()
         off, nbytes = layout["dm_trace"]
-        t = scratch[off : off + nbytes].view(torch.int64).reshape(-1)[: BLOCKS * TRACE_SLOTS].reshape(BLOCKS, TRACE_SLOTS).cpu()
+        t = scratch[off : off + nbytes].view(torch.int64).reshape(-1)[: TRACE_LAYERS * BLOCKS * TRACE_SLOTS]
+        t = t.reshape(TRACE_LAYERS, BLOCKS, TRACE_SLOTS)[LAYER % TRACE_LAYERS].cpu()
         used = [i for i in range(len(STAMPS)) if (t[:, i] != 0).any()]
         t0 = t[:, 0][t[:, 0] != 0].min().item()
         us = (t.double() - t0) / 100.0

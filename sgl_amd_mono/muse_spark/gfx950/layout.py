@@ -9,6 +9,7 @@ a GPU (``test/unit/test_muse_spark_layout.py``).
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, pair_layout
 
 TRACE_SLOTS = 16  # stage stamps a CTA (``device.stamp``), an int64 pair each
+TRACE_LAYERS = 64  # stamp slots a layer: a trace region holds every layer's last launch
 from sgl_amd_mono.muse_spark.gfx950.config import (
     HEAD_DIM,
     HIDDEN,
@@ -63,7 +64,7 @@ def k1_scratch_layout() -> dict:
     the K parts' fp32 partials (a pair a (part, token, row)) and, in a merged
     launch, a flag a token for its x."""
     return pair_layout(
-        [("k1_part", PARTS * MAX_TOKENS * QKVG_ROWS), ("k1_xflag", MAX_TOKENS), ("k1_trace", BLOCKS * TRACE_SLOTS)],
+        [("k1_part", PARTS * MAX_TOKENS * QKVG_ROWS), ("k1_xflag", MAX_TOKENS), ("k1_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS)],
         align=256,
     )
 
@@ -119,7 +120,7 @@ def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
             ("attn_pflag", R * LOCAL_KV_HEADS * ATTN_MAX_PARTS),
             ("attn_l2", l2_words // 2),
             ("attn_l2flag", R * LOCAL_KV_HEADS * tiles * ATTN_MERGE_GROUPS),
-            ("attn_trace", BLOCKS * TRACE_SLOTS),
+            ("attn_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )

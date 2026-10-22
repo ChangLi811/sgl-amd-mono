@@ -40,7 +40,7 @@ class K1Build(msgspec.Struct, frozen=True):
     trace: bool = False  # stage stamps into the ``k1_trace`` region (``device.stamp``)
 
 
-def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged: bool = False) -> dict:
+def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged: bool = False, layer=None) -> dict:
     """K1's context: LDS views, the mailbox, the scratch regions and arguments.
     ``merged``: x comes from this launch's earlier stages (device-scope loads)."""
     s = key.tokens
@@ -58,6 +58,7 @@ def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged
         "args": args,
         "x_cm": CM_DEV if merged else 0,  # x from this launch: past the L2 (another XCD wrote it)
         "trace_on": key.trace,
+        "layer": layer,
     }
     for region, (off, _) in layout.items():
         c[region[3:]] = sreg(scratch, off, region)  # "k1_part" -> c["part"]
@@ -108,7 +109,7 @@ def build_k1(key: K1Build):
                 "k_out": k_out, "v_out": v_out, "g_out": g_out, "use_rope": use_rope,
                 "use_swa": use_swa, "slot64": slot64, "swa64": swa64,
             }  # fmt: skip
-            c = k1_context(key, lds, args, scratch, step_tag(epoch, layer), layout)
+            c = k1_context(key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer)
             pre_attn.run_k1(c, c["bid"])
 
     @flyc.jit
@@ -163,7 +164,7 @@ def _attn_views(lds):
     return lds.loop.peek(), lds.tree.peek()
 
 
-def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict) -> dict:
+def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict, layer=None) -> dict:
     """K-attn's context: LDS views, the mailbox, the scratch region and arguments."""
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
@@ -180,6 +181,7 @@ def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict) 
         "poll": mb.poll,
         "args": args,
         "trace_on": key.trace,
+        "layer": layer,
     }
     for region in ("attn_part", "attn_pflag", "attn_l2", "attn_l2flag", "attn_trace"):
         c[region[5:]] = sreg(scratch, layout[region][0], region)  # "attn_part" -> c["part"]
@@ -234,7 +236,7 @@ def build_kattn(key: KAttnBuild):
                 "lens64": lens64, "extra": extra, "window": window, "part_in": part_in,
                 "scale_bits": scale_bits,
             }  # fmt: skip
-            c = kattn_context(key, lds, args, scratch, step_tag(epoch, layer), layout)
+            c = kattn_context(key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer)
             attention.run_kattn(c)
 
     @flyc.jit
@@ -373,14 +375,14 @@ def build_layer(key: LayerBuild):
                 "s13": s13, "w2": w2, "s2": s2, "pen_w": pen_w, "res": res, "pfw": pfw, "alpha": alpha2,
                 "beta": beta2, "npw": npw, "w_unpool": w_unpool, "attn_out": attn_out, "last": last_in,
             }  # fmt: skip
-            c2 = k2_context(k2_key, lds.k2.peek(), k2_args, scratch2, sym, peers, rank, tag, k2_layout)
+            c2 = k2_context(k2_key, lds.k2.peek(), k2_args, scratch2, sym, peers, rank, tag, k2_layout, layer=layer)
             oflag, rflag, xinflag = c2["oflag"], c2["rflag"], c2["xinflag"]
-            ca = kattn_context(ka_key, lds, a_args, scratch_a, tag, ka_layout)
+            ca = kattn_context(ka_key, lds, a_args, scratch_a, tag, ka_layout, layer=layer)
             attention.run_kattn(ca, o_flag=oflag)
             gpu.barrier()  # this CTA is done with the attention's LDS
             post_attn.run_k2(c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL)
             gpu.barrier()
-            c3 = k3_context(k3_key, lds.k3.peek(), k3_args, scratch3, sym, peers, rank, tag, k3_layout, sy)
+            c3 = k3_context(k3_key, lds.k3.peek(), k3_args, scratch3, sym, peers, rank, tag, k3_layout, sy, layer=layer)
             if const_expr(next_k1):
                 k1_args = {
                     "x": attn_out, "w": w1, "cos_sin": cos_sin, "positions": positions, "slots": slots,
@@ -388,7 +390,7 @@ def build_layer(key: LayerBuild):
                     "k_out": k_out, "v_out": v_out, "g_out": g, "use_rope": use_rope1,
                     "use_swa": use_swa1, "slot64": slot64, "swa64": swa64,
                 }  # fmt: skip
-                c1 = k1_context(k1_key, lds.k1.peek(), k1_args, scratch1, tag1, k1_layout, merged=True)
+                c1 = k1_context(k1_key, lds.k1.peek(), k1_args, scratch1, tag1, k1_layout, merged=True, layer=layer + 1)
                 ffn.run_k3(c3, route_flag=rflag, xin_flag=xinflag, x_flag=c1["xflag"], x_put=c1["put"])
                 gpu.barrier()
                 pre_attn.run_k1(c1, bid, x_flag=c1["xflag"])

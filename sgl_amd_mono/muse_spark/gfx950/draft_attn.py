@@ -32,7 +32,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, pair_layout
 from sgl_amd_mono.muse_spark.gfx950.config import LOG2E, MAX_TOKENS
-from sgl_amd_mono.muse_spark.gfx950.device import TRACE_SLOTS, acquire_loads, lds_dma_16, poll_flags, release_stores, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS, acquire_loads, lds_dma_16, poll_flags, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ATTN_CHUNK as CHUNK,
     ATTN_KEY_SPLITS as KEY_SPLITS,
@@ -74,7 +74,7 @@ def dattn_scratch_layout(tokens: int, q_len: int) -> dict:
             ("attn_pflag", R * LOCAL_KV_HEADS * MAX_PARTS),
             ("attn_l2", l2_words // 2),
             ("attn_l2flag", R * LOCAL_KV_HEADS * tiles * GROUPS),
-            ("attn_trace", BLOCKS * TRACE_SLOTS),
+            ("attn_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )
@@ -675,7 +675,7 @@ def _attn_views(lds):
     return lds.loop.peek(), lds.tree.peek()
 
 
-def dattn_context(key: DAttnBuild, lds, args: dict, scratch, tag, layout: dict) -> dict:
+def dattn_context(key: DAttnBuild, lds, args: dict, scratch, tag, layout: dict, layer=None) -> dict:
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
     c = {
@@ -691,6 +691,7 @@ def dattn_context(key: DAttnBuild, lds, args: dict, scratch, tag, layout: dict) 
         "poll": mb.poll,
         "args": args,
         "trace_on": key.trace,
+        "layer": layer,
     }
     for region in ("attn_part", "attn_pflag", "attn_l2", "attn_l2flag", "attn_trace"):
         c[region[5:]] = sreg(scratch, layout[region][0], region)  # "attn_part" -> c["part"]
@@ -735,7 +736,7 @@ def build_dattn(key: DAttnBuild):
                 "seq_lens": seq_lens, "lens64": lens64, "extra": extra, "window": window, "part_in": part_in,
                 "scale_bits": scale_bits,
             }  # fmt: skip
-            c = dattn_context(key, lds, args, scratch, step_tag(epoch, layer), layout)
+            c = dattn_context(key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer)
             run_dattn(c)
 
     @flyc.jit

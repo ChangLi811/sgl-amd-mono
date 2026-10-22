@@ -44,7 +44,7 @@ from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
-from sgl_amd_mono.muse_spark.gfx950.device import TRACE_SLOTS, stamp, step_tag
+from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS, stamp, step_tag
 from sgl_amd_mono.muse_spark.gfx950.draft_mlp import (
     BLOCK,
     C_RED,
@@ -97,7 +97,7 @@ def dp_scratch_layout() -> dict:
             ("dp_cpart", K_PARTS * MAX_TOKENS * COEF_ROWS),
             ("dp_coef", MAX_TOKENS * COEF_ROWS),
             ("dp_apart", K_PARTS * MAX_TOKENS * QKV_ROWS),
-            ("dp_trace", BLOCKS * TRACE_SLOTS),
+            ("dp_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )
@@ -105,7 +105,7 @@ def dp_scratch_layout() -> dict:
 
 def do_scratch_layout() -> dict:
     """D-post's scratch regions (pairs): the trace (the o GEMV sums its K parts itself)."""
-    return pair_layout([("do_trace", BLOCKS * TRACE_SLOTS)], align=256)
+    return pair_layout([("do_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS)], align=256)
 
 
 def do_sym_layout(npes: int) -> dict:
@@ -446,12 +446,13 @@ class DPostBuild(msgspec.Struct, frozen=True):
     trace: bool = False
 
 
-def _common(key, lds_members: dict, args: dict, tag, extra: dict) -> dict:
+def _common(key, lds_members: dict, args: dict, tag, extra: dict, layer=None) -> dict:
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
     c = {
         "S": key.tokens, "tid": tid, "bid": fx.block_idx.x, "lane": tid % 64, "wave": tid // 64,
         "put": mb.put, "put_bf": mb.put_bf, "poll": mb.poll, "args": args, "trace_on": key.trace,
+        "layer": layer,
     }  # fmt: skip
     c.update(lds_members)
     c.update(extra)
@@ -489,7 +490,7 @@ def build_dpre(key: DPreBuild):
                 "q": q, "coef_out": coef,
             }  # fmt: skip
             members = {"red": lds.red.ptr, "hbuf": lds.hbuf.ptr, "ssl": lds.ssl.ptr, "nf": lds.nf.ptr, "cf": lds.cf.ptr, "hrow": lds.hrow.ptr, "hss": lds.hss.ptr}  # fmt: skip
-            c = _common(key, members, args, step_tag(epoch, layer), {})
+            c = _common(key, members, args, step_tag(epoch, layer), {}, layer=layer)
             for region, (off, _) in layout.items():
                 c[region[3:]] = sreg(scratch, off, region)  # "dp_cpart" -> c["cpart"]
             run_dpre(c)
@@ -534,7 +535,7 @@ def build_dpost(key: DPostBuild):
             do_off = sym_layout["do"][0]
             extra = {"W": npes, "rank": rank, "own_do": preg(sym, do_off, "do"), "peer_do": [preg(b, do_off, "do") for b in bases]}
             members = {"red": lds.red.ptr, "dbuf": lds.dbuf.ptr, "cf1": lds.cf1.ptr}
-            c = _common(key, members, args, step_tag(epoch, layer), extra)
+            c = _common(key, members, args, step_tag(epoch, layer), extra, layer=layer)
             for region, (off, _) in layout.items():
                 c[region[3:]] = sreg(scratch, off, region)
             run_dpost(c)

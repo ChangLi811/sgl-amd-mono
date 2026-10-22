@@ -44,7 +44,7 @@ class K3Build(msgspec.Struct, frozen=True):
     fp8_unpool: bool = False  # w_unpool is a packed FP8 copy (codes, then fp32 row scales)
 
 
-def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict) -> dict:
+def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict, layer=None) -> dict:
     """K3's context: LDS views, the mailbox, the scratch and peer regions (this
     rank's own ``ffn`` / ``unp`` for polling, every rank's for the pushes, the peer
     bases loaded once), the CTA map and the arguments."""
@@ -76,6 +76,7 @@ def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, la
         "rank": rank,
         "last": key.last,
         "trace_on": key.trace,
+        "layer": layer,
         "fp8_unpool": key.fp8_unpool,
         "bases": ffn.k3_bases(s, npes),
         "ar_parts": ffn.ar_parts(s),
@@ -156,7 +157,7 @@ def build_k3(key: K3Build):
             }  # fmt: skip
             c = k3_context(
                 key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout, sym_layout
-            )
+            , layer=layer)
             ffn.run_k3(c)
 
     @flyc.jit

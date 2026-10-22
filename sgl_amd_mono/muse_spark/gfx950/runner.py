@@ -99,6 +99,10 @@ USE_LAYER = os.environ.get("SGLANG_AMD_MONO_MUSE_LAYER", "0") == "1"
 # SGLANG_AMD_MONO_MUSE_SKIP=1: a timing diagnostic, the MXFP4 layers skipped (garbage
 # output): the step's cost outside the kernel layers
 SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_MUSE_SKIP", "0") == "1"
+# SGLANG_AMD_MONO_MUSE_TRACE=<dir>: the kernels stamp their stages (``device.stamp``, a slot
+# set a layer) and a thread snapshots the stamps to <dir>/rank<r>.pt every few seconds
+# (``test/kernels/report_muse_spark_trace.py``). A diagnostic: the stamps cost a little.
+TRACE_DIR = os.environ.get("SGLANG_AMD_MONO_MUSE_TRACE", "")
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -214,7 +218,7 @@ class MuseMonoRunner:
             from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, build_k1
 
             no_capture(f"the {rows}-row K1 first reached")
-            self._k1[rows] = build_k1(K1Build(tokens=rows, fault_site=self.fault_site, fault_after=self.fault_after))
+            self._k1[rows] = build_k1(K1Build(tokens=rows, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR)))
         return self._k1[rows]
 
     def kattn_kernel(self, rows: int, q_len: int):
@@ -223,7 +227,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K-attn first reached")
             self._kattn[(rows, q_len)] = build_kattn(
-                KAttnBuild(tokens=rows, q_len=q_len, fault_site=self.fault_site, fault_after=self.fault_after)
+                KAttnBuild(tokens=rows, q_len=q_len, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR))
             )
         return self._kattn[(rows, q_len)]
 
@@ -233,7 +237,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K2 first reached")
             self._k2[rows] = build_k2(
-                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, fp8_pool=self.fp8_dense)
+                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_pool=self.fp8_dense)
             )
         return self._k2[rows]
 
@@ -243,7 +247,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K3 first reached")
             self._k3[rows] = build_k3(
-                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, fp8_unpool=self.fp8_dense)
+                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_unpool=self.fp8_dense)
             )
         return self._k3[rows]
 
@@ -255,7 +259,7 @@ class MuseMonoRunner:
             self._layer[(rows, q_len, next_k1)] = build_layer(
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
-                    fault_site=self.fault_site, fault_after=self.fault_after, fp8_dense=self.fp8_dense,
+                    fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]
@@ -332,6 +336,58 @@ class MuseMonoRunner:
             self.windows.append(w if w > 0 else 0)
         self.swa_map = pool.full_to_swa_index_mapping
         self.backend, self.pool = backend, pool
+        if TRACE_DIR:
+            self._start_trace_thread()
+
+    # ---------------------------------------------------------------- stage trace
+    def _start_trace_thread(self) -> None:
+        """Snapshot the launches' stage stamps (every layer's slot set) to
+        ``TRACE_DIR/rank<r>.pt`` every two seconds; a daemon thread on a side stream."""
+        import threading
+        import time
+
+        from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_scratch_layout
+        from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import k2_scratch_layout
+
+        os.makedirs(TRACE_DIR, exist_ok=True)
+        self._trace_shape = None  # (rows, q_len) of the last launch
+
+        def region(buf, layout, name):
+            off, nbytes = layout[name]
+            return buf[off : off + nbytes]
+
+        def loop():
+            torch.cuda.set_device(self.device)
+            side = torch.cuda.Stream(device=self.device)
+            path = os.path.join(TRACE_DIR, f"rank{self.rank}.pt")
+            while True:
+                time.sleep(2.0)
+                shape = self._trace_shape
+                if shape is None:
+                    continue
+                rows, q_len = shape
+                try:
+                    with torch.cuda.stream(side):
+                        snap = {
+                            "k1": region(self.scratch_k1, k1_scratch_layout(), "k1_trace").cpu(),
+                            "attn": region(self.scratch_attn, kattn_scratch_layout(rows, q_len), "attn_trace").cpu(),
+                            "k2": region(self.scratch_k2, k2_scratch_layout(), "k2_trace").cpu(),
+                            "k3": region(self.scratch_k3, k3_scratch_layout(), "k3_trace").cpu(),
+                            "epoch": self.epoch.cpu(),
+                        }
+                    side.synchronize()
+                    snap.update(
+                        rank=self.rank, npes=self.npes, time=time.time(), rows=rows, q_len=q_len,
+                        windows=list(self.windows), swa=[bool(c[2]) for c in self.caches],
+                        kinds=[v.kind for v in self.views], use_layer=self.use_layer,
+                    )  # fmt: skip
+                    torch.save(snap, path + ".tmp")
+                    os.replace(path + ".tmp", path)
+                except Exception as e:  # noqa: BLE001 - a diagnostic thread never takes the server down
+                    print(f"[muse mono trace] rank {self.rank}: snapshot failed: {e!r}", flush=True)
+                    time.sleep(10.0)
+
+        threading.Thread(target=loop, name=f"muse-mono-trace-{self.rank}", daemon=True).start()
 
     # ---------------------------------------------------------------- launches
     def _attn_args(self, i: int, rows: int, forward_batch, q_len: int) -> tuple:
@@ -373,6 +429,8 @@ class MuseMonoRunner:
             raise RuntimeError(f"Muse Spark launch: out_cache_loc {slots.dtype} {tuple(slots.shape)}")
         if SKIP_LAYERS:
             return stream, attn_input
+        if TRACE_DIR:
+            self._trace_shape = (rows, q_len)
         k_cache, v_cache, is_swa = self.caches[i]
         m = self.swa_map
         cur = torch.cuda.current_stream()

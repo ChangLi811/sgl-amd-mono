@@ -19,10 +19,13 @@ K2_STAMPS = ["entry", "og done", "o tasks done", "a_part done", "x arrived", "pa
 K3_STAMPS = ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end", "unp flags", "unp dma", "unp mfma", "unp pushed"]
 
 
-def _stamps(scratch, layout, region, blocks, slots):
+def _stamps(scratch, layout, region, blocks, slots, layer=None):
+    """Stamps [blocks, slots] of ``layer``'s slot set (the harness's LAYER by default)."""
+    from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_LAYERS
+
     off, nbytes = layout[region]
-    t = scratch[off : off + nbytes].view(torch.int64).reshape(-1)[: blocks * slots].reshape(blocks, slots).cpu()
-    return t
+    t = scratch[off : off + nbytes].view(torch.int64).reshape(-1)[: TRACE_LAYERS * blocks * slots]
+    return t.reshape(TRACE_LAYERS, blocks, slots)[(LAYER if layer is None else layer) % TRACE_LAYERS].cpu()
 
 
 def _report(name, t, names, classes=None):

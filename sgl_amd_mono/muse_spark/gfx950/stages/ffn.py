@@ -71,7 +71,7 @@ from sgl_amd_mono.common.ops import (
     uniform,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, cdiv, pair_layout
-from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_SLOTS
+from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_LAYERS, TRACE_SLOTS
 from sgl_amd_mono.muse_spark.gfx950.config import (
     HIDDEN,
     INTER,
@@ -182,7 +182,7 @@ def k3_scratch_layout() -> dict:
             ("k3_fflag", MAX_TOKENS * AR_PARTS_MAX),
             ("k3_ss", MAX_TOKENS * TOP_K * DN_T),
             ("k3_fbuf", MAX_TOKENS * MOE_HIDDEN // 4),
-            ("k3_trace", BLOCKS * TRACE_SLOTS),
+            ("k3_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
     )

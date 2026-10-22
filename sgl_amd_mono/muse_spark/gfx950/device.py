@@ -38,7 +38,9 @@ def acquire_loads():
 
 
 # ---------------------------------------------------------------- stage trace
-TRACE_SLOTS = 16  # stamps a CTA: int64 clock ticks (100 MHz) at trace[(bid TRACE_SLOTS + idx)]
+TRACE_SLOTS = 16  # stamps a CTA: int64 clock ticks (100 MHz) at trace[((layer % TRACE_LAYERS) BLOCKS + bid) TRACE_SLOTS + idx]
+TRACE_LAYERS = 64  # a layer's own stamp slots (``c["layer"]``): a server snapshot keeps every layer's last launch
+TRACE_BLOCKS = 256  # CTAs a launch (``common.plan.BLOCKS``)
 
 
 @flyc.jit
@@ -50,7 +52,10 @@ def stamp(c, idx: int):
         return
     if c["tid"] == 0:
         now = clock()
-        addr = c["trace"].value + fx.Int64((c["bid"] * TRACE_SLOTS + idx) * 8)
+        slot = c["bid"] * TRACE_SLOTS + idx
+        if c.get("layer") is not None:
+            slot = slot + (c["layer"] % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS)
+        addr = c["trace"].value + fx.Int64(slot * 8)
         ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
         llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
 

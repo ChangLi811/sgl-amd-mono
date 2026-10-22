@@ -65,7 +65,7 @@ class K2Build(msgspec.Struct, frozen=True):
     fp8_pool: bool = False  # w_pool is a packed FP8 copy (codes, then fp32 row scales)
 
 
-def k2_context(key: K2Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict) -> dict:
+def k2_context(key: K2Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, layer=None) -> dict:
     """K2's context: LDS views, the mailbox, the scratch and peer regions, the
     ranks' peer buffer bases (loaded once a CTA) and the arguments."""
     tid = fx.thread_idx.x
@@ -93,6 +93,7 @@ def k2_context(key: K2Build, lds, args: dict, scratch, sym, peers, rank, tag, la
         "sy_attn": sy["attn"][0],
         "own_attn": preg(sym, sy["attn"][0], "attn"),
         "trace_on": key.trace,
+        "layer": layer,
         "fp8_pool": key.fp8_pool,
     }
     for region, (off, _) in layout.items():
@@ -159,7 +160,7 @@ def build_k2(key: K2Build):
                 "pre_w": pre_w, "w_hi": w_hi, "w_lo": w_lo, "bias": bias, "w_pool": w_pool,
                 "xn_w": xn_w, "ids": ids, "scores": scores, "xin": xin,
             }  # fmt: skip
-            c = k2_context(key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout)
+            c = k2_context(key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout, layer=layer)
             post_attn.run_k2(c)
 
     @flyc.jit
