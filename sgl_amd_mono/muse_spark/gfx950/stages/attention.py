@@ -287,17 +287,24 @@ def run_kattn(c, o_flag=None):
                 )
             return kws + vws
 
+        # Two chunks of K / V in flight (chunk cc + 2's words go out as chunk cc
+        # computes, two chunk computes to land) and their page ids one chunk ahead
+        # of that: a one-deep pipeline exposed most of the memory latency on every
+        # chunk (6 us a chunk at 300k keys; the loads themselves are ~1.5 us).
         c_last = fx.max(c_hi - 1, c_lo)
         pa0, pa1 = pages_of(c_lo)
-        k00, k01, k10, k11, v0, v1 = kv_of(pa0, pa1)
         pb0, pb1 = pages_of(fx.min(c_lo + 1, c_last))
+        k00, k01, k10, k11, v0, v1 = kv_of(pa0, pa1)
+        n00, n01, n10, n11, w0, w1 = kv_of(pb0, pb1)
+        pc0, pc1 = pages_of(fx.min(c_lo + 2, c_last))
         for cc in range(c_lo, c_hi):
             key0 = cc * CHUNK + ks * KEYS_PER_WAVE
             kw_cur = [k00, k01, k10, k11]
             vw_cur = [v0, v1]
-            # the next chunk's words and the one after's pages go out first
-            k00, k01, k10, k11, v0, v1 = kv_of(pb0, pb1)
-            pb0, pb1 = pages_of(fx.min(cc + 2, c_last))
+            # chunk cc + 2's words and chunk cc + 3's pages go out first
+            k00, k01, k10, k11, v0, v1 = n00, n01, n10, n11, w0, w1
+            n00, n01, n10, n11, w0, w1 = kv_of(pc0, pc1)
+            pc0, pc1 = pages_of(fx.min(cc + 3, c_last))
             # the chunk's K operands, decoded once for every tile
             kb = [fp8_to_bf16x8(kw[0], kw[1]) for kw in kw_cur]
             m_next, l_next, acc_scaled = [], [], []
