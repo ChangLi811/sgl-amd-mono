@@ -73,6 +73,31 @@ def test_the_plugin_registers_the_architecture():
         isa="gfx950",
     )
     assert found is muse.SPEC, why
+    # the DFlash2 draft's spec, by its architecture
+    from sgl_amd_mono.muse_spark import draft
+
+    found, why = registry.find_spec(backend=sgl_amd_mono.BACKEND, architectures=["DFlash2DraftModel"], isa="gfx950")
+    assert found is draft.SPEC, why
+    assert draft.SPEC.tokens_per_request is not None and draft.SPEC.widths("gfx950") == muse.SPEC.widths("gfx950")
+
+
+def test_the_draft_config_is_accepted():
+    from types import SimpleNamespace
+
+    from sgl_amd_mono.muse_spark import draft
+
+    hf = SimpleNamespace(
+        model_type="qwen3",
+        architectures=["DFlash2DraftModel"],
+        dflash_config={"block_size": 8, "conv_kernel_size": 2, "conv_group_size": 16, "attention_mode": "gqa"},
+        layer_types=["sliding_attention"] * 5,
+        **draft.DRAFT_CONFIG,
+    )
+    assert draft._config_disable_reasons(None, hf) == []
+    hf.head_dim = 64
+    hf.dflash_config["block_size"] = 16
+    reasons = draft._config_disable_reasons(None, hf)
+    assert len(reasons) == 2 and "head_dim" in reasons[0] and "block_size" in reasons[1]
 
 
 def test_the_recipe_is_accepted():
