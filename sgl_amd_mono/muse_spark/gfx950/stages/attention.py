@@ -421,15 +421,15 @@ def run_kattn(c, o_flag=None):
     # requests' cumulative task counts, so a CTA iterates real tasks only
     counts = [n_parts_of(fx.Int32(rr)) * (LOCAL_KV_HEADS * TASK_TILES) for rr in range(R)]
     starts = [fx.Int32(0)]
-    for rr in range(1, R):
+    for rr in range_constexpr(1, R):
         starts.append(starts[-1] + counts[rr - 1])
     total = starts[-1] + counts[-1]
     for job in range(bid, total, BLOCKS):
         r = fx.Int32(0)
-        for rr in range(1, R):
+        for rr in range_constexpr(1, R):
             r = (job >= starts[rr]).select(fx.Int32(rr), r)
         base = starts[0]
-        for rr in range(1, R):
+        for rr in range_constexpr(1, R):
             base = (r == rr).select(starts[rr], base)
         np_r = n_parts_of(r)
         local = job - base
