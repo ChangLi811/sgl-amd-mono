@@ -60,6 +60,7 @@ def main():
         window = int(sys.argv[sys.argv.index("--window") + 1])
         args = [a for a in args if a != str(window)] if False else args
     merged = "--merged" in sys.argv  # the whole-layer launch (K1 first), stamps of every stage
+    graph = "--graph" in sys.argv  # the step captured in a graph and replayed: the launches' gaps as the server sees them
     S = int(args[0]) if args else 8
     lens = [int(x) for x in args[1:]] if len(args) > 1 else LENS[: S // 8]
     ql = 8
@@ -74,7 +75,33 @@ def main():
     k3 = build_k3(K3Build(tokens=S, npes=1, trace=True))
     layer = build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, trace=True)) if merged else None
     try:
-        for rep in range(3):  # the third step's stamps are reported (warm caches, steady tags)
+        def step():
+            _k1(k1, L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream)
+            if merged:
+                layer(
+                    *_attn_args(L, B), *_k2_args(L, B), *_k3_args(L, B), *_k1_next_args(L, B),
+                    B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream,
+                )  # fmt: skip
+            else:
+                ka(*_attn_args(L, B), epoch.data_ptr(), LAYER, stream=stream)
+                k2(B.o.data_ptr(), *_k2_args(L, B), B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, stream=stream)  # fmt: skip
+                a3 = _k3_args(L, B)
+                k3(B.xin.data_ptr(), B.ids.data_ptr(), B.scores.data_ptr(), a3[0], *a3[1:5], a3[5], B.res.data_ptr(), *a3[6:],
+                   B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream)  # fmt: skip
+            epoch[0] += 1
+
+        if graph:
+            B.res.copy_(L.res0)
+            step()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for _ in range(4):
+                    step()
+            for _ in range(2):
+                g.replay()
+            torch.cuda.synchronize()
+        for rep in range(0 if graph else 3):  # the third step's stamps are reported (warm caches, steady tags)
             B.res.copy_(L.res0)
             _k1(k1, L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream)
             if merged:
@@ -90,8 +117,24 @@ def main():
                    B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream)  # fmt: skip
             epoch[0] += 1
             torch.cuda.synchronize()
-        print(f"S={S} lens={lens} window={window} merged={merged}; ids of token 0: {B.ids[0].tolist()}")
+        print(f"S={S} lens={lens} window={window} merged={merged} graph={graph}; ids of token 0: {B.ids[0].tolist()}")
         cta = torch.arange(BLOCKS)
+        # the launches on one clock: each launch's first entry and last stamp from K1's first entry
+        tt = {
+            "K1": _stamps(B.scratch_k1, k1_scratch_layout(), "k1_trace", BLOCKS, TRACE_SLOTS),
+            "K-attn": _stamps(B.scratch_a, kattn_scratch_layout(S, ql), "attn_trace", BLOCKS, TRACE_SLOTS),
+            "K2": _stamps(B.scratch_k2, post_attn.k2_scratch_layout(), "k2_trace", BLOCKS, TRACE_SLOTS),
+            "K3": _stamps(B.scratch_k3, ffn.k3_scratch_layout(), "k3_trace", BLOCKS, TRACE_SLOTS),
+        }
+        base = tt["K1"][:, 0][tt["K1"][:, 0] != 0].min().item()
+        prev_end = None
+        for name, t in tt.items():
+            live = t[t != 0]
+            first = (live.min().item() - base) / 100.0
+            last = (live.max().item() - base) / 100.0
+            gap = f" gap {first - prev_end:6.1f}" if prev_end is not None else ""
+            print(f"  {name:7s} first {first:7.1f} last {last:7.1f} us{gap}")
+            prev_end = last
         _report("K1", _stamps(B.scratch_k1, k1_scratch_layout(), "k1_trace", BLOCKS, TRACE_SLOTS), K1_STAMPS, [
             ("head tasks", (cta >= 32) & (cta < 52)), ("gate tasks", (cta >= 52) & (cta < 68)), ("gemv only", (cta < 32) | (cta >= 68)),
         ])  # fmt: skip
