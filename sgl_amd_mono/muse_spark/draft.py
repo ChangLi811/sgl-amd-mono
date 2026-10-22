@@ -81,10 +81,11 @@ SGLANG_READS = {
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc", "req_pool_indices", "seq_lens"),
 }
 
-USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_DRAFT_KERNELS", "0") == "1"
+# on by default; SGLANG_AMD_MONO_DRAFT_KERNELS=0 keeps the draft on SGLang's modules (stage 0)
+USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_DRAFT_KERNELS", "1") == "1"
 # the kernels' reach: 1 = the MLP half as D-MLP launches (the attention half on SGLang's
-# modules); 2 = the attention half too (D-pre, D-attn, D-post: four launches a layer)
-STAGE = int(os.environ.get("SGLANG_AMD_MONO_DRAFT_STAGE", "1")) if USE_KERNELS else 0
+# modules); 2 (default) = the attention half too (D-pre, D-attn, D-post: four launches a layer)
+STAGE = int(os.environ.get("SGLANG_AMD_MONO_DRAFT_STAGE", "2")) if USE_KERNELS else 0
 # a timing diagnostic: the routed draft forward returns the normed embeddings (no layer runs):
 # the step time's drop is the whole draft forward's cost (the draft tokens are then garbage)
 SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_DRAFT_SKIP", "0") == "1"
