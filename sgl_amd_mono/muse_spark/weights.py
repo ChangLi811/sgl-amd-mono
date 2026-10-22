@@ -28,7 +28,7 @@ import torch
 QUANT_BF16 = os.environ.get("SGLANG_AMD_MONO_MUSE_QUANT_BF16", "1") == "1"
 # SGLANG_AMD_MONO_MUSE_FP8_DENSE=0: the pooler and unpooler stay bf16 (else the kernels
 # stream FP8 E4M3 copies with a scale a row, 36 % of a layer's bytes halved; see fp8_quant.py)
-FP8_DENSE = os.environ.get("SGLANG_AMD_MONO_MUSE_FP8_DENSE", "1") == "1"
+FP8_DENSE = os.environ.get("SGLANG_AMD_MONO_MUSE_FP8_DENSE", "0") == "1"  # off: no gain measured while the chains bound K2 / K3
 
 from sgl_amd_mono.muse_spark import TP
 from sgl_amd_mono.muse_spark.gfx950.config import (
