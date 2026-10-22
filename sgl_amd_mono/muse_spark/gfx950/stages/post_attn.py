@@ -29,9 +29,10 @@ their o tasks and wait on the tokens' flags behind them, as they must anyway::
     og      S tasks, stream CTA OG0 + t: token t's normed, gated o -> ``og``
     o       512 tasks (16 rows each), two a CTA on every CTA: o_proj partial
             rows -> every rank's ``attn`` region
-    a_part  a task a token (a_parts(S) = 1), chain CTAs AP0 ..: the all-reduce sum
-            of the row (the ranks' pairs polled in one round), the boundary, x ->
-            ``xbuf`` (plain bf16 words), the stream in place, the token's ``xflag``
+    a_part  a_parts(S) tasks a token, chain CTAs AP0 ..: the all-reduce sum of
+            the part's columns (the ranks' pairs polled in one round), the boundary
+            with the row's sums of squares exchanged through ``ss``, x -> ``xbuf``
+            (plain bf16 words), the stream in place, part 0 the token's ``xflag``
     router  128 tasks (16 expert tiles x an eighth of K), stream CTAs R0 ..:
             partial logits -> ``logits`` [part][token][expert]
     pool    256 tasks (128 rows x an eighth of K), one a CTA, the same eighth as
@@ -137,11 +138,15 @@ assert P_TILES * P_PARTS == BLOCKS and MAX_TOKENS % TILE == 0 and OG_THREADS <= 
 
 
 def a_parts(s: int) -> int:
-    """CTAs a token's attention boundary at width ``s``: one (a whole row a CTA: the
-    ranks' partials of its 8 pairs a thread polled in one round, no sums-of-squares
-    or x-flag hops between parts; eight parts cost three hops, ~6 us)."""
-    assert s <= A_TASKS_MAX, s
-    return 1
+    """CTAs a token's attention boundary at width ``s``: the largest power of two
+    (at most A_PARTS_MAX) whose tasks fit the A_TASKS_MAX chain CTAs. (One task a
+    token pulls 8 ranks x 16 KB of partials into one CTA: measured no better on one
+    GPU and worse in the TP 8 server than eight parts with their three hops.)"""
+    p = A_PARTS_MAX
+    while p > 1 and p * s > A_TASKS_MAX:
+        p //= 2
+    assert p * s <= A_TASKS_MAX and A_PAIRS_MAX % p == 0, (s, p)
+    return p
 
 
 def k2_scratch_layout() -> dict:
@@ -464,16 +469,16 @@ def stage_a_part(c, t, part):
     # the all-reduce: this thread's PAIRS pairs from every rank in one poll round (two
     # adjacent pairs a spec), each pair summed in rank order, one bf16 rounding
     pb = t * (HIDDEN // 2) + e0 // 2
-    assert PAIRS % 2 == 0, PAIRS
+    PW = 2 if PAIRS % 2 == 0 else 1  # pairs a spec
     ws = poll(
-        [(own, src * (MAX_TOKENS * HIDDEN // 2) + pb + 2 * q, 2) for q in range(PAIRS // 2) for src in range(W)],
-        batch=max(8, (PAIRS // 2) * W),
+        [(own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW) for q in range(PAIRS // PW) for src in range(W)],
+        batch=max(8, (PAIRS // PW) * W),
     )
     v = []
     for j in range_constexpr(PAIRS):
-        acc0, acc1 = bf2_f32(ws[(j // 2) * W][j % 2])
+        acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
         for src in range_constexpr(1, W):
-            lo, hi = bf2_f32(ws[(j // 2) * W + src][j % 2])
+            lo, hi = bf2_f32(ws[(j // PW) * W + src][j % PW])
             acc0 = acc0 + lo
             acc1 = acc1 + hi
         v += [bf16_round(acc0), bf16_round(acc1)]
@@ -770,19 +775,18 @@ def stage_xn(c, t, xin_flag=None):
 # ---------------------------------------------------------------- the CTAs' roles
 @flyc.jit
 def run_chain(c, route_flag=None, xin_flag=None):
-    """A chain CTA (``bid >= CHAIN0``): its pooler weights, its two o tasks (``bid``
-    and ``bid + BLOCKS``), its boundary task (the S boundary tasks sit here), the
-    tokens' flags, the pooler passes, and token ``bid - CHAIN0``'s route and xn."""
+    """A chain CTA (``bid >= CHAIN0``): its two o tasks (``bid`` and ``bid +
+    BLOCKS``), its boundary part (the 64 boundary tasks sit here), then its pooler
+    weights, the tokens' flags, the pooler passes, and token ``bid - CHAIN0``'s
+    route and xn."""
     S, bid = c["S"], c["bid"]
     a = c["args"]
     A_PARTS = a_parts(S)
     tok = bid - CHAIN0
-    # the pooler weights first: they land (~11 us) while the o tasks and the boundary
-    # run, so the x wait and the passes behind them do not pay for them (loads
-    # complete in order: the o weights and the boundary's polls land after them, at
-    # about when the stream CTAs' boundary inputs are ready anyway)
-    tile, part = bid // P_PARTS, bid % P_PARTS
-    pool_w = pool_w_loads(c, tile, part)
+    # the o tasks and the boundary first, the pooler weights after: issued before
+    # them, the weights (~15 us to land) delay the o tasks, and in the TP 8 server
+    # every rank's boundary then waits for the slowest rank's o partials (measured
+    # +1.1 ms a step)
     w_first = o_w_loads(c, bid)
     w_second = o_w_loads(c, bid + BLOCKS)
     stage_og_rows(c)
@@ -791,7 +795,9 @@ def run_chain(c, route_flag=None, xin_flag=None):
     stamp(c, 2)  # the o tasks done
     if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
         stage_a_part(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
-    stamp(c, 3)  # the boundary done (boundary CTAs)
+    stamp(c, 3)  # the boundary part done (boundary CTAs)
+    tile, part = bid // P_PARTS, bid % P_PARTS
+    pool_w = pool_w_loads(c, tile, part)
     rocdl.sched_barrier(0)
     wait_x(c)
     stamp(c, 4)  # every token's x arrived
