@@ -77,6 +77,9 @@ SGLANG_READS = {
 }
 
 USE_KERNELS = os.environ.get("SGLANG_AMD_MONO_DRAFT_KERNELS", "0") == "1"
+# a timing diagnostic: the routed draft forward returns the normed embeddings (no layer runs):
+# the step time's drop is the whole draft forward's cost (the draft tokens are then garbage)
+SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_DRAFT_SKIP", "0") == "1"
 
 
 def _mlp_views(layer) -> dict:
@@ -235,6 +238,8 @@ class _Draft:
             raise ValueError("the Muse Spark DFlash2 draft forward needs input_embeds")
         rows = int(plan.key.rows)
         hidden, residual = input_embeds, None
+        if SKIP_LAYERS:
+            return LogitsProcessorOutput(next_token_logits=None, hidden_states=m.norm(hidden))
         stream = torch.cuda.current_stream()
         check = self.check and not torch.cuda.is_current_stream_capturing()
         for i, layer in enumerate(m.layers):
