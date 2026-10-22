@@ -26,6 +26,9 @@ import torch
 # checkpoint) stay on SGLang's modules instead of running the kernels on an online
 # MXFP4 quantization of their experts (aiter's rule, see mxfp4_quant.py)
 QUANT_BF16 = os.environ.get("SGLANG_AMD_MONO_MUSE_QUANT_BF16", "1") == "1"
+# SGLANG_AMD_MONO_MUSE_FP8_DENSE=0: the pooler and unpooler stay bf16 (else the kernels
+# stream FP8 E4M3 copies with a scale a row, 36 % of a layer's bytes halved; see fp8_quant.py)
+FP8_DENSE = os.environ.get("SGLANG_AMD_MONO_MUSE_FP8_DENSE", "1") == "1"
 
 from sgl_amd_mono.muse_spark import TP
 from sgl_amd_mono.muse_spark.gfx950.config import (
@@ -293,6 +296,17 @@ def _quantized_experts(experts, i: int, copies: dict) -> tuple:
     return tuple(copies[k] for k in keys)
 
 
+def _fp8_dense(weight: torch.Tensor, i: int, what: str, copies: dict) -> torch.Tensor:
+    """A dense bf16 weight's packed FP8 copy (``pack_fp8_rows``), kept in ``copies``."""
+    from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows
+
+    key = ("fp8 dense", i, what)
+    if key not in copies:
+        with torch.no_grad():
+            copies[key] = pack_fp8_rows(weight.data)
+    return copies[key]
+
+
 def _router_hi_lo(moe, i: int, copies: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """The fp32 router as bf16 hi + lo [EXPERTS, HIDDEN]: the model's packed weight
     (rows 4096 .. 4352 and 4352 .. 4608 next to the pooler) when it prepared one,
@@ -338,6 +352,8 @@ class LayerViews(msgspec.Struct, frozen=True):
     beta2: torch.Tensor
     npw: torch.Tensor  # bf16 [HIDDEN]: the next layer's pre_attn_norm (+1), or the final norm's
     quantized: bool = False  # bf16 experts quantized online (kind is then "mxfp4")
+    w_pool_fp8: object = None  # packed FP8 copy of w_pool (``pack_fp8_rows``), or None
+    w_unpool_fp8: object = None  # packed FP8 copy of w_unpool, or None
 
     @staticmethod
     def build(layer, i: int, next_pre_norm, copies: dict) -> "LayerViews":
@@ -381,4 +397,6 @@ class LayerViews(msgspec.Struct, frozen=True):
             beta2=beta2,
             npw=_effective_norm_weight(next_pre_norm, i, "next pre_attn_norm", copies),
             quantized=quantized,
+            w_pool_fp8=_fp8_dense(moe.pre_expert_proj.weight, i, "pooler", copies) if FP8_DENSE else None,
+            w_unpool_fp8=_fp8_dense(moe.post_expert_proj.weight, i, "unpooler", copies) if FP8_DENSE else None,
         )

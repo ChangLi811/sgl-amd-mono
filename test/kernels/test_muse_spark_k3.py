@@ -146,9 +146,9 @@ def _picks(rows, device, gen):
 
 
 @pytest.mark.parametrize(
-    "rows,last", [(8, False), (16, True), (32, False), (64, False), (64, True)]
+    "rows,last,fp8", [(8, False, False), (16, True, False), (32, False, False), (64, False, False), (64, True, False), (8, False, True), (64, True, True)]
 )
-def test_k3_matches_the_compact_a4_math(rows, last):
+def test_k3_matches_the_compact_a4_math(rows, last, fp8):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
@@ -180,12 +180,19 @@ def test_k3_matches_the_compact_a4_math(rows, last):
         "npw": (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(bf),
         "w_unpool": (torch.randn(HIDDEN, MOE_HIDDEN, device=dev) * 0.02).to(bf),
     }
+    unpool_ptr = w["w_unpool"].data_ptr()
+    if fp8:  # the kernel streams the packed codes + row scales; the reference their values
+        from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, unpack_fp8_rows
+
+        packed = pack_fp8_rows(w["w_unpool"])
+        w["w_unpool"] = unpack_fp8_rows(packed, HIDDEN, MOE_HIDDEN)
+        unpool_ptr = packed.data_ptr()
     attn_out = torch.full((MAX_TOKENS, HIDDEN), float("nan"), device=dev, dtype=bf)
     scratch = torch.zeros(scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev)
     peers = PeerBuffer(scratch_bytes(k3_sym_layout(1)) + guard.FLAG_BYTES, None, 0, 1, dev)
     peers.bytes.zero_()
     epoch = _epoch(dev)
-    launch = build_k3(K3Build(tokens=rows, npes=1))  # the rule from the launch's ``last``
+    launch = build_k3(K3Build(tokens=rows, npes=1, fp8_unpool=fp8))  # the rule from the launch's ``last``
     new_ref, attn_ref = _reference(xin, ids, scores, LOCAL_START, dec13, dec2, w, stream, last)
     got = stream.clone()
     try:
@@ -196,7 +203,7 @@ def test_k3_matches_the_compact_a4_math(rows, last):
                 w13.data_ptr(), s13.data_ptr(), w2.data_ptr(), s2.data_ptr(),
                 w["pen_w"].data_ptr(), got.data_ptr(), w["pfw"].data_ptr(),
                 w["alpha"].data_ptr(), w["beta"].data_ptr(), w["npw"].data_ptr(),
-                w["w_unpool"].data_ptr(), attn_out.data_ptr(), scratch.data_ptr(),
+                unpool_ptr, attn_out.data_ptr(), scratch.data_ptr(),
                 peers.local, peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, int(last),
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip

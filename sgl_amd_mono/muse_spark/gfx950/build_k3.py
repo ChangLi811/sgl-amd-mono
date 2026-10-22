@@ -41,6 +41,7 @@ class K3Build(msgspec.Struct, frozen=True):
     fault_site: int = 0
     fault_after: int = 0
     trace: bool = False
+    fp8_unpool: bool = False  # w_unpool is a packed FP8 copy (codes, then fp32 row scales)
 
 
 def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict) -> dict:
@@ -75,6 +76,7 @@ def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, la
         "rank": rank,
         "last": key.last,
         "trace_on": key.trace,
+        "fp8_unpool": key.fp8_unpool,
         "bases": ffn.k3_bases(s, npes),
         "ar_parts": ffn.ar_parts(s),
         "own_ffn": preg(sym, ffn_off, "ffn"),
@@ -102,7 +104,7 @@ def build_k3(key: K3Build):
     last-layer rule, when the build did not compile it in)."""
     S, npes = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= npes <= WAVES, (S, npes)
-    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace))
+    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_unpool))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = ffn.k3_scratch_layout()

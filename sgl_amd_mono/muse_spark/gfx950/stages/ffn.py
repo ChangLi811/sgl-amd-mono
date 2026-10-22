@@ -55,6 +55,7 @@ from sgl_amd_mono.common.mx import FP4, mfma_scaled
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     ballot,
+    fp8_to_bf16x8,
     bf2_f32,
     bf16_pair,
     bf16_round,
@@ -433,24 +434,40 @@ def unp_gtask(c, k):
 
 
 def unp_w_loads(c, gtask):
-    """A lane's loads of unpooler row tile ``gtask`` (16 rows x MOE_HIDDEN bf16,
-    row-major): row l16, this wave's K eighth, 8 k a step; 64 VGPRs, in flight."""
+    """A lane's loads of unpooler row tile ``gtask`` (16 rows x MOE_HIDDEN, row-major
+    bf16, or E4M3 codes with ``c["fp8_unpool"]``): row l16, this wave's K eighth, 8
+    values a step; 64 VGPRs (32 FP8), in flight."""
     lane, wave = c["lane"], c["wave"]
     l16, g4 = lane % 16, lane // 16
+    fp8 = c["fp8_unpool"]
     # a tile past the last reads past the buffer: zeros, no traffic
-    r_u = rsrc(c["args"]["w_unpool"], HIDDEN * MOE_HIDDEN * 2)
+    r_u = rsrc(c["args"]["w_unpool"], HIDDEN * MOE_HIDDEN * (1 if fp8 else 2))
     row = gtask * UNP_ROWS + l16
     return [
         fx.Vector(
             bo.buffer_load(
                 r_u,
-                (row * MOE_HIDDEN + wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4) // 2,
-                vec_width=4,
+                (row * MOE_HIDDEN + wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4) // (4 if fp8 else 2),
+                vec_width=2 if fp8 else 4,
                 dtype=T.i32,
             )
         )
         for kc in range(UNP_STEPS)
     ]
+
+
+def unp_a(c, w):
+    """An unpooler weight step as the MFMA's bf16 A operand (FP8 codes decoded)."""
+    if c["fp8_unpool"]:
+        return fp8_to_bf16x8(w[0], w[1])
+    return w.bitcast(fx.BFloat16)
+
+
+def unp_scale(c, row):
+    """The unpooler row's FP8 scale (fp32, after the codes), or 1."""
+    if not c["fp8_unpool"]:
+        return fx.Float32(1.0)
+    return fx.Float32(bo.buffer_load(rsrc(c["args"]["w_unpool"]), (HIDDEN * MOE_HIDDEN) // 4 + row, vec_width=1, dtype=T.f32))
 
 
 # ---------------------------------------------------------------- 0. the plan
@@ -857,14 +874,14 @@ def stage_unpool(c, first_w):
             for kc in range_constexpr(UNP_STEPS):
                 k0 = wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4
                 fbv = fx.Vector(fx.ptr_load(xcol + (tl * (MOE_HIDDEN // 2) + k0 // 2), result_type=V4F))
-                acc = mfma_bf16(cur[kc].bitcast(fx.BFloat16), fbv.bitcast(fx.BFloat16), acc)
+                acc = mfma_bf16(unp_a(c, cur[kc]), fbv.bitcast(fx.BFloat16), acc)
             fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
             gpu.barrier()
             if const_expr(k == 0):
                 stamp(c, 10)  # the first job's MFMAs done
-            # branch = bf16(the fp32 sum over the waves, in wave order)
+            # branch = bf16(the fp32 sum over the waves, in wave order, x the row's FP8 scale)
             if tid < UNP_ROWS * nt:
-                fx.ptr_store(bf16_round(row_sum(red, tid % UNP_ROWS, tid // UNP_ROWS)), misc + tid)
+                fx.ptr_store(bf16_round(row_sum(red, tid % UNP_ROWS, tid // UNP_ROWS) * unp_scale(c, gtask * UNP_ROWS + tid % UNP_ROWS)), misc + tid)  # fmt: skip
             gpu.barrier()
             if live_k & (tid < (UNP_ROWS // 2) * nt):
                 tk = tid // (UNP_ROWS // 2)

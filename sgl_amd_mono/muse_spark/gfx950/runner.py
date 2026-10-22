@@ -156,6 +156,8 @@ class MuseMonoRunner:
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
         self.use_layer = USE_LAYER
+        # the pooler / unpooler as FP8 copies when every kernel layer carries them
+        self.fp8_dense = all(v.w_pool_fp8 is not None and v.w_unpool_fp8 is not None for v in views if v.kind == "mxfp4")
         self._k1_done = -1  # the layer whose K1 the previous merged launch ran
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         dev, bf16 = self.device, torch.bfloat16
@@ -231,7 +233,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K2 first reached")
             self._k2[rows] = build_k2(
-                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after)
+                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, fp8_pool=self.fp8_dense)
             )
         return self._k2[rows]
 
@@ -241,7 +243,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K3 first reached")
             self._k3[rows] = build_k3(
-                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after)
+                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, fp8_unpool=self.fp8_dense)
             )
         return self._k3[rows]
 
@@ -253,7 +255,7 @@ class MuseMonoRunner:
             self._layer[(rows, q_len, next_k1)] = build_layer(
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
-                    fault_site=self.fault_site, fault_after=self.fault_after,
+                    fault_site=self.fault_site, fault_after=self.fault_after, fp8_dense=self.fp8_dense,
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]
@@ -392,11 +394,11 @@ class MuseMonoRunner:
             self.layer_kernel(rows, q_len, next_k1)(
                 _ptr(self.q), _ptr(self.o), *self._attn_args(i, rows, forward_batch, q_len),
                 _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta), _ptr(L.pre_w),
-                _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool), _ptr(L.xn_w),
+                _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool_fp8 if self.fp8_dense else L.w_pool), _ptr(L.xn_w),
                 _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
                 int(self.modules[i].mlp.local_expert_start), _ptr(L.w13), _ptr(L.s13), _ptr(L.w2),
                 _ptr(L.s2), _ptr(L.pen_w), _ptr(L.pfw), _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw),
-                _ptr(L.w_unpool), _ptr(self.attn_in), _ptr(self.scratch_k3),
+                _ptr(L.w_unpool_fp8 if self.fp8_dense else L.w_unpool), _ptr(self.attn_in), _ptr(self.scratch_k3),
                 _ptr(L1.w_qkvg), _ptr(cos_sin1), _ptr(positions), _ptr(slots), _ptr(m), k_cache1,
                 v_cache1, _ptr(self.k), _ptr(self.v), _ptr(self.scratch_k1), int(L1.use_rope),
                 int(is_swa1), int(slots.dtype == torch.int64), int(m.dtype == torch.int64),
@@ -412,14 +414,14 @@ class MuseMonoRunner:
         )  # fmt: skip
         self.k2_kernel(rows)(
             _ptr(self.o), _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta),
-            _ptr(L.pre_w), _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool),
+            _ptr(L.pre_w), _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool_fp8 if self.fp8_dense else L.w_pool),
             _ptr(L.xn_w), _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
             self.peers.local, _ptr(self.peers.addresses), self.rank, _ptr(self.epoch), i, stream=cur,
         )  # fmt: skip
         self.k3_kernel(rows)(
             _ptr(self.xin), _ptr(self.ids), _ptr(self.scores), int(self.modules[i].mlp.local_expert_start),
             _ptr(L.w13), _ptr(L.s13), _ptr(L.w2), _ptr(L.s2), _ptr(L.pen_w), _ptr(stream), _ptr(L.pfw),
-            _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw), _ptr(L.w_unpool), _ptr(self.attn_in),
+            _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw), _ptr(L.w_unpool_fp8 if self.fp8_dense else L.w_unpool), _ptr(self.attn_in),
             _ptr(self.scratch_k3), self.peers.local, _ptr(self.peers.addresses), self.rank,
             _ptr(self.epoch), i, int(last), stream=cur,
         )  # fmt: skip

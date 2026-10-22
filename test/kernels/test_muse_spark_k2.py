@@ -120,8 +120,8 @@ def _check_routing(ids, scores, ids_ref, scores_ref, biased):
                 assert abs(s - ref_at[e]) <= 1e-3 + 1e-2 * abs(ref_at[e]), (t, e, s, ref_at[e])
 
 
-@pytest.mark.parametrize("rows", [8, 16, 32, 64, 24])
-def test_k2_matches_the_ops_math(rows):
+@pytest.mark.parametrize("rows,fp8", [(8, False), (16, False), (32, False), (64, False), (24, False), (8, True), (64, True)])
+def test_k2_matches_the_ops_math(rows, fp8):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, build_k2
@@ -156,13 +156,22 @@ def test_k2_matches_the_ops_math(rows):
         "w_pool": (torch.randn(MOE_HIDDEN, HIDDEN, device=dev) * 0.02).to(bf),
         "xn_w": (1.0 + 0.1 * torch.randn(MOE_HIDDEN, device=dev)).to(bf),
     }
+    # the FP8 pooler: the kernel streams the packed codes + row scales; the reference
+    # takes the values they encode (fp32)
+    pool_ptr = w["w_pool"].data_ptr()
+    if fp8:
+        from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, unpack_fp8_rows
+
+        packed = pack_fp8_rows(w["w_pool"])
+        w["w_pool"] = unpack_fp8_rows(packed, MOE_HIDDEN, HIDDEN)
+        pool_ptr = packed.data_ptr()
     ids = torch.full((MAX_TOKENS, TOP_K), -7, dtype=torch.int32, device=dev)
     scores = torch.full((MAX_TOKENS, TOP_K), float("nan"), device=dev)
     xn = torch.full((MAX_TOKENS, MOE_HIDDEN), float("nan"), device=dev, dtype=bf)
     scratch = torch.zeros(scratch_bytes(k2_scratch_layout()), dtype=torch.uint8, device=dev)
     peers = PeerBuffer(sym_bytes(1) + guard.FLAG_BYTES, None, 0, 1, dev)
     epoch = _epoch(dev)
-    launch = build_k2(K2Build(tokens=rows, npes=1))
+    launch = build_k2(K2Build(tokens=rows, npes=1, fp8_pool=fp8))
     new_ref, ids_ref, scores_ref, xn_ref, biased = _reference(o, g, stream, w)
     got_stream = stream.clone()
     try:
@@ -172,7 +181,7 @@ def test_k2_matches_the_ops_math(rows):
                 o.data_ptr(), g.data_ptr(), got_stream.data_ptr(), w["w_o"].data_ptr(),
                 w["alpha"].data_ptr(), w["beta"].data_ptr(), w["pre_w"].data_ptr(),
                 w["w_hi"].data_ptr(), w["w_lo"].data_ptr(), w["bias"].data_ptr(),
-                w["w_pool"].data_ptr(), w["xn_w"].data_ptr(), ids.data_ptr(), scores.data_ptr(),
+                pool_ptr, w["xn_w"].data_ptr(), ids.data_ptr(), scores.data_ptr(),
                 xn.data_ptr(), scratch.data_ptr(), peers.local, peers.addresses.data_ptr(), 0,
                 epoch.data_ptr(), LAYER,
                 stream=torch.cuda.current_stream(),

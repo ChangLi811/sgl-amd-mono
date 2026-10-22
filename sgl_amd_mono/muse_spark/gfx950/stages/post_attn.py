@@ -63,6 +63,7 @@ from flydsl.expr.typing import T
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
+    fp8_to_bf16x8,
     bf2_f32,
     bf16_pair,
     bf16_round,
@@ -523,11 +524,13 @@ def stage_a_part(c, t, part):
 # ---------------------------------------------------------------- router and pooler GEMVs
 def pool_w_loads(c, tile, part):
     """The pooler weights of task (``tile``, ``part``): its P_SUB row tiles over this
-    wave's P_STEPS k-steps of K eighth ``part``, this lane's, in flight (128 VGPRs).
-    Row-major bf16, 16 B a lane a step, read once a layer (nontemporal)."""
+    wave's P_STEPS k-steps of K eighth ``part``, this lane's, in flight (128 VGPRs
+    bf16, 64 FP8). Row-major, 8 values a lane a step (16 B bf16, 8 B of E4M3 codes
+    with ``c["fp8_pool"]``), read once a layer (nontemporal)."""
     lane, wave = c["lane"], c["wave"]
     l16, g4 = lane % 16, lane // 16
     r_w = rsrc(c["args"]["w_pool"])
+    fp8 = c["fp8_pool"]
     out = []
     for sub in range(P_SUB):
         row = tile * P_ROWS + sub * ROWS + l16
@@ -536,14 +539,28 @@ def pool_w_loads(c, tile, part):
                 fx.Vector(
                     bo.buffer_load(
                         r_w,
-                        (row * HIDDEN + part * K_PER_WAVE + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // 2,
-                        vec_width=4, dtype=T.i32, cache_modifier=CM_NT,
+                        (row * HIDDEN + part * K_PER_WAVE + (wave * P_STEPS + kc) * K_STEP + 8 * g4) // (4 if fp8 else 2),
+                        vec_width=2 if fp8 else 4, dtype=T.i32, cache_modifier=CM_NT,
                     )  # fmt: skip
                 )
                 for kc in range(P_STEPS)
             ]
         )
     return out
+
+
+def pool_a(c, w):
+    """A pooler weight step as the MFMA's bf16 A operand (FP8 codes decoded)."""
+    if c["fp8_pool"]:
+        return fp8_to_bf16x8(w[0], w[1])
+    return w.bitcast(fx.BFloat16)
+
+
+def pool_scale(c, row):
+    """The pooler row's FP8 scale (fp32, after the codes), or 1."""
+    if not c["fp8_pool"]:
+        return fx.Float32(1.0)
+    return fx.Float32(bo.buffer_load(rsrc(c["args"]["w_pool"]), (MOE_HIDDEN * HIDDEN) // 4 + row, vec_width=1, dtype=T.f32))
 
 
 def router_w_loads(c, tile, part):
@@ -608,7 +625,7 @@ def stage_passes(c, tile, part, pool_w, router_w, r_tile, is_router):
         for sub in range_constexpr(P_SUB):
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for kc in range_constexpr(P_STEPS):
-                acc = mfma_bf16(pool_w[sub][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), acc)
+                acc = mfma_bf16(pool_a(c, pool_w[sub][kc]), xb[kc].bitcast(fx.BFloat16), acc)
             tiles.append(acc)
         racc = fx.Vector.filled(4, 0.0, fx.Float32)
         for kc in range_constexpr(P_STEPS):
@@ -630,10 +647,11 @@ def stage_passes(c, tile, part, pool_w, router_w, r_tile, is_router):
                         tk = tid // (ROWS // 2)
                         rp = (tid % (ROWS // 2)) * 2
                         if tk < nt:
+                            prow = tile * P_ROWS + ti * ROWS + rp
                             put_bf(
                                 pool,
-                                (part * MAX_TOKENS + t0 + tk) * MOE_HIDDEN + tile * P_ROWS + ti * ROWS + rp,
-                                [row_sum(rb, rp, tk), row_sum(rb, rp + 1, tk)],
+                                (part * MAX_TOKENS + t0 + tk) * MOE_HIDDEN + prow,
+                                [row_sum(rb, rp, tk) * pool_scale(c, prow), row_sum(rb, rp + 1, tk) * pool_scale(c, prow + 1)],
                             )
                 else:
                     # the router tile's partial logits: thread (token tk, expert row r)
