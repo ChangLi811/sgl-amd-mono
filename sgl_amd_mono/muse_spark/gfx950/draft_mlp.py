@@ -265,9 +265,11 @@ def stage_coef(c, rg, kp, w):
 @flyc.jit
 def stage_coef_reduce(c, bid):
     """Rows 8 bid .. of the coefficients for every token: the K parts' partials summed
-    in part order -> ``dm_coef`` [token][row] (fp32)."""
+    in part order -> ``dm_coef`` [token][row] (fp32) and, with a ``coef_out`` argument
+    (D-pre: D-post reads it), the plain fp32 [S, COEF_ROWS] tensor."""
     S, tid, poll, put = c["S"], c["tid"], c["poll"], c["put"]
     cpart, coef = c["cpart"], c["coef"]
+    a = c["args"]
     N = C_RED * S
     for p in range_constexpr(-(-N // THREADS)):
         idx = fx.min(tid + p * THREADS, N - 1)
@@ -279,6 +281,8 @@ def stage_coef_reduce(c, bid):
             v = v + got[kp][0].bitcast(fx.Float32)
         if tid + p * THREADS < N:
             put(coef, t * COEF_ROWS + row, v)
+            if const_expr("coef_out" in a):
+                bo.buffer_store(v, rsrc(a["coef_out"]), t * COEF_ROWS + row, cache_modifier=CM_DEV)
 
 
 # ---------------------------------------------------------------- S2: conv0, the gate / up GEMV
