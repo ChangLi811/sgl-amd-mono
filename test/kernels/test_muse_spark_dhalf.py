@@ -120,7 +120,7 @@ def test_dpre_matches_the_attention_input_path(rows, first):
         "w_qkv": (torch.randn(DH.QKV_ROWS, D.H, device=dev) * 0.02).to(bf),
         "q_norm": (1.0 + 0.1 * torch.randn(128, device=dev)).to(bf),
         "k_norm": (1.0 + 0.1 * torch.randn(128, device=dev)).to(bf),
-        "cos_sin": cos_sin.to(bf),
+        "cos_sin": cos_sin,  # the served table is fp32
         "positions": torch.randint(0, MAX_POS, (rows,), device=dev, dtype=torch.int32),
     }
     slots = torch.randperm(SLOTS, device=dev)[:rows].to(torch.int32)

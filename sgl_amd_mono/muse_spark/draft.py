@@ -126,8 +126,8 @@ def _attn_view_reasons(i: int, views: dict) -> list[str]:
         if not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16 or not t.is_contiguous() or tuple(t.shape) != want:
             reasons.append(f"draft layer {i} {name}: {getattr(t, 'dtype', None)} {tuple(getattr(t, 'shape', ()))}, want contiguous bf16 {want}")  # fmt: skip
     cs = views["cos_sin"]
-    if not isinstance(cs, torch.Tensor) or cs.dtype != torch.bfloat16 or not cs.is_contiguous() or cs.dim() != 2 or cs.shape[1] != DH.HEAD_DIM:
-        reasons.append(f"draft layer {i} rotary table: {getattr(cs, 'dtype', None)} {tuple(getattr(cs, 'shape', ()))}, D-pre reads bf16 [*, {DH.HEAD_DIM}]")  # fmt: skip
+    if not isinstance(cs, torch.Tensor) or cs.dtype != torch.float32 or not cs.is_contiguous() or cs.dim() != 2 or cs.shape[1] != DH.HEAD_DIM:
+        reasons.append(f"draft layer {i} rotary table: {getattr(cs, 'dtype', None)} {tuple(getattr(cs, 'shape', ()))}, D-pre reads fp32 [*, {DH.HEAD_DIM}]")  # fmt: skip
     return reasons
 
 
