@@ -11,7 +11,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_muse_spark_layer import LAYER, LENS, Buffers, Layer, _attn_args, _epoch, _k1, _k2_args, _k3_args  # noqa: E402
+from test_muse_spark_layer import LAYER, LENS, Buffers, Layer, _attn_args, _epoch, _k1, _k1_next_args, _k2_args, _k3_args  # noqa: E402
 
 K1_STAMPS = ["entry", "x ready", "gemv done", "head/gate done"]
 KA_STAMPS = ["entry", "attention tasks done", "merge done"]
@@ -49,7 +49,7 @@ def main():
     from sgl_amd_mono.common.plan import BLOCKS
     from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, build_k2
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
-    from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, KAttnBuild, build_k1, build_kattn
+    from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, KAttnBuild, LayerBuild, build_k1, build_kattn, build_layer
     from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_SLOTS, k1_scratch_layout, kattn_scratch_layout
     from sgl_amd_mono.muse_spark.gfx950.stages import ffn, post_attn
     from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_bases
@@ -59,6 +59,7 @@ def main():
     if "--window" in sys.argv:
         window = int(sys.argv[sys.argv.index("--window") + 1])
         args = [a for a in args if a != str(window)] if False else args
+    merged = "--merged" in sys.argv  # the whole-layer launch (K1 first), stamps of every stage
     S = int(args[0]) if args else 8
     lens = [int(x) for x in args[1:]] if len(args) > 1 else LENS[: S // 8]
     ql = 8
@@ -71,18 +72,25 @@ def main():
     ka = build_kattn(KAttnBuild(tokens=S, q_len=ql, trace=True))
     k2 = build_k2(K2Build(tokens=S, npes=1, trace=True))
     k3 = build_k3(K3Build(tokens=S, npes=1, trace=True))
+    layer = build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, trace=True)) if merged else None
     try:
         for rep in range(3):  # the third step's stamps are reported (warm caches, steady tags)
             B.res.copy_(L.res0)
             _k1(k1, L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream)
-            ka(*_attn_args(L, B), epoch.data_ptr(), LAYER, stream=stream)
-            k2(B.o.data_ptr(), *_k2_args(L, B), B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, stream=stream)  # fmt: skip
-            a3 = _k3_args(L, B)
-            k3(B.xin.data_ptr(), B.ids.data_ptr(), B.scores.data_ptr(), a3[0], *a3[1:5], a3[5], B.res.data_ptr(), *a3[6:],
-               B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream)  # fmt: skip
+            if merged:
+                layer(
+                    *_attn_args(L, B), *_k2_args(L, B), *_k3_args(L, B), *_k1_next_args(L, B),
+                    B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream,
+                )  # fmt: skip
+            else:
+                ka(*_attn_args(L, B), epoch.data_ptr(), LAYER, stream=stream)
+                k2(B.o.data_ptr(), *_k2_args(L, B), B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, stream=stream)  # fmt: skip
+                a3 = _k3_args(L, B)
+                k3(B.xin.data_ptr(), B.ids.data_ptr(), B.scores.data_ptr(), a3[0], *a3[1:5], a3[5], B.res.data_ptr(), *a3[6:],
+                   B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream)  # fmt: skip
             epoch[0] += 1
             torch.cuda.synchronize()
-        print(f"S={S} lens={lens} window={window}; ids of token 0: {B.ids[0].tolist()}")
+        print(f"S={S} lens={lens} window={window} merged={merged}; ids of token 0: {B.ids[0].tolist()}")
         cta = torch.arange(BLOCKS)
         _report("K1", _stamps(B.scratch_k1, k1_scratch_layout(), "k1_trace", BLOCKS, TRACE_SLOTS), K1_STAMPS, [
             ("head tasks", (cta >= 32) & (cta < 52)), ("gate tasks", (cta >= 52) & (cta < 68)), ("gemv only", (cta < 32) | (cta >= 68)),
