@@ -7,6 +7,7 @@ fp8 cache rows must agree to the last bit but for the attention's partition merg
 order; and the step time of each form at every served width when run as a script
 (``python test_muse_spark_layer.py``)."""
 
+import os
 import struct
 import sys
 import time
@@ -24,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 PAGES = 16384  # cache pages of the layer's K / V planes (262k keys)
+FP8_DENSE = os.environ.get("MUSE_BENCH_FP8", "0") == "1"  # the pooler / unpooler as packed FP8 copies
 MAX_BLOCKS = 16384
 POSITIONS = 4096
 THETA = 500000.0
@@ -132,6 +134,11 @@ class Layer:
             "npw": (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(bf),
             "w_unpool": (torch.randn(HIDDEN, MOE_HIDDEN, device=dev) * 0.02).to(bf),
         }
+        if FP8_DENSE:  # the kernels stream the packed copies (the merged / four launch forms agree either way)
+            from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows
+
+            self.w2k["w_pool"] = pack_fp8_rows(self.w2k["w_pool"])
+            self.w3k["w_unpool"] = pack_fp8_rows(self.w3k["w_unpool"])
 
 
 class Buffers:
@@ -239,9 +246,9 @@ def _kernels(S, ql):
     return {
         "k1": build_k1(K1Build(tokens=S)),
         "ka": build_kattn(KAttnBuild(tokens=S, q_len=ql)),
-        "k2": build_k2(K2Build(tokens=S, npes=1)),
-        "k3": build_k3(K3Build(tokens=S, npes=1)),
-        "layer": build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True)),
+        "k2": build_k2(K2Build(tokens=S, npes=1, fp8_pool=FP8_DENSE)),
+        "k3": build_k3(K3Build(tokens=S, npes=1, fp8_unpool=FP8_DENSE)),
+        "layer": build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, fp8_dense=FP8_DENSE)),
     }
 
 
