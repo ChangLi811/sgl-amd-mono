@@ -293,7 +293,12 @@ def test_the_views_read_in_place_and_log_the_copies():
     assert v.pre_w.dtype == v.npw.dtype == torch.bfloat16 and v.pen_w.numel() == MOE_HIDDEN
     # no packed router and no cached norms on this layer: the split and the effective weights are copies
     kinds = {k[0] for k in copies}
-    assert kinds == {"router hi/lo", "effective norm weight", "residual gate", "fp8 dense"}  # fp8: the pooler / unpooler copies
+    from sgl_amd_mono.muse_spark import weights as W
+
+    want = {"router hi/lo", "effective norm weight", "residual gate"}
+    if W.FP8_DENSE:
+        want.add("fp8 dense")  # the pooler / unpooler FP8 copies (off by default)
+    assert kinds == want
     # a packed router is read in place
     packed = _meta(MOE_HIDDEN + 2 * EXPERTS, HIDDEN)
     layer.mlp.router_pooler_packed_weight = packed
