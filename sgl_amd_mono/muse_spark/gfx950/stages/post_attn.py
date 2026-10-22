@@ -38,7 +38,7 @@ their o tasks and wait on the tokens' flags behind them, as they must anyway::
     pool    256 tasks (128 rows x an eighth of K), one a CTA, the same eighth as
             the CTA's router task: partial pooled rows -> ``pool`` [part][token][row]
     route   S tasks, chain CTA CHAIN0 + t: top-8 -> ids / scores
-    xn      S tasks, chain CTA CHAIN0 + t: the pre-expert norm -> expert input
+    xn      S tasks, stream CTA t (beside the route): the pre-expert norm -> expert input
 
 Width scaling (8 .. 64 rows): the o GEMV holds every token's og row in LDS
 (S x 2 KB) and runs a token tile of 16 an MFMA accumulator, each tile's rows
@@ -204,7 +204,7 @@ def k2_xs_floats(tokens: int) -> int:
 def red_sets(tokens: int) -> int:
     """Reduction row sets of the router / pooler passes (a row tile each a round):
     what the LDS leaves beside the og rows."""
-    return 8 if tokens <= 16 else (4 if tokens <= 32 else 2)
+    return P_SUB + 1 if tokens <= 16 else (4 if tokens <= 32 else 2)  # one round of 9 tiles up to 16 rows
 
 
 def k2_lds_bytes(tokens: int) -> int:
@@ -806,12 +806,11 @@ def run_chain(c, route_flag=None, xin_flag=None):
     stamp(c, 5)  # the pooler passes done
     stamp(c, 6)  # (the pooled rows go out with the passes)
     if tok < S:
-        stage_route(c, tok, route_flag)
-        stage_xn(c, tok, xin_flag)
+        stage_route(c, tok, route_flag)  # the xn task runs on stream CTA tok meanwhile
 
 
 @flyc.jit
-def run_stream(c, o_flag=None, QL=8):
+def run_stream(c, o_flag=None, QL=8, xin_flag=None):
     """A stream CTA (``bid < CHAIN0``): its og task (CTAs 0 .. S), its two o tasks
     (``bid`` and ``bid + BLOCKS``), then its pooler weights, the tokens' flags, and
     the router / pooler passes (a router task's rows on CTAs R0 ..: every stream CTA
@@ -840,6 +839,8 @@ def run_stream(c, o_flag=None, QL=8):
     stage_passes(c, tile, part, pool_w, router_w, r_tile, (bid >= R0) & (bid < R0 + R_TASKS))
     stamp(c, 5)  # the router / pooler passes done
     stamp(c, 6)  # (the pooled rows go out with the passes)
+    if bid < S:
+        stage_xn(c, bid, xin_flag)  # token bid's expert input, beside the chain CTA's route
 
 
 @flyc.jit
@@ -854,5 +855,5 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     if bid >= CHAIN0:
         run_chain(c, route_flag, xin_flag)
     else:
-        run_stream(c, o_flag, QL)
+        run_stream(c, o_flag, QL, xin_flag)
     stamp(c, 7)  # end
