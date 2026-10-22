@@ -145,6 +145,11 @@ def do_lds(tokens: int):
     return Lds
 
 
+def _pick(pair, idx):
+    """Element ``idx % 2`` of a (lo, hi) bf16 pair for a dynamic ``idx``."""
+    return (idx % 2 == 0).select(pair[0], pair[1])
+
+
 # ---------------------------------------------------------------- D-pre stages
 @flyc.jit
 def stage_norm_in(c, rg, kp):
@@ -253,7 +258,7 @@ def stage_heads(c, bid):
         for w in range_constexpr(1, WAVES):
             tot = tot + fx.ptr_load(hss + w)
         inv = hw_rsq(tot / float(HEAD_DIM) + EPS)
-        wn = fx.Float32(bf2_f32(fx.Int32(bo.buffer_load(rsrc(is_k.select(a["k_norm"], a["q_norm"])), d // 2, vec_width=1, dtype=T.i32)))[d % 2])  # fmt: skip
+        wn = fx.Float32(_pick(bf2_f32(fx.Int32(bo.buffer_load(rsrc(is_k.select(a["k_norm"], a["q_norm"])), d // 2, vec_width=1, dtype=T.i32))), d % 2))  # fmt: skip
         xn = bf16_round(v * inv * wn)  # the normed value, bf16 (q and k); v keeps v
         val = is_v.select(v, xn)
         if tid < HEAD_DIM:
@@ -264,8 +269,8 @@ def stage_heads(c, bid):
         half = d % 64
         cs_w = fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + half) // 2, vec_width=1, dtype=T.i32))
         sn_w = fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + 64 + half) // 2, vec_width=1, dtype=T.i32))
-        cs = bf2_f32(cs_w)[half % 2]
-        sn = bf2_f32(sn_w)[half % 2]
+        cs = _pick(bf2_f32(cs_w), half % 2)
+        sn = _pick(bf2_f32(sn_w), half % 2)
         x1 = fx.ptr_load(hrow + half)
         x2 = fx.ptr_load(hrow + (half + 64))
         rot = (d < 64).select(x1 * cs - x2 * sn, x2 * cs + x1 * sn)
@@ -275,8 +280,8 @@ def stage_heads(c, bid):
                 # q: bf16 pairs (even dims store the pair)
                 if (d % 2) == 0:
                     nxt = (d < 64).select(
-                        bf16_round(fx.ptr_load(hrow + (half + 1)) * bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + half + 1) // 2, vec_width=1, dtype=T.i32)))[(half + 1) % 2] - fx.ptr_load(hrow + (half + 65)) * bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + 64 + half + 1) // 2, vec_width=1, dtype=T.i32)))[(half + 1) % 2]),  # fmt: skip
-                        bf16_round(fx.ptr_load(hrow + (half + 65)) * bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + half + 1) // 2, vec_width=1, dtype=T.i32)))[(half + 1) % 2] + fx.ptr_load(hrow + (half + 1)) * bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + 64 + half + 1) // 2, vec_width=1, dtype=T.i32)))[(half + 1) % 2]),  # fmt: skip
+                        bf16_round(fx.ptr_load(hrow + (half + 1)) * _pick(bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + half + 1) // 2, vec_width=1, dtype=T.i32))), (half + 1) % 2) - fx.ptr_load(hrow + (half + 65)) * _pick(bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + 64 + half + 1) // 2, vec_width=1, dtype=T.i32))), (half + 1) % 2)),  # fmt: skip
+                        bf16_round(fx.ptr_load(hrow + (half + 65)) * _pick(bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + half + 1) // 2, vec_width=1, dtype=T.i32))), (half + 1) % 2) + fx.ptr_load(hrow + (half + 1)) * _pick(bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + 64 + half + 1) // 2, vec_width=1, dtype=T.i32))), (half + 1) % 2)),  # fmt: skip
                     )
                     bo.buffer_store(fx.Vector.from_elements([out, nxt], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0], r_q, (t * Q_K + row0 + d) // 2)  # fmt: skip
             else:
@@ -289,8 +294,8 @@ def stage_heads(c, bid):
                         he = de % 64
                         xe1 = fx.ptr_load(hrow + he)
                         xe2 = fx.ptr_load(hrow + (he + 64))
-                        cse = bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + he) // 2, vec_width=1, dtype=T.i32)))[he % 2]
-                        sne = bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + 64 + he) // 2, vec_width=1, dtype=T.i32)))[he % 2]
+                        cse = _pick(bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + he) // 2, vec_width=1, dtype=T.i32))), he % 2)
+                        sne = _pick(bf2_f32(fx.Int32(bo.buffer_load(r_cs, (pos * HEAD_DIM + 64 + he) // 2, vec_width=1, dtype=T.i32))), he % 2)
                         rote = (de < 64).select(xe1 * cse - xe2 * sne, xe2 * cse + xe1 * sne)
                         vals.append(is_v.select(fx.ptr_load(hrow + de), bf16_round(rote)))
                     packed = fp8_pack4(clamp_fp8(vals[0]), clamp_fp8(vals[1]), clamp_fp8(vals[2]), clamp_fp8(vals[3]))

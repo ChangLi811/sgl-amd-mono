@@ -406,7 +406,7 @@ def ug_pair_loads(c, q, pr, n_tiles):
     e, _, _ = tile_info(c, q // UG_T, n_tiles)
     r_w, r_s = w13_rsrc(c, e)
     return [
-        fp4_tile_loads(c, r_w, r_s, pr * INTER + (q % UG_T) * 32 + t * 16 + l16, UG_CHUNKS)
+        [list(part) for part in fp4_tile_loads(c, r_w, r_s, pr * INTER + (q % UG_T) * 32 + t * 16 + l16, UG_CHUNKS)]
         for t in range(2)
     ]
 
@@ -425,11 +425,11 @@ def ug_or_dn_pair_loads(c, q, pr, dq, n_tiles, use_dn):
     s_addr = use_dn.select(a["s2"] + fx.Int64(e_d) * (MOE_HIDDEN * W2_SCALE_COLS), a["s13"] + fx.Int64(e_u) * (2 * INTER * W13_SCALE_COLS))  # fmt: skip
     r_w, r_s = rsrc(w_addr), rsrc(s_addr)
     return [
-        fp4_tile_loads(
+        [list(part) for part in fp4_tile_loads(
             c, r_w, r_s,
             use_dn.select((dq % DN_T) * 32 + t * 16 + l16, pr * INTER + (q % UG_T) * 32 + t * 16 + l16),
             UG_CHUNKS,
-        )  # fmt: skip
+        )]  # fmt: skip
         for t in range(2)
     ]
 
@@ -440,7 +440,7 @@ def dn_pair_loads(c, q, n_tiles):
     e, _, _ = tile_info(c, q // DN_T, n_tiles)
     r_w, r_s = w2_rsrc(c, e)
     return [
-        fp4_tile_loads(c, r_w, r_s, (q % DN_T) * 32 + t * 16 + l16, DN_CHUNKS) for t in range(2)
+        [list(part) for part in fp4_tile_loads(c, r_w, r_s, (q % DN_T) * 32 + t * 16 + l16, DN_CHUNKS)] for t in range(2)
     ]
 
 
