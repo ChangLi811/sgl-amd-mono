@@ -24,9 +24,9 @@ pytestmark = pytest.mark.skipif(
     reason="needs a gfx950 GPU",
 )
 
-PAGES = 16384  # cache pages of the layer's K / V planes (262k keys)
+PAGES = 65536  # cache pages of the layer's K / V planes (1M keys: eight 95k requests fit)
 FP8_DENSE = os.environ.get("MUSE_BENCH_FP8", "0") == "1"  # the pooler / unpooler as packed FP8 copies
-MAX_BLOCKS = 16384
+MAX_BLOCKS = 65536
 POSITIONS = 4096
 THETA = 500000.0
 LAYER = 9

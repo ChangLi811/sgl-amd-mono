@@ -201,16 +201,45 @@ def run_kattn(c, o_flag=None):
         keys = seq_len_of(r)
         ctx = keys - QL
         ks = wave  # this wave's key split
+        # Q: rows 16 (rt0 + it) + i = 8 qpos + hg of (request r, head h) into LDS, 16 B a thread
+        if tid < NT * 16 * HEAD_DIM // 8:
+            i_t = tid // (16 * HEAD_DIM // 8)
+            q_row = (tid % (16 * HEAD_DIM // 8)) // (HEAD_DIM // 8)
+            row = (rt0 + i_t) * 16 + q_row
+            d0 = (tid % (HEAD_DIM // 8)) * 8
+            t = r * QL + fx.min(row, ROWS - 1) // GQA
+            qv = fx.Vector(
+                bo.buffer_load(
+                    r_q, (t * Q_K + (h * GQA + fx.min(row, ROWS - 1) % GQA) * HEAD_DIM + d0) // 2,
+                    vec_width=4, dtype=T.i32,
+                )  # fmt: skip
+            )
+            fx.ptr_store(qv.bitcast(fx.BFloat16), qs + ((i_t * 16 + q_row) * Q_PITCH + d0))
+        gpu.barrier()
+        # each tile's A operands of this lane: row l16, dims 8 g4 + 32 step
+        qa = [
+            [
+                fx.Vector(fx.ptr_load(qs + ((it * 16 + l16) * Q_PITCH + 32 * step + 8 * g4), result_type=V8B))  # fmt: skip
+                for step in range(2)
+            ]
+            for it in range(NT)
+        ]
+        # this lane's rows 4 g4 + e of each tile; their query positions
+        qpos = [[fx.min(((rt0 + it) * 16 + 4 * g4 + e) // GQA, QL - 1) for e in range(4)] for it in range(NT)]  # fmt: skip
+        live = [[((rt0 + it) * 16 + 4 * g4 + e) < ROWS for e in range(4)] for it in range(NT)]
+        # each tile's running row statistics and O, carried through the chunk loop
+        m_run = [fx.Vector.filled(4, NEG, fx.Float32) for _ in range(NT)]
+        l_run = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NT)]
+        accs = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)] for _ in range(NT)]
         lo, hi = chunk_range(keys, 0)
         c_lo = fx.max(lo, lo + p * (part // CHUNK))
         c_hi = fx.min(hi, lo + (p + 1) * (part // CHUNK))
-        c_last = fx.max(c_hi - 1, c_lo)
 
-        # The chunk loop is software-pipelined two deep: chunks cc + 1 and cc + 2's K / V
-        # loads and chunk cc + 3's page ids are in flight while chunk cc computes (each
-        # would otherwise be a dependent round trip: the page id, then the slots). A
-        # wave's 32 keys of a chunk are two pages, its two K tiles, and its V passes read
-        # the same two pages. The first chunks' loads go out before the Q staging.
+        # The chunk loop is software-pipelined: chunk cc + 1's K / V loads and
+        # chunk cc + 2's page ids are in flight while chunk cc computes (each
+        # would otherwise be a dependent round trip: the page id, then the
+        # slots). A wave's 32 keys of a chunk are two pages, its two K tiles,
+        # and its V passes read the same two pages.
         assert KEY_TILES == 2 and V_STEPS == 1
 
         def pages_of(cc):
@@ -247,51 +276,17 @@ def run_kattn(c, o_flag=None):
                 )
             return kws + vws
 
+        c_last = fx.max(c_hi - 1, c_lo)
         pa0, pa1 = pages_of(c_lo)
-        kva = kv_of(pa0, pa1)
+        k00, k01, k10, k11, v0, v1 = kv_of(pa0, pa1)
         pb0, pb1 = pages_of(fx.min(c_lo + 1, c_last))
-        kvb = kv_of(pb0, pb1)
-        pc0, pc1 = pages_of(fx.min(c_lo + 2, c_last))
-        # Q: rows 16 (rt0 + it) + i = 8 qpos + hg of (request r, head h) into LDS, 16 B a thread
-        if tid < NT * 16 * HEAD_DIM // 8:
-            i_t = tid // (16 * HEAD_DIM // 8)
-            q_row = (tid % (16 * HEAD_DIM // 8)) // (HEAD_DIM // 8)
-            row = (rt0 + i_t) * 16 + q_row
-            d0 = (tid % (HEAD_DIM // 8)) * 8
-            t = r * QL + fx.min(row, ROWS - 1) // GQA
-            qv = fx.Vector(
-                bo.buffer_load(
-                    r_q, (t * Q_K + (h * GQA + fx.min(row, ROWS - 1) % GQA) * HEAD_DIM + d0) // 2,
-                    vec_width=4, dtype=T.i32,
-                )  # fmt: skip
-            )
-            fx.ptr_store(qv.bitcast(fx.BFloat16), qs + ((i_t * 16 + q_row) * Q_PITCH + d0))
-        gpu.barrier()
-        # each tile's A operands of this lane: row l16, dims 8 g4 + 32 step
-        qa = [
-            [
-                fx.Vector(fx.ptr_load(qs + ((it * 16 + l16) * Q_PITCH + 32 * step + 8 * g4), result_type=V8B))  # fmt: skip
-                for step in range(2)
-            ]
-            for it in range(NT)
-        ]
-        # this lane's rows 4 g4 + e of each tile; their query positions
-        qpos = [[fx.min(((rt0 + it) * 16 + 4 * g4 + e) // GQA, QL - 1) for e in range(4)] for it in range(NT)]  # fmt: skip
-        live = [[((rt0 + it) * 16 + 4 * g4 + e) < ROWS for e in range(4)] for it in range(NT)]
-        # each tile's running row statistics and O, carried through the chunk loop
-        m_run = [fx.Vector.filled(4, NEG, fx.Float32) for _ in range(NT)]
-        l_run = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NT)]
-        accs = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)] for _ in range(NT)]
-        ka0, ka1, ka2, ka3, va0, va1 = kva
-        kb0, kb1, kb2, kb3, vb0, vb1 = kvb
         for cc in range(c_lo, c_hi):
             key0 = cc * CHUNK + ks * KEYS_PER_WAVE
-            kw_cur = [ka0, ka1, ka2, ka3]
-            vw_cur = [va0, va1]
-            # the ring moves: chunk cc + 2's words and chunk cc + 3's pages go out first
-            ka0, ka1, ka2, ka3, va0, va1 = kb0, kb1, kb2, kb3, vb0, vb1
-            kb0, kb1, kb2, kb3, vb0, vb1 = kv_of(pc0, pc1)
-            pc0, pc1 = pages_of(fx.min(cc + 3, c_last))
+            kw_cur = [k00, k01, k10, k11]
+            vw_cur = [v0, v1]
+            # the next chunk's words and the one after's pages go out first
+            k00, k01, k10, k11, v0, v1 = kv_of(pb0, pb1)
+            pb0, pb1 = pages_of(fx.min(cc + 2, c_last))
             # the chunk's K operands, decoded once for every tile
             kb = [fp8_to_bf16x8(kw[0], kw[1]) for kw in kw_cur]
             m_next, l_next, acc_scaled = [], [], []
