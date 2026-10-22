@@ -131,6 +131,6 @@ def kattn_lds_bytes(nt: int) -> int:
     red = THREADS * 10 * 4
     pt = WAVES * nt * 16 * ATTN_P_PITCH * 2
     vt = WAVES * HEAD_DIM * ATTN_V_PITCH * 2
-    comb = (WAVES // 2) * nt * 16 * ATTN_PART_ROW * 4
+    comb = WAVES * nt * 16 * ATTN_PART_ROW * 4
     return qs + red + max(pt + vt, comb)
 

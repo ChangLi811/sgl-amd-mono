@@ -24,7 +24,7 @@ as plain fp32 words with one flag a task. The partitions are sized to at most
 so a 95k-key full layer is 128 tasks of three chunks a KV head and a sliding
 layer eight tasks of one.
 
-Merge. A (request, KV head, row tile) with at most ``MERGE_GROUPS`` partitions
+Merge. A (request, KV head, row tile) with at most ``DIRECT_MAX`` partitions
 folds them in one job; a longer one in two levels: ``MERGE_GROUPS`` level-1 jobs
 each fold a contiguous eighth of the partitions (a thread a (row, 8 dims,
 partition lane), the lanes combined in LDS) into a level-2 partial, and the
@@ -72,11 +72,12 @@ NO_MAX = -1.0e29  # a running max below this is "no key yet": exp2 then takes 0
 O_OFF = 4  # a partial row: m, l, pad, pad, O[64] (O 16 B aligned)
 COMB_ROW = PART_ROW  # a tile row's (m, l, pad, pad, O[64]) in the LDS tree
 MERGE_LANES = 4  # partitions folded side by side a (row, 8 dims): 16 x 8 x 4 = THREADS
+DIRECT_MAX = 16  # partitions a level-2 job folds itself (four a lane); more go through level 1
 
 
 def comb_floats(nt: int) -> int:
-    """The LDS tree's floats: the four sending waves' states of ``nt`` tiles."""
-    return (WAVES // 2) * nt * 16 * COMB_ROW
+    """The key-split merge's LDS floats: every wave's state of ``nt`` tiles."""
+    return WAVES * nt * 16 * COMB_ROW
 
 
 def kattn_lds(nt: int):
@@ -364,67 +365,52 @@ def run_kattn(c, o_flag=None):
                     acc_pv.append([mfma_bf16(a_p, b_v[dt], accs[it][dt]) for dt in range(4)])
                 accs = acc_pv
                 rocdl.s_waitcnt(lgkmcnt=0)  # the next pass rewrites vt
-        gpu.barrier()  # every wave is done with pt / vt: the tree reuses them
+        gpu.barrier()  # every wave is done with pt / vt: the merge reuses them
 
-        # ---- the key splits merge as a tree in LDS: the upper waves send, the
-        # lower fold; a (row, tile) record is COMB_ROW floats, O from O_OFF
+        # ---- the key splits merge in LDS in one round: every wave writes its
+        # (m, l, O) rows (a (split, tile, row) record is COMB_ROW floats, O from
+        # O_OFF); then each wave owns 2 NT of the task's rows, folds the eight splits
+        # of them (a lane: one row, DPL dims) and publishes them with vector stores
         def comb_at(slot, it, row):
             return comb + ((slot * NT + it) * 16 + row) * COMB_ROW
 
-        def send(slot):
-            for it in range_constexpr(NT):
-                for e in range_constexpr(4):
-                    row = 4 * g4 + e
-                    base = comb_at(slot, it, row)
-                    if l16 == 0:
-                        fx.ptr_store(fx.Float32(m_run[it][e]), base)
-                        fx.ptr_store(fx.Float32(l_run[it][e]), base + 1)
-                    for dt in range_constexpr(4):
-                        fx.ptr_store(fx.Float32(accs[it][dt][e]), base + (O_OFF + dt * 16 + l16))
-
-        def take(slot):
-            m2, l2, acc2 = [], [], []
-            for it in range_constexpr(NT):
-                mf, lf, of = [], [], [[None] * 4 for _ in range(4)]
-                for e in range_constexpr(4):
-                    row = 4 * g4 + e
-                    base = comb_at(slot, it, row)
-                    m_o = fx.ptr_load(base)
-                    l_o = fx.ptr_load(base + 1)
-                    m = fx.max(fx.Float32(m_run[it][e]), m_o)
-                    mg = (m > fx.Float32(NO_MAX)).select(m, fx.Float32(0.0))
-                    a1 = hw_exp2(fx.Float32(m_run[it][e]) - mg)
-                    a2 = hw_exp2(m_o - mg)
-                    mf.append(m)
-                    lf.append(fx.Float32(l_run[it][e]) * a1 + l_o * a2)
-                    for dt in range_constexpr(4):
-                        v2 = fx.ptr_load(base + (O_OFF + dt * 16 + l16))
-                        of[dt][e] = fx.Float32(accs[it][dt][e]) * a1 + v2 * a2
-                m2.append(fx.Vector.from_elements(mf, fx.Float32))
-                l2.append(fx.Vector.from_elements(lf, fx.Float32))
-                acc2.append([fx.Vector.from_elements(of[dt], fx.Float32) for dt in range(4)])
-            return m2, l2, acc2
-
-        # the upper waves send, every wave folds slot ks % half (the upper ones fold
-        # their own copy: harmless, only wave 0's state is published)
-        for half in (4, 2, 1):
-            if (ks >= half) & (ks < 2 * half):
-                send(ks - half)
-            gpu.barrier()
-            m_run, l_run, accs = take(ks % half)
-            gpu.barrier()
-        # ---- wave 0 publishes the task's partial rows: plain fp32 words, then the flag
-        if ks == 0:
-            for it in range_constexpr(NT):
-                for e in range_constexpr(4):
-                    row = (rt0 + it) * 16 + 4 * g4 + e
-                    if row < ROWS:
-                        base = part_row(r, h, p, row)
-                        if l16 == 0:
-                            bo.buffer_store(fx.Float32(m_run[it][e]), r_part, base, cache_modifier=CM_DEV)
-                            bo.buffer_store(fx.Float32(l_run[it][e]), r_part, base + 1, cache_modifier=CM_DEV)
-                        for dt in range_constexpr(4):
-                            bo.buffer_store(fx.Float32(accs[it][dt][e]), r_part, base + O_OFF + dt * 16 + l16, cache_modifier=CM_DEV)  # fmt: skip
+        for it in range_constexpr(NT):
+            for e in range_constexpr(4):
+                row = 4 * g4 + e
+                base = comb_at(ks, it, row)
+                if l16 == 0:
+                    fx.ptr_store(fx.Float32(m_run[it][e]), base)
+                    fx.ptr_store(fx.Float32(l_run[it][e]), base + 1)
+                for dt in range_constexpr(4):
+                    fx.ptr_store(fx.Float32(accs[it][dt][e]), base + (O_OFF + dt * 16 + l16))
+        gpu.barrier()
+        RPW = 2 * NT  # rows a wave: NT 16 / 8
+        LPR = 64 // RPW  # lanes a row: 16 or 32
+        DPL = HEAD_DIM // LPR  # dims a lane: 4 or 2
+        VD = fx.Vector.make_type(DPL, fx.Float32)
+        trow = wave * RPW + lane // LPR  # the task row (0 .. NT 16)
+        it_f, row_f = trow // 16, trow % 16
+        dd = (lane % LPR) * DPL
+        m_f = fx.Float32(NEG)
+        l_f = fx.Float32(0.0)
+        o_f = fx.Vector.filled(DPL, 0.0, fx.Float32)
+        for src in range_constexpr(KEY_SPLITS):
+            base = comb_at(src, it_f, row_f)
+            m2 = fx.ptr_load(base)
+            l2 = fx.ptr_load(base + 1)
+            v2 = fx.Vector(fx.ptr_load(base + (O_OFF + dd), result_type=VD))
+            mn = fx.max(m_f, m2)
+            mg = (mn > fx.Float32(NO_MAX)).select(mn, fx.Float32(0.0))
+            a1 = hw_exp2(m_f - mg)
+            a2 = hw_exp2(m2 - mg)
+            m_f, l_f, o_f = mn, l_f * a1 + l2 * a2, o_f * a1 + v2 * a2
+        # ---- the task's partial rows: plain fp32 words, then the flag
+        row = rt0 * 16 + trow
+        if row < ROWS:
+            base = part_row(r, h, p, row)
+            if lane % LPR == 0:
+                bo.buffer_store(fx.Vector.from_elements([m_f, l_f], fx.Float32), r_part, base, cache_modifier=CM_DEV)
+            bo.buffer_store(o_f, r_part, base + O_OFF + dd, cache_modifier=CM_DEV)
         release_stores()
         gpu.barrier()
         if tid == 0:
@@ -526,10 +512,10 @@ def run_kattn(c, o_flag=None):
             put(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS + g, fx.Int32(1))
 
     def merge_l2(r, h, rt):
-        """Level-2 job: the groups' records (or, with at most GROUPS partitions, the
-        partitions themselves) of (request r, head h, row tile rt) -> o rows."""
+        """Level-2 job: the groups' records (or, with at most DIRECT_MAX partitions,
+        the partitions themselves) of (request r, head h, row tile rt) -> o rows."""
         np_r = n_parts_of(r)
-        direct = np_r <= GROUPS
+        direct = np_r <= DIRECT_MAX
         row = fx.min(rt * 16 + row16, ROWS - 1)
         m = fx.Float32(NEG)
         l = fx.Float32(0.0)
@@ -542,10 +528,10 @@ def run_kattn(c, o_flag=None):
         else:
             poll_flags(c, [(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS, GROUPS)])
         r_src = rsrc(direct.select(part_w.value, l2_w.value))
-        for k in range_constexpr(GROUPS // MERGE_LANES):
-            g = k * MERGE_LANES + pl
-            idx = direct.select(part_row(r, h, fx.min(g, np_r - 1), row), l2_row(r, h, rt, g, row16))
-            ok = direct.select(g < np_r, fx.Int32(1) == fx.Int32(1))
+        for k in range_constexpr(DIRECT_MAX // MERGE_LANES):
+            g = k * MERGE_LANES + pl  # a partition (direct) or a group (g < GROUPS)
+            idx = direct.select(part_row(r, h, fx.min(g, np_r - 1), row), l2_row(r, h, rt, fx.min(g, GROUPS - 1), row16))
+            ok = direct.select(g < np_r, g < GROUPS)
             m, l, o0, o1 = fold_rec(m, l, o0, o1, load_rec(r_src, idx), ok)
         m, l, o0, o1 = combine_lanes(m, l, o0, o1)
         if (pl == 0) & (rt * 16 + row16 < ROWS):
@@ -570,7 +556,7 @@ def run_kattn(c, o_flag=None):
         rt = (j // GROUPS) % ROW_TILES
         h = (j // (GROUPS * ROW_TILES)) % LOCAL_KV_HEADS
         r = j // (GROUPS * ROW_TILES * LOCAL_KV_HEADS)
-        if n_parts_of(r) > GROUPS:  # else the level-2 job folds the partitions itself
+        if n_parts_of(r) > DIRECT_MAX:  # else the level-2 job folds the partitions itself
             merge_l1(r, h, rt, g)
     if mbid < n_l2:
         rt = mbid % ROW_TILES
