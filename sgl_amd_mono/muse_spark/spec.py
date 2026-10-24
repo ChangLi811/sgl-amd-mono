@@ -290,6 +290,20 @@ class _Built:
             nat = f"native vs exact min {c_nat.min().item():.5f} mean {c_nat.mean().item():.5f}; native vs ours min {c_vs.min().item():.5f}"
         except Exception as e:  # noqa: BLE001 - a diagnostic
             nat = f"native attention not run: {e!r}"[:200]
+        dump_dir = os.environ.get("SGLANG_AMD_MONO_ATTN_DUMP", "")
+        if dump_dir and cos.min().item() < 0.9 and getattr(self, "_attn_dumps", 0) < 4:
+            # the failing case's inputs, for an offline reproduction: the request's K / V rows
+            # in key order, its pages, q, our output and the exact one
+            self._attn_dumps = getattr(self, "_attn_dumps", 0) + 1
+            keys = int(lens[0]) + extra
+            pages = table[0, : (keys + 15) // 16].clone()
+            slots = (pages.long()[:, None] * 16 + torch.arange(16, device=q.device)[None, :]).reshape(-1)[:keys]
+            os.makedirs(dump_dir, exist_ok=True)
+            torch.save(
+                {"layer": i, "rank": r.rank, "q": q_i.cpu(), "k": k[slots].cpu(), "v": v[slots].cpu(), "pages": pages.cpu(),
+                 "lens": lens.cpu(), "extra": extra, "scale": scale, "o": r.o[:rows].cpu(), "ref": ref.cpu(), "rows": rows, "q_len": q_len},
+                os.path.join(dump_dir, f"attn_r{r.rank}_l{i}_{self._attn_dumps}.pt"),
+            )  # fmt: skip
         logger.info(
             "monokernel attn check layer %d: %d rows, lens %s, table %s; ours vs exact head cosine min %.5f mean %.5f; low (row, head) %s; %s",
             i, rows, lens.tolist()[:4], tuple(table.shape), cos.min().item(), cos.mean().item(), low[:24], nat,
