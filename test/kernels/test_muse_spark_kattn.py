@@ -75,7 +75,7 @@ def _reference(q, k_cache, v_cache, table, seq_lens, ql, window, scale):
         (1, 16, 2047, 256, None),
     ],
 )
-def test_kattn_matches_the_verify_attention(ql, R, window, part, lens):
+def test_kattn_matches_the_verify_attention(ql, R, window, part, lens, peaks=None):
     from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K, SOFTMAX_SCALE
     from sgl_amd_mono.muse_spark.gfx950.layer import KAttnBuild, build_kattn
     from sgl_amd_mono.muse_spark.gfx950.layout import kattn_scratch_layout, scratch_bytes
@@ -100,6 +100,22 @@ def test_kattn_matches_the_verify_attention(ql, R, window, part, lens):
         table[r, :n] = perm[at : at + n].to(torch.int32)
         at += n
     scale = SOFTMAX_SCALE
+    if peaks is not None:
+        # peaked attention, as real heads (a sink, a far key, a recent one): each row's
+        # query a multiple of chosen keys' K, so those logits stand ~30 above the rest
+        for r in range(R):
+            ctx = lens[r] - ql
+            for qpos in range(ql):
+                t = r * ql + qpos
+                for h in range(LOCAL_KV_HEADS):
+                    for g in range(8):
+                        rel = peaks[(qpos + g) % len(peaks)]
+                        kidx = min(max(int(rel * ctx) if isinstance(rel, float) else rel, 0), ctx + qpos)
+                        page = int(table[r, kidx // 16])
+                        kv = k_cache[page * 16 + kidx % 16, h].float()
+                        a = 30.0 / (scale * float(kv.pow(2).sum()))
+                        qh = (a * kv + 0.02 * torch.randn(HEAD_DIM, device=dev)).to(bf)
+                        q[t, (h * 8 + g) * HEAD_DIM : (h * 8 + g + 1) * HEAD_DIM] = qh
     o = torch.full((S, Q_K), float("nan"), device=dev, dtype=bf)
     scratch = torch.zeros(scratch_bytes(kattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev)
     epoch = _epoch(dev)
@@ -124,6 +140,19 @@ def test_kattn_matches_the_verify_attention(ql, R, window, part, lens):
     assert bad == 0.0, f"{bad:.2%} of the outputs off (max err {err.max().item():.4f})"
     cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1).min().item()
     assert cos > 0.999, f"least row cosine {cos}"
+
+
+@pytest.mark.parametrize(
+    "lens,peaks",
+    [
+        ([95000], [0, 0.5, 0.999]),  # a sink, a middle key, a recent one: maxima in different partitions
+        ([95000], [0.999]),  # the max in the last partition (a late rescale)
+        ([95000], [0]),  # the max in the first partition
+        ([20000, 95000], [3, 0.25, 0.75]),
+    ],
+)
+def test_kattn_peaked_attention(lens, peaks):
+    test_kattn_matches_the_verify_attention(8, len(lens), 0, 0, lens, peaks)
 
 
 @pytest.mark.parametrize("rows,ql", [(8, 8), (16, 8), (32, 8), (64, 8), (16, 1)])

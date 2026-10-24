@@ -230,10 +230,55 @@ class _Built:
             if ref is not None:
                 _log_check(i, live, (stream, attn_input), ref)
                 _log_kv_check(i, live, self._kv_rows(i, forward_batch, rows), kv_ref)
+                self._attn_check(i, rows, q_len, forward_batch)
             if i in m.layers_to_capture:  # set after attach: read per step
                 aux.append(stream.to(torch.bfloat16))
         r.end_step()
         return attn_input, (aux if self.lm.capture_aux_hidden_states else None)
+
+    def _attn_check(self, i, rows, q_len, forward_batch):
+        """Check mode, full-attention layers, the first steps: the launch's attention
+        output (``runner.o``) against the exact softmax attention recomputed in torch from
+        its q (``runner.q``), the served page table and the fp8 cache (P rounded to bf16 as
+        the kernel), every row's cosine; rows below 0.99 are listed. Isolates K-attn from
+        what follows it in the layer."""
+        r = self.runner
+        if r.windows[i] != 0 or getattr(self, "_attn_checks", 0) >= 6 * 16:
+            return
+        self._attn_checks = getattr(self, "_attn_checks", 0) + 1
+        from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K
+
+        attn = self.model.layers[i].self_attn.attn
+        k, v = r.pool.get_kv_buffer(attn.layer_id)
+        table = r.backend.forward_metadata.kv_indices
+        lens = forward_batch.seq_lens
+        extra = q_len if forward_batch.forward_mode.is_target_verify() else 0
+        scale = float(attn.scaling)
+        q, o = r.q[:rows].float(), r.o[:rows].float()
+        ref = torch.zeros_like(o)
+        GQA = Q_K // HEAD_DIM // LOCAL_KV_HEADS
+        for req in range(rows // q_len):
+            keys = int(lens[req]) + extra
+            ctx = keys - q_len
+            pages = table[req, : (keys + 15) // 16].long()
+            slots = (pages[:, None] * 16 + torch.arange(16, device=q.device)[None, :]).reshape(-1)[:keys]
+            K, V = k[slots].float(), v[slots].float()  # [keys, KV heads, HEAD_DIM]
+            kidx = torch.arange(keys, device=q.device)
+            for qp in range(q_len):
+                t = req * q_len + qp
+                ok = kidx < ctx + qp + 1
+                for h in range(LOCAL_KV_HEADS):
+                    qh = q[t].reshape(-1, HEAD_DIM)[h * GQA : (h + 1) * GQA]
+                    sc = scale * (qh @ K[:, h].T)
+                    sc = torch.where(ok[None, :], sc, torch.full_like(sc, float("-inf")))
+                    p = torch.softmax(sc, dim=-1).to(torch.bfloat16).float()
+                    ref[t, h * GQA * HEAD_DIM : (h + 1) * GQA * HEAD_DIM] = (p @ V[:, h]).reshape(-1)
+        cos = torch.nn.functional.cosine_similarity(o.reshape(rows, -1, HEAD_DIM), ref.reshape(rows, -1, HEAD_DIM), dim=-1)  # [rows, heads]
+        low = (cos < 0.99).nonzero().tolist()
+        logger.info(
+            "monokernel attn check layer %d: %d rows, lens %s, table %s; head cosine min %.5f mean %.5f; low (row, head) %s",
+            i, rows, lens.tolist()[:4], tuple(table.shape), cos.min().item(), cos.mean().item(), low[:24],
+        )  # fmt: skip
 
     def _kv_rows(self, i, forward_batch, rows):
         """Check mode: layer ``i``'s K / V cache rows of this step's slots (through the
