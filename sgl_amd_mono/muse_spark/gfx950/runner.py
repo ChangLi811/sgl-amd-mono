@@ -165,18 +165,7 @@ class MuseMonoRunner:
         assert len(views) == len(modules) == len(boundaries) <= LAYER_SLOTS
         self.views, self.modules, self.boundaries = list(views), list(modules), list(boundaries)
         self.tpx = TPX and USE_KERNELS
-        self.tpx_w = [None] * len(self.views)
-        if self.tpx:
-            import time
-
-            from sglang.srt.runtime_context import get_parallel
-
-            from sgl_amd_mono.muse_spark.weights import tp_expert_copies
-
-            t0 = time.time()
-            self.tpx_w = tp_expert_copies(self.views, self.modules, rank, npes, get_parallel().tp_group.device_group if npes > 1 else None)
-            gb = sum(sum(t.numel() for t in w) for w in self.tpx_w if w is not None) / 2**30
-            print(f"[muse mono] rank {rank}: TP experts copies {gb:.1f} GiB in {time.time() - t0:.1f} s", flush=True)
+        self.tpx_w = None  # the TP-experts slices: built at bind, after SGLang sized the KV cache
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
         self.use_layer = USE_LAYER
@@ -286,11 +275,33 @@ class MuseMonoRunner:
             )
         return self._layer[(rows, q_len, next_k1)]
 
+    def _build_tpx(self) -> None:
+        """The TP-experts slices (``weights.tp_expert_copies``, ~0.8 GB a layer): taken
+        here, at the first bind (an eager forward every rank runs: the all-to-alls are
+        collective), from the memory SGLang leaves outside its static fraction once the
+        KV cache is sized -- the recipe's fraction has no room for them before."""
+        import time
+
+        from sglang.srt.runtime_context import get_parallel
+
+        from sgl_amd_mono.muse_spark.weights import tp_expert_copies
+
+        t0 = time.time()
+        free0 = torch.cuda.mem_get_info(self.device)[0]
+        group = get_parallel().tp_group.device_group if self.npes > 1 else None
+        self.tpx_w = tp_expert_copies(self.views, self.modules, self.rank, self.npes, group)
+        torch.cuda.synchronize(self.device)
+        gb = sum(sum(t.numel() for t in w) for w in self.tpx_w if w is not None) / 2**30
+        free1 = torch.cuda.mem_get_info(self.device)[0]
+        print(f"[muse mono] rank {self.rank}: TP experts slices {gb:.1f} GiB in {time.time() - t0:.1f} s; device free {free0 / 2**30:.1f} -> {free1 / 2**30:.1f} GiB", flush=True)  # fmt: skip
+
     def _experts(self, i: int) -> tuple:
         """Layer ``i``'s w13, s13, w2, s2 pointers: EP's whole local experts, or under TP
         experts the rank's slices of every expert."""
-        w = self.tpx_w[i] if self.tpx else None
-        if w is not None:
+        if self.tpx:
+            w = self.tpx_w[i] if self.tpx_w is not None else None
+            if w is None:
+                raise RuntimeError(f"Muse Spark layer {i}: TP-experts launch without its slices")
             return tuple(_ptr(t) for t in w)
         L = self.views[i]
         return (_ptr(L.w13), _ptr(L.s13), _ptr(L.w2), _ptr(L.s2))
@@ -367,6 +378,8 @@ class MuseMonoRunner:
             self.windows.append(w if w > 0 else 0)
         self.swa_map = pool.full_to_swa_index_mapping
         self.backend, self.pool = backend, pool
+        if self.tpx and self.tpx_w is None:
+            self._build_tpx()
         if TRACE_DIR:
             # the pinned host buffers before any capture (no host allocation inside
             # one); the save thread is CPU-only, so it may run through the captures
