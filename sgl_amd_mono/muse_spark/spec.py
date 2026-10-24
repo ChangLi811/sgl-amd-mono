@@ -278,9 +278,21 @@ class _Built:
                     ref[t, h * GQA * HEAD_DIM : (h + 1) * GQA * HEAD_DIM] = (p @ V[:, h]).reshape(-1)
         cos = torch.nn.functional.cosine_similarity(o.reshape(rows, -1, HEAD_DIM), ref.reshape(rows, -1, HEAD_DIM), dim=-1)  # [rows, heads]
         low = (cos < 0.99).nonzero().tolist()
+        # SGLang's own attention on the same q and the step's K / V rows (from the cache, no write)
+        nat = None
+        try:
+            slots_new = forward_batch.out_cache_loc[:rows].long()
+            k_new = k[slots_new].to(torch.bfloat16).reshape(rows, -1)
+            v_new = v[slots_new].to(torch.bfloat16).reshape(rows, -1)
+            nat_o = attn(q_i.to(torch.bfloat16), k_new, v_new, forward_batch, save_kv_cache=False).float().reshape(rows, -1)
+            c_nat = torch.nn.functional.cosine_similarity(nat_o.reshape(rows, -1, HEAD_DIM), ref.reshape(rows, -1, HEAD_DIM), dim=-1)
+            c_vs = torch.nn.functional.cosine_similarity(nat_o.reshape(rows, -1, HEAD_DIM), o.reshape(rows, -1, HEAD_DIM), dim=-1)
+            nat = f"native vs exact min {c_nat.min().item():.5f} mean {c_nat.mean().item():.5f}; native vs ours min {c_vs.min().item():.5f}"
+        except Exception as e:  # noqa: BLE001 - a diagnostic
+            nat = f"native attention not run: {e!r}"[:200]
         logger.info(
-            "monokernel attn check layer %d: %d rows, lens %s, table %s; head cosine min %.5f mean %.5f; low (row, head) %s",
-            i, rows, lens.tolist()[:4], tuple(table.shape), cos.min().item(), cos.mean().item(), low[:24],
+            "monokernel attn check layer %d: %d rows, lens %s, table %s; ours vs exact head cosine min %.5f mean %.5f; low (row, head) %s; %s",
+            i, rows, lens.tolist()[:4], tuple(table.shape), cos.min().item(), cos.mean().item(), low[:24], nat,
         )  # fmt: skip
 
     def _kv_rows(self, i, forward_batch, rows):
