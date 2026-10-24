@@ -161,3 +161,54 @@ def test_widths_compile(rows, ql):
     from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
 
     compile_only(build_kattn(KAttnBuild(tokens=rows, q_len=ql)))
+
+
+@pytest.mark.parametrize("lens", [[95000], [95000, 60000]])
+def test_kattn_scratch_reuse_with_new_inputs(lens):
+    """Launches that alternate two queries through one scratch, as a step's layers
+    do: a merge must read only this launch's partials. (A partition's flag once
+    stood for every task of its row tiles: at ~95k keys a partition's two tasks
+    ran in different rounds and the merge read the other tasks' rows of the
+    previous launch; repeating one input could not show it.)"""
+    from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K, SOFTMAX_SCALE
+    from sgl_amd_mono.muse_spark.gfx950.layer import KAttnBuild, build_kattn
+    from sgl_amd_mono.muse_spark.gfx950.layout import kattn_scratch_layout, scratch_bytes
+
+    ql, R = 8, len(lens)
+    torch.manual_seed(31 + R)
+    dev = torch.device("cuda")
+    bf = torch.bfloat16
+    S = ql * R
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
+    qs = [(torch.randn(S, Q_K, device=dev) * 5.47).to(bf) for _ in range(2)]
+    k_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev) * 2).to(torch.float8_e4m3fn)
+    v_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev)).to(torch.float8_e4m3fn)
+    perm = torch.randperm(PAGES - 1, device=dev) + 1
+    table = torch.zeros(R, MAX_BLOCKS, dtype=torch.int32, device=dev)
+    at = 0
+    for r in range(R):
+        n = (lens[r] + 15) // 16
+        table[r, :n] = perm[at : at + n].to(torch.int32)
+        at += n
+    refs = [_reference(q, k_cache, v_cache, table, seq_lens, ql, 0, SOFTMAX_SCALE) for q in qs]
+    o = torch.full((S, Q_K), float("nan"), device=dev, dtype=bf)
+    scratch = torch.zeros(scratch_bytes(kattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev)
+    epoch = _epoch(dev)
+    launch = build_kattn(KAttnBuild(tokens=S, q_len=ql))
+    scale_bits = struct.unpack("i", struct.pack("f", SOFTMAX_SCALE))[0]
+    prefix_lens = (seq_lens - ql).contiguous()
+    for step in range(12):
+        q, ref = qs[step % 2], refs[step % 2]
+        o.fill_(float("nan"))
+        launch(
+            q.data_ptr(), o.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+            table.data_ptr(), MAX_BLOCKS, table.numel() * 4, prefix_lens.data_ptr(), 0,
+            ql, 0, 0, scale_bits, scratch.data_ptr(), epoch.data_ptr(), 11,
+            stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        epoch[0] += 1
+        torch.cuda.synchronize()
+        got = o.float()
+        assert not got.isnan().any(), f"launch {step}: NaN in the attention output"
+        heads = torch.nn.functional.cosine_similarity(got.reshape(S, -1, HEAD_DIM), ref.reshape(S, -1, HEAD_DIM), dim=-1)
+        assert heads.min().item() > 0.999, f"launch {step}: (row, head) {(heads <= 0.999).nonzero().tolist()[:8]} off, least cosine {heads.min().item():.5f}"  # fmt: skip

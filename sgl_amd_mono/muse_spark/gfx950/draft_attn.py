@@ -71,7 +71,7 @@ def dattn_scratch_layout(tokens: int, q_len: int) -> dict:
     return pair_layout(
         [
             ("attn_part", part_words // 2),
-            ("attn_pflag", R * LOCAL_KV_HEADS * MAX_PARTS),
+            ("attn_pflag", R * LOCAL_KV_HEADS * tiles * MAX_PARTS),  # a flag a task (its first row tile)
             ("attn_l2", l2_words // 2),
             ("attn_l2flag", R * LOCAL_KV_HEADS * tiles * GROUPS),
             ("attn_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
@@ -221,6 +221,13 @@ def run_dattn(c, o_flag=None):
         """Request r's partitions (its span's, the rest of the task slots idle)."""
         lo, hi = chunk_range(seq_len_of(r), 0)
         return ((hi - lo) * CHUNK + part - 1) // part
+
+    def pflag_at(r, h, rt, p):
+        """Pair index of the flag of the task holding row tile ``rt`` of (request r,
+        head h) over partition p: a task's own (its first tile's), not the
+        partition's: the tasks of a partition's row tiles finish apart (a merge
+        that took the first one's flag read the other tiles' rows of the last layer)."""
+        return ((r * LOCAL_KV_HEADS + h) * ROW_TILES + (rt // NT) * NT) * MAX_PARTS + p
 
     def part_row(r, h, p, row):
         """Float index of (request r, head h, partition p)'s row record."""
@@ -470,7 +477,7 @@ def run_dattn(c, o_flag=None):
         release_stores()
         gpu.barrier()
         if tid == 0:
-            put(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS + p, fx.Int32(1))
+            put(pflag, pflag_at(r, h, rt0, p), fx.Int32(1))
 
     # the tasks, request-major over the requests' own partition counts (a short
     # request has few): job -> (request, head, tile pair, partition) through the
@@ -558,7 +565,7 @@ def run_dattn(c, o_flag=None):
         ppg = (np_r + GROUPS - 1) // GROUPS
         p_lo = g * ppg
         cnt = fx.max(fx.min(np_r - p_lo, ppg), fx.Int32(0))
-        poll_flags(c, [(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS + p_lo, cnt)])
+        poll_flags(c, [(pflag, pflag_at(r, h, rt, p_lo), cnt)])
         row = fx.min(rt * 16 + row16, ROWS - 1)
         for dp in range_constexpr(D_PASSES):
             d0 = (dch + 8 * dp) * 8
@@ -595,7 +602,7 @@ def run_dattn(c, o_flag=None):
         # the source records: the partitions themselves (at most GROUPS of them), or
         # the level-1 records; one resource over the selected base address
         if direct:
-            poll_flags(c, [(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS, np_r)])
+            poll_flags(c, [(pflag, pflag_at(r, h, rt, 0), np_r)])
         else:
             poll_flags(c, [(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS, GROUPS)])
         r_src = rsrc(direct.select(part_w.value, l2_w.value))

@@ -107,7 +107,9 @@ def attn_rows(q_len: int) -> int:
 
 def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
     """K-attn's scratch (a "pair" is 8 bytes): the tasks' partial rows ((request, head,
-    partition, row) x ATTN_PART_ROW fp32 words) and a flag a task; the level-2 records
+    partition, row) x ATTN_PART_ROW fp32 words) and a flag a task, (request, head,
+    first row tile, partition): the tasks of one partition's row tiles finish apart,
+    so each has its own flag; the level-2 records
     ((request, head, row tile, group, row16) x ATTN_PART_ROW words) and a flag each."""
     R = tokens // q_len
     rows = attn_rows(q_len)
@@ -117,7 +119,7 @@ def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
     return pair_layout(
         [
             ("attn_part", part_words // 2),
-            ("attn_pflag", R * LOCAL_KV_HEADS * ATTN_MAX_PARTS),
+            ("attn_pflag", R * LOCAL_KV_HEADS * tiles * ATTN_MAX_PARTS),
             ("attn_l2", l2_words // 2),
             ("attn_l2flag", R * LOCAL_KV_HEADS * tiles * ATTN_MERGE_GROUPS),
             ("attn_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),

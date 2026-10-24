@@ -76,6 +76,11 @@ NEG = -1.0e30  # a masked score, and "no key yet" of a row's running max
 NO_MAX = -1.0e29  # a running max below this is "no key yet": exp2 then takes 0
 O_OFF = 4  # a partial row: m, l, pad, pad, O[64] (O 16 B aligned)
 COMB_ROW = PART_ROW  # a tile row's (m, l, pad, pad, O[64]) in the LDS tree
+# the ring's wait at a chunk's head: chunk cc + 1's four DMAs may stay in flight
+# (SGLANG_AMD_MONO_ATTN_RING_WAIT0=1: wait for both chunks, a diagnostic)
+import os as _os
+
+RING_WAIT = 0 if _os.environ.get("SGLANG_AMD_MONO_ATTN_RING_WAIT0", "0") == "1" else 4
 MERGE_LANES = 4  # partitions folded side by side a (row, 8 dims): 16 x 8 x 4 = THREADS
 PAGE_WORDS = 16 * HEAD_DIM // 4  # a 16-key fp8 page of one head in LDS: 1 KB, chunk-major (dims 16 c .., key)
 V_SKEW = 16  # words between the two V pages beyond a page: the transposed reads of both hit distinct banks
@@ -208,6 +213,13 @@ def run_kattn(c, o_flag=None):
         lo, hi = chunk_range(seq_len_of(r), 0)
         return ((hi - lo) * CHUNK + part - 1) // part
 
+    def pflag_at(r, h, rt, p):
+        """Pair index of the flag of the task holding row tile ``rt`` of (request r,
+        head h) over partition p: a task's own (its first tile's), not the
+        partition's: the tasks of a partition's row tiles finish apart (a merge
+        that took the first one's flag read the other tiles' rows of the last layer)."""
+        return ((r * LOCAL_KV_HEADS + h) * ROW_TILES + (rt // NT) * NT) * MAX_PARTS + p
+
     def part_row(r, h, p, row):
         """Float index of (request r, head h, partition p)'s row record."""
         return (((r * LOCAL_KV_HEADS + h) * MAX_PARTS + p) * ROWS + row) * PART_ROW
@@ -326,7 +338,7 @@ def run_kattn(c, o_flag=None):
                 sl = (cc - b_lo) % 2
                 slot = wring + sl * SLOT_WORDS
                 key0 = cc * CHUNK + ks * KEYS_PER_WAVE
-                rocdl.s_waitcnt(vmcnt=2 * KEY_TILES)  # chunk cc's pages landed (cc + 1's in flight)
+                rocdl.s_waitcnt(vmcnt=RING_WAIT)  # chunk cc's pages landed (cc + 1's in flight)
                 # the chunk's K operands (tile kt, step: key l16, dims 32 step + 8 g4)
                 kb = []
                 for kt in range_constexpr(KEY_TILES):
@@ -448,7 +460,7 @@ def run_kattn(c, o_flag=None):
         release_stores()
         gpu.barrier()
         if tid == 0:
-            put(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS + p, fx.Int32(1))
+            put(pflag, pflag_at(r, h, rt0, p), fx.Int32(1))
 
     # the tasks, request-major over the requests' own partition counts (a short
     # request has few): job -> (request, head, tile pair, partition) through the
@@ -535,7 +547,7 @@ def run_kattn(c, o_flag=None):
         ppg = (np_r + GROUPS - 1) // GROUPS
         p_lo = g * ppg
         cnt = fx.max(fx.min(np_r - p_lo, ppg), fx.Int32(0))
-        poll_flags(c, [(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS + p_lo, cnt)])
+        poll_flags(c, [(pflag, pflag_at(r, h, rt, p_lo), cnt)])
         row = fx.min(rt * 16 + row16, ROWS - 1)
         m = fx.Float32(NEG)
         l = fx.Float32(0.0)
@@ -572,7 +584,7 @@ def run_kattn(c, o_flag=None):
         # the source records: the partitions themselves (at most GROUPS of them), or
         # the level-1 records; one resource over the selected base address
         if direct:
-            poll_flags(c, [(pflag, (r * LOCAL_KV_HEADS + h) * MAX_PARTS, np_r)])
+            poll_flags(c, [(pflag, pflag_at(r, h, rt, 0), np_r)])
         else:
             poll_flags(c, [(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS, GROUPS)])
         r_src = rsrc(direct.select(part_w.value, l2_w.value))

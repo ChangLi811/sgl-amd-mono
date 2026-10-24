@@ -26,7 +26,7 @@ def main():
     MAXB = 65536
     k_cache = torch.zeros(PAGES * 16, *k_rows.shape[1:], dtype=k_rows.dtype, device=dev)
     v_cache = torch.zeros_like(k_cache)
-    which = sys.argv[3] if len(sys.argv) > 3 else "fresh"
+    which = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "fresh"
     if which == "served":
         pages = d["pages"].to(dev).to(torch.int32)  # the served page ids (the cache sized to hold them)
         k_cache = torch.zeros(int(pages.max()) * 16 + 16, *k_rows.shape[1:], dtype=k_rows.dtype, device=dev)
@@ -50,7 +50,12 @@ def main():
     e[guard.GUARD_DEADLINE + 1] = ticks >> 32
     launch = build_kattn(KAttnBuild(tokens=rows, q_len=ql))
     scale_bits = struct.unpack("i", struct.pack("f", d["scale"]))[0]
+    cold = "--cold" in sys.argv
+    flush = torch.empty(2 * 2**30, dtype=torch.uint8, device=dev) if cold else None
     for it in range(iters):
+        if cold:
+            flush.fill_(it & 0xFF)  # evict the caches: the K / V reads come from HBM
+            torch.cuda.synchronize()
         o.fill_(float("nan"))
         launch(
             q.data_ptr(), o.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), table.data_ptr(), MAXB, table.numel() * 4,
