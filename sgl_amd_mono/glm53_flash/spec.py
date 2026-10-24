@@ -91,6 +91,7 @@ SGLANG_READS = {
     "srt/environ.py": (
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
         "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+        "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK",
     ),
     "srt/configs/model_config.py": ("context_len",),
     "srt/distributed/parallel_state.py": ("cpu_group",),
@@ -180,8 +181,8 @@ NUMERICS = Numerics(
         "kda.state.cosine": 0.9999,
         "dsa.streams.cosine": 0.95,
         "dsa.kv.cosine": 0.995,
+        # the completed index pools' keys, dequantized (FP8 value x pool scale)
         "dsa.index.cosine": 0.999,
-        "dsa.index_scale.rel": 0.01,
         "dsa.tail_k.cosine": 0.9999,
         "dsa.tail_g.cosine": 0.9999,
     },
@@ -741,6 +742,9 @@ SPEC = MonoSpec(
             # benchmark routing overrides: the kernel routes with the model's own router
             "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
+            # the kernel breaks router ties in AITER's grouped top-k order, the path
+            # SGLang takes with this off; on, its Triton gate keeps the lower expert id
+            "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK": False,
         },
     ),
     numerics=NUMERICS,

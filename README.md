@@ -116,6 +116,7 @@ If the model, GPU or configuration is not supported, the server refuses to start
 sgl-amd-mono/
 ├── sgl_amd_mono/
 │   ├── common/          # HIP device runtime: guarded waits, epochs, peer memory
+│   ├── deepseek_v4/     # DeepSeek-V4-Pro; spec and kernels land in its PR
 │   ├── deepseek_v41/
 │   │   ├── spec.py      # target model: spec and forward
 │   │   ├── draft.py     # DSpark draft model: spec and forward
@@ -151,10 +152,11 @@ pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or 
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k minimax_m3                      # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
-pytest test/kernels test/e2e -k kimi_k3                      # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
+pytest test/kernels test/e2e -k kimi_k3                         # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
 ```
 
-Kimi-K3 runs at TP8, so its kernel checks need 8 GPUs where DeepSeek-V4.1's need 4.
+
+Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8`.
 
 ## Contributing
 
