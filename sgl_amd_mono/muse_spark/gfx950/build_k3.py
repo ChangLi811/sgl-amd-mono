@@ -42,6 +42,7 @@ class K3Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
     trace: bool = False
     fp8_unpool: bool = False  # w_unpool is a packed FP8 copy (codes, then fp32 row scales)
+    tpx: bool = False  # TP experts: w13 / s13 / w2 / s2 are the rank's slices of every expert (ffn module notes)
 
 
 def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict, layer=None) -> dict:
@@ -84,7 +85,17 @@ def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, la
         "own_unp": preg(sym, unp_off, "unp"),
         "peer_ffn": [preg(base, ffn_off, "ffn") for base in bases],
         "peer_unp": [preg(base, unp_off, "unp") for base in bases],
+        "tpx": key.tpx,
+        "start_of": lds.start_of.ptr,
     }
+    if key.tpx:
+        c.update(ffn.tpx_dims(npes))
+        for region in ("midx", "vx", "ssx"):
+            off = sym_layout[region][0]
+            c["own_" + region] = preg(sym, off, region)
+            c["peer_" + region] = [preg(base, off, region) for base in bases]
+    else:
+        c.update(ug_t=ffn.UG_T, dn_t=ffn.DN_T, up_row0=ffn.INTER, w13_rows=2 * ffn.INTER, w2_rows=ffn.MOE_HIDDEN)
     for region, (off, _) in layout.items():
         c[region[3:]] = sreg(scratch, off, region)  # "k3_mid" -> c["mid"]
     return c
@@ -105,7 +116,7 @@ def build_k3(key: K3Build):
     last-layer rule, when the build did not compile it in)."""
     S, npes = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= npes <= WAVES, (S, npes)
-    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_unpool))
+    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_unpool), x=int(key.tpx))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = ffn.k3_scratch_layout()

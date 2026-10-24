@@ -106,6 +106,10 @@ SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_MUSE_SKIP", "0") == "1"
 # set a layer) and a thread snapshots the stamps to <dir>/rank<r>.pt every few seconds
 # (``test/kernels/report_muse_spark_trace.py``). A diagnostic: the stamps cost a little.
 TRACE_DIR = os.environ.get("SGLANG_AMD_MONO_MUSE_TRACE", "")
+# SGLANG_AMD_MONO_MUSE_TPX=1: TP experts (ATOM's TP-sharded MoE): every rank works every
+# pick on its slices of every expert (weights.tp_expert_copies, ~0.8 GB a layer), so no
+# rank waits on another's expert load
+TPX = os.environ.get("SGLANG_AMD_MONO_MUSE_TPX", "0") == "1"
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -160,6 +164,19 @@ class MuseMonoRunner:
         _ensure_writable_flydsl_cache()
         assert len(views) == len(modules) == len(boundaries) <= LAYER_SLOTS
         self.views, self.modules, self.boundaries = list(views), list(modules), list(boundaries)
+        self.tpx = TPX and USE_KERNELS
+        self.tpx_w = [None] * len(self.views)
+        if self.tpx:
+            import time
+
+            from sglang.srt.runtime_context import get_parallel
+
+            from sgl_amd_mono.muse_spark.weights import tp_expert_copies
+
+            t0 = time.time()
+            self.tpx_w = tp_expert_copies(self.views, self.modules, rank, npes, get_parallel().tp_group.device_group if npes > 1 else None)
+            gb = sum(sum(t.numel() for t in w) for w in self.tpx_w if w is not None) / 2**30
+            print(f"[muse mono] rank {rank}: TP experts copies {gb:.1f} GiB in {time.time() - t0:.1f} s", flush=True)
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
         self.use_layer = USE_LAYER
@@ -251,7 +268,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K3 first reached")
             self._k3[rows] = build_k3(
-                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_unpool=self.fp8_dense)
+                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_unpool=self.fp8_dense, tpx=self.tpx)
             )
         return self._k3[rows]
 
@@ -264,9 +281,19 @@ class MuseMonoRunner:
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
                     fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
+                    tpx=self.tpx,
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]
+
+    def _experts(self, i: int) -> tuple:
+        """Layer ``i``'s w13, s13, w2, s2 pointers: EP's whole local experts, or under TP
+        experts the rank's slices of every expert."""
+        w = self.tpx_w[i] if self.tpx else None
+        if w is not None:
+            return tuple(_ptr(t) for t in w)
+        L = self.views[i]
+        return (_ptr(L.w13), _ptr(L.s13), _ptr(L.w2), _ptr(L.s2))
 
     def merged(self, i: int, rows: int, q_len: int) -> bool:
         """Layer ``i`` runs as one launch (the attention, K2, K3 and, when the next
@@ -475,8 +502,7 @@ class MuseMonoRunner:
                 _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta), _ptr(L.pre_w),
                 _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool_fp8 if self.fp8_dense else L.w_pool), _ptr(L.xn_w),
                 _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
-                int(self.modules[i].mlp.local_expert_start), _ptr(L.w13), _ptr(L.s13), _ptr(L.w2),
-                _ptr(L.s2), _ptr(L.pen_w), _ptr(L.pfw), _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw),
+                int(self.modules[i].mlp.local_expert_start), *self._experts(i), _ptr(L.pen_w), _ptr(L.pfw), _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw),
                 _ptr(L.w_unpool_fp8 if self.fp8_dense else L.w_unpool), _ptr(self.attn_in), _ptr(self.scratch_k3),
                 _ptr(L1.w_qkvg), _ptr(cos_sin1), _ptr(positions), _ptr(slots), _ptr(m), k_cache1,
                 v_cache1, _ptr(self.k), _ptr(self.v), _ptr(self.scratch_k1), int(L1.use_rope),
@@ -499,7 +525,7 @@ class MuseMonoRunner:
         )  # fmt: skip
         self.k3_kernel(rows)(
             _ptr(self.xin), _ptr(self.ids), _ptr(self.scores), int(self.modules[i].mlp.local_expert_start),
-            _ptr(L.w13), _ptr(L.s13), _ptr(L.w2), _ptr(L.s2), _ptr(L.pen_w), _ptr(stream), _ptr(L.pfw),
+            *self._experts(i), _ptr(L.pen_w), _ptr(stream), _ptr(L.pfw),
             _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw), _ptr(L.w_unpool_fp8 if self.fp8_dense else L.w_unpool), _ptr(self.attn_in),
             _ptr(self.scratch_k3), self.peers.local, _ptr(self.peers.addresses), self.rank,
             _ptr(self.epoch), i, int(last), stream=cur,

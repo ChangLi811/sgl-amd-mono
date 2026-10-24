@@ -188,14 +188,9 @@ def sym_layout(npes: int) -> dict:
     unpooled rows [token][HIDDEN / 2] (each rank's rows from that rank). Shared
     by the layer: K2 pushes ``attn``, K3 ``ffn`` and ``unp``. The guard's peer
     flags follow at ``sym_bytes(npes)``."""
-    return pair_layout(
-        [
-            ("attn", npes * MAX_TOKENS * HIDDEN // 2),
-            ("ffn", npes * MAX_TOKENS * MOE_HIDDEN // 2),
-            ("unp", MAX_TOKENS * HIDDEN // 2),
-        ],
-        align=256,
-    )
+    from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_sym_layout
+
+    return k3_sym_layout(npes)  # one layout: K3's (attn, ffn, unp, then the TP-experts regions)
 
 
 def sym_bytes(npes: int) -> int:

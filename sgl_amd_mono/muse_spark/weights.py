@@ -401,3 +401,46 @@ class LayerViews(msgspec.Struct, frozen=True):
             w_pool_fp8=_fp8_dense(moe.pre_expert_proj.weight, i, "pooler", copies) if FP8_DENSE else None,
             w_unpool_fp8=_fp8_dense(moe.post_expert_proj.weight, i, "unpooler", copies) if FP8_DENSE else None,
         )
+
+
+def tp_expert_copies(views, modules, rank: int, npes: int, group) -> list:
+    """TP experts (``K3Build.tpx``, ATOM's TP-sharded MoE): for every kernel layer, this
+    rank's slices of every expert -- the gate and up rows of its INTER / TP
+    intermediate columns and the down rows of its MOE_HIDDEN / TP output columns,
+    with their scales -- as (w13, s13, w2, s2) [EXPERTS, rows, bytes] in global
+    expert order; None for a layer the kernels do not run. EP holds whole experts
+    a rank, so the slices come from every rank: one all-to-all a tensor over the TP
+    device group (``group``). A copy: EXPERTS / TP x (INTER and MOE_HIDDEN slices)
+    is LOCAL_EXPERTS whole experts' bytes, ~0.8 GB a layer."""
+    import torch.distributed as dist
+
+    RS, CS = INTER // npes, MOE_HIDDEN // npes
+    out = []
+
+    def a2a(parts):
+        inp = torch.stack(parts).contiguous()
+        if npes == 1:
+            return inp
+        got = torch.empty_like(inp)
+        dist.all_to_all_single(got, inp, group=group)
+        return got
+
+    with torch.no_grad():
+        for i, L in enumerate(views):
+            if L.kind != "mxfp4" or L.w13 is None:
+                out.append(None)
+                continue
+            E = L.w13.shape[0]
+            start = int(modules[i].mlp.local_expert_start)
+            if E * npes != EXPERTS or start != rank * E:
+                raise ValueError(f"layer {i}: experts {E} a rank from {start} on rank {rank}: TP experts take EP's contiguous {EXPERTS // npes} a rank")  # fmt: skip
+
+            def rows13(t, d):
+                return torch.cat([t[:, d * RS : (d + 1) * RS], t[:, INTER + d * RS : INTER + (d + 1) * RS]], dim=1)
+
+            w13 = a2a([rows13(L.w13, d) for d in range(npes)]).reshape(EXPERTS, 2 * RS, -1)
+            s13 = a2a([rows13(L.s13, d) for d in range(npes)]).reshape(EXPERTS, 2 * RS, -1)
+            w2 = a2a([L.w2[:, d * CS : (d + 1) * CS] for d in range(npes)]).reshape(EXPERTS, CS, -1)
+            s2 = a2a([L.s2[:, d * CS : (d + 1) * CS] for d in range(npes)]).reshape(EXPERTS, CS, -1)
+            out.append((w13, s13, w2, s2))
+    return out
