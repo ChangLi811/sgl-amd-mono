@@ -40,6 +40,7 @@ launch once on real weights, not through FlyDSL's compile-only mode
 from __future__ import annotations
 
 import importlib.util
+import os
 from typing import Any
 
 import msgspec
@@ -350,6 +351,36 @@ NUMERICS = Numerics(
         # one row has the least averaging.
         "moe.out.cosine": 0.9998,
         "moe.out.rel": 0.02,
+        # SGLANG_AMD_MONO_CHECK, which scores K1 against SGLang's own
+        # attention on the real weights at TP8, over 28 steps of one request:
+        #
+        #   k1.core    cos 0.99999678  rel 0.0026
+        #   k1.bank    rel 0 (bit for bit); cos 0.99999982
+        #   k1.ssm     cos 0.99999976  rel 0.00033
+        #   k1.window  cos 0.99999988  rel 0.00032
+        #
+        # The gated core output: the in-projection, f_b, the conv and the
+        # recurrence. Its reference sums in another order, so this is bf16
+        # rounding.
+        "k1.core.cosine": 0.99999,
+        "k1.core.rel": 0.004,
+        # The bank row the launch writes in place of AttnResidual.write. The
+        # same values in the same order, so it is exact: rel is what holds it
+        # to that, and DSpark's capture reads the bank, so a row that drifts
+        # changes the draft's input. The cosine bound is the looser of the two
+        # on purpose. Cosine of two 4608-wide bf16 rows carries its own
+        # rounding, measured down to 0.99999982 on rows that are bit for bit.
+        "k1.bank.cosine": 1.0 - 1e-6,
+        "k1.bank.rel": 0.0,
+        # The recurrent state staged for the step's verify rows.
+        "k1.ssm.cosine": 1.0 - 1e-6,
+        "k1.ssm.rel": 0.001,
+        # The conv window handed back to SGLang's speculative state, which the
+        # accept-time commit reads. Nothing in the serving path reports a wrong
+        # one: it shows up as a lower acceptance length and a GSM8K score a few
+        # points down. Measured exact, so the bound is tight on purpose.
+        "k1.window.cosine": 1.0 - 1e-6,
+        "k1.window.rel": 0.001,
     },
 )
 
@@ -584,6 +615,11 @@ class _Built:
         # This step's shared K1 state and the layers that took it, set by
         # _backbone before the first layer and read by _core and finish().
         self._k1_state, self._k1_engaged = None, []
+        # Read once: _core asks this for every layer of every step, and a
+        # served step must not pay for a check that is off.
+        self._check = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
+        # The conv windows waiting for finish(), under that flag only.
+        self._check_handoff = []
         self._shim = _LanguageModelShim(self)
 
     def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
@@ -629,6 +665,7 @@ class _Built:
         k1_batch = self._k1_by_width[self._plan.key.rows]
         self._k1_state = k1_mod.prepare(k1_batch, forward_batch)
         self._k1_engaged = []
+        self._check_handoff = []
         hidden = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
         start(forward_batch)
         zero_allocator = BumpAllocator(
@@ -648,6 +685,12 @@ class _Built:
         # Once a step, after the last layer: the conv inputs handed back to
         # SGLang's speculative window, which only reads them at accept.
         k1_mod.finish(k1_batch, self._k1_state, self._k1_engaged)
+        if self._check:
+            from sgl_amd_mono.kimi_k3 import check as check_mod
+
+            # The conv window is handed back once a step, so it is scored here
+            # and not in the layer that produced it.
+            check_mod.compare_handoff(self)
         hidden = final_norm(
             hidden, forward_batch, m._final_read, capture=None, skip_empty=True
         )
@@ -698,9 +741,22 @@ class _Built:
 
         state = self._k1_state
         if packed.k1 is not None and k1_mod.covered(packed.k1, hidden, bank, state):
+            ref = None
+            if self._check:
+                from sgl_amd_mono.kimi_k3 import check as check_mod
+
+                # Before K1, on the same input and the caches as they were.
+                ref = check_mod.reference(
+                    self, layer, packed, hidden, bank, forward_batch, zero_allocator
+                )
             set_written(hidden, forward_batch)
             self._k1_engaged.append(packed.i)
-            return k1_mod.launch(self.runner, packed.k1, hidden, bank, state)
+            core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state)
+            if self._check:
+                from sgl_amd_mono.kimi_k3 import check as check_mod
+
+                check_mod.compare(self, packed.i, core, ref, bank)
+            return core
         x = layer.attn_boundary.prepare(hidden, forward_batch, capture_gathered=None)
         return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
 

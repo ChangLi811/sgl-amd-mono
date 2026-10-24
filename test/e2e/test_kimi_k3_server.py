@@ -1,12 +1,15 @@
 """Kimi-K3 with --monokernel-backend amd on MI35x, TP8, across the switch point.
 
 The runtime serves one width here: a DSpark verify step of 8 rows at one
-request in flight. Two requests at a time step past it and back, so the tests
-run both sides of the switch. The startup line is checked first, because
-without it every other test could pass on the normal path alone. Then a short
-GSM8K run for gross failures, and the tokens of covered steps scored again by
-the normal prefill path (KL consistency). A fault on one rank stops the server
-before any token of the failed step is sent.
+request in flight. The server runs one request a step, so every decode step is
+that width and the launches cover all of them. That is deliberate. A second
+running request makes a 16-row step, which is wider than MAX_ROWS, and those
+steps take the standard path -- enough of them to average away a fault the
+launches have. The startup line is checked first, because without it every
+other test could pass on the normal path alone. Then a short GSM8K run for
+gross failures, and the tokens of covered steps scored again by the normal
+prefill path (KL consistency). A fault on one rank stops the server before any
+token of the failed step is sent.
 
 The kernel checks (``test/kernels/kimi_k3``) cover the launch's own outputs;
 this file covers what only a server shows: that the routing is live, that the
@@ -37,8 +40,11 @@ from sglang.test.test_utils import (
 from sgl_amd_mono import BACKEND
 
 LAUNCH_TIMEOUT = 3600
-# The normal path scores 0.985 to 0.990 on this recipe: the bound is for gross
-# failures, not for a regression of a question or two.
+# Both paths score 0.975 to 0.990 on this recipe, over three samples each, so
+# the bound is for gross failures and not for a regression of a question or
+# two. It does bite: a conv hand-off that was wrong for every covered layer
+# scored 0.870 to 0.915 here, while the same fault at --max-running-requests 2
+# scored 0.980 and passed.
 GSM8K_BOUND = 0.95
 # Decode against prefill on short prompts, mean KL.
 KL_BOUND = 0.03
@@ -90,8 +96,10 @@ class TestMonokernelKimiK3(CustomTestCase):
         self.assertIn(RUNS, log)
 
     def test_gsm8k_across_the_switch(self):
-        # Two requests at a time: the batch steps past the one covered width as
-        # it fills and back as it drains, so both paths run.
+        # The server runs one request a step, so every decode step is covered
+        # and nothing the launches get wrong is averaged with the standard
+        # path. The client still sends two at a time, which keeps the queue
+        # full; the server serialises them.
         metrics = run_eval_few_shot_gsm8k(
             type(
                 "Args",

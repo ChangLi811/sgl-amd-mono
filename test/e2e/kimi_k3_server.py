@@ -32,8 +32,13 @@ ARGS = [
     "fp8_e4m3",
     "--mem-fraction-static",
     "0.9",
+    # One request a step, so every decode step is 1 x 8 rows and the launches
+    # cover all of them. At 2 a step is 16 rows, which is wider than MAX_ROWS:
+    # the launch declines those steps and they take the standard path, which
+    # dilutes anything the launches get wrong. A GSM8K regression that is 9
+    # points at this setting reads as half a point at 2.
     "--max-running-requests",
-    "2",
+    "1",
     "--chunked-prefill-size",
     "4096",
     "--page-size",

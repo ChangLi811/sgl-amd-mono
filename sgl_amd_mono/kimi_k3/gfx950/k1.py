@@ -425,10 +425,18 @@ def finish(batch: Optional[K1Batch], st: Optional[dict], engaged: list) -> None:
     layer that engaged, in one write.
 
     SGLang's own accept-time commit reads this to advance the committed state.
-    ``view[s, j, k]`` aliases ``phys[s, j + k]``, so writing column CONV_W - 2
-    of steps 1.. lays down one entry each. The two writes are disjoint in the
-    physical buffer -- the first lands on entries 0 .. CONV_W - 2, the second
-    on the rest -- so the view's overlapping windows cannot alias between them.
+
+    This window is dense on a KDA model, so every one of its
+    ``qlen x (CONV_W - 1)`` entries has to be written. SGLang's
+    ``conv_window_dedup_enabled`` returns False whenever the model is KDA: the
+    deduplicated layout is one overlapping ``as_strided`` view, and KDA
+    transposes the window before the conv, which would corrupt its stores. Each
+    draft token therefore owns its window, and no entry is shared with another
+    token.
+
+    ``unfold`` gives token ``j`` the window ``conv[..., j : j + CONV_W - 1]``.
+    That is the same sliding read the overlapping layout expressed with its
+    strides, written out once per token because nothing here is shared.
 
     Masked to the engaged layers: a layer that declined ran SGLang's attention,
     which wrote this itself.
@@ -466,10 +474,20 @@ def finish(batch: Optional[K1Batch], st: Optional[dict], engaged: list) -> None:
             st["window"][batch.where],
         )
     view = st["inter_window"]
+    # The sequence the conv actually read, which is not what the buffer holds
+    # now. The launch rolls its state left by one and appends this step's
+    # projections, so conv[.., :win] is already the next step's window. The
+    # window prepare() staged is the one this step convolved against.
+    seq = torch.cat([window.mT, conv[:, :, win:]], dim=2)
+    # What SGLang commits for token j is the state after j, which is the last
+    # win entries up to and including j's own input. The conv reads
+    # seq[j .. j + win] for token j, so j's input is seq[j + win] and the
+    # window to hand back is seq[j + 1 .. j + win]. The last token's input is
+    # the final entry of seq, so every entry is used.
+    windows = seq.unfold(2, win, 1)[:, :, 1 : qlen + 1]
     # row stays a tensor and broadcasts against idx: reading it out would be a
     # host sync, which the capture this runs in rejects.
-    view[idx, row, 0] = window
-    view[idx, row, 1:, win - 1] = conv[:, :, win : batch.conv.shape[-1] - 1].mT
+    view[idx, row] = windows.permute(0, 2, 3, 1)
 
 
 def covered(packed: K1Layer, prefix, attn_res, state) -> bool:
