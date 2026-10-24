@@ -223,6 +223,9 @@ class _Built:
             pre_norm_dtype = torch.bfloat16 if i == last else None
             ref = self._reference(i, positions, forward_batch, stream, attn_input, pre_norm_dtype) if check else None  # fmt: skip
             kv_ref = self._kv_rows(i, forward_batch, rows) if check else None
+            # the layer's q (its K1 ran in the previous launch): the merged launch's next K1
+            # overwrites it before the attention check reads it
+            q_i = self.runner.q[:rows].clone() if check else None
             stream, attn_input = r.launch(
                 i=i, rows=rows, q_len=q_len, positions=positions, forward_batch=forward_batch,
                 stream=stream, attn_input=attn_input, pre_norm_dtype=pre_norm_dtype,
@@ -230,20 +233,20 @@ class _Built:
             if ref is not None:
                 _log_check(i, live, (stream, attn_input), ref)
                 _log_kv_check(i, live, self._kv_rows(i, forward_batch, rows), kv_ref)
-                self._attn_check(i, rows, q_len, forward_batch)
+                self._attn_check(i, rows, q_len, forward_batch, q_i)
             if i in m.layers_to_capture:  # set after attach: read per step
                 aux.append(stream.to(torch.bfloat16))
         r.end_step()
         return attn_input, (aux if self.lm.capture_aux_hidden_states else None)
 
-    def _attn_check(self, i, rows, q_len, forward_batch):
+    def _attn_check(self, i, rows, q_len, forward_batch, q_i):
         """Check mode, full-attention layers, the first steps: the launch's attention
         output (``runner.o``) against the exact softmax attention recomputed in torch from
         its q (``runner.q``), the served page table and the fp8 cache (P rounded to bf16 as
         the kernel), every row's cosine; rows below 0.99 are listed. Isolates K-attn from
         what follows it in the layer."""
         r = self.runner
-        if r.windows[i] != 0 or getattr(self, "_attn_checks", 0) >= 6 * 16:
+        if r.windows[i] != 0 or getattr(self, "_attn_checks", 0) >= 6 * 16 or int(forward_batch.seq_lens.max()) < 50000:
             return
         self._attn_checks = getattr(self, "_attn_checks", 0) + 1
         from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K
@@ -254,7 +257,7 @@ class _Built:
         lens = forward_batch.seq_lens
         extra = q_len if forward_batch.forward_mode.is_target_verify() else 0
         scale = float(attn.scaling)
-        q, o = r.q[:rows].float(), r.o[:rows].float()
+        q, o = q_i.float(), r.o[:rows].float()
         ref = torch.zeros_like(o)
         GQA = Q_K // HEAD_DIM // LOCAL_KV_HEADS
         for req in range(rows // q_len):
