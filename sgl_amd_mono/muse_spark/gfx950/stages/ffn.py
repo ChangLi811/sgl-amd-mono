@@ -602,10 +602,9 @@ def stage_plan(c):
 
 @flyc.jit
 def stage_plan_tpx(c):
-    """TP experts' plan (every rank alike): wave 0 walks the picks in rounds of 64 and,
-    a round, its distinct experts in ascending order (the lowest remaining one each
-    turn: a ballot of its picks, their columns from the expert's count in LDS, so a
-    pick's column is its rank among its expert's picks in pick order), then lays out
+    """TP experts' plan (every rank alike): wave 0 walks the picks in rounds of 64, a
+    pick's column its rank among its expert's picks in pick order (the round's
+    same-expert lanes from 8 ballots, the earlier rounds' count in LDS), then lays out
     the experts' starts in the sorted pick list (``pick_of``) and their column tiles
     of 16 in expert order. Returns the tiles."""
     S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
@@ -625,19 +624,22 @@ def stage_plan_tpx(c):
         ]
         cols = []
         for rr in range_constexpr(ROUNDS):
+            # a lane's same-expert lanes of the round by the expert id's 8 bits (a
+            # ballot a bit: a fixed cost, where a turn a distinct expert took 6.8 us
+            # at 64 picks); its column = the expert's count of the earlier rounds +
+            # its same-expert lanes below it (pick order, alike on every rank); the
+            # round's lowest lane of an expert moves the expert's count
             e = ids[rr]
-            todo = (rr * 64 + lane < PICKS).select(fx.Int32(1), fx.Int32(0))
-            col = fx.Int32(0)
-            while ballot(todo != 0) != 0:
-                e0 = butterfly((todo != 0).select(e, fx.Int32(EXPERTS)), (32, 16, 8, 4, 2, 1), fx.min)
-                hit = (todo != 0) & (e == e0)
-                m = ballot(hit)
-                base = uniform(fx.ptr_load(cnt_of + e0))
-                col = hit.select(base + lanes_before(m, lane), col)
-                if lane == 0:
-                    fx.ptr_store(base + uniform(popcount(m)), cnt_of + e0)
-                todo = hit.select(fx.Int32(0), todo)
-            cols.append(col)
+            valid = rr * 64 + lane < PICKS
+            m = ballot(valid)
+            for bit in range_constexpr(8):
+                on = (e >> bit) & 1
+                m = m & (ballot(on == 1) ^ (fx.Int64(on) - fx.Int64(1)))  # its own bit's lanes
+            below = lanes_before(m, lane)
+            base = fx.ptr_load(cnt_of + e)
+            cols.append(base + below)
+            if valid & (below == 0):
+                fx.ptr_store(base + popcount(m), cnt_of + e)
         # the experts' starts and tiles: EPL experts a lane, an exclusive prefix over the lanes
         cn = [fx.ptr_load(cnt_of + (lane * EPL + k)) for k in range(EPL)]
         tl = [(fx.min(cn[k], fx.Int32(COLS)) + TILE_COLS - 1) // TILE_COLS for k in range(EPL)]
