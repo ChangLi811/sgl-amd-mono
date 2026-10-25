@@ -288,6 +288,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     defer_k1: bool = False  # the next K1 folds the FFN boundary's norms itself (needs next_k1)
     xq_pre: bool = True  # K2's xn hands K3 the expert input as MXFP4 blocks (S <= 16; K3Build.xq_pre)
     ug_dyn: bool = False  # K3's ug items from a launch-wide queue (with xq_pre; K3Build.ug_dyn)
+    pshard: bool = False  # the pooler sharded by rows over the ranks (K2Build.pshard; npes == 8)
 
 
 def build_layer(key: LayerBuild):
@@ -312,14 +313,15 @@ def build_layer(key: LayerBuild):
 
     S, QL, W, next_k1, last = key.tokens, key.q_len, key.npes, key.next_k1, key.last
     assert 1 <= S <= MAX_TOKENS and S % QL == 0 and QL in (1, 8) and 1 <= W <= guard.FLAG_WORDS
-    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16))  # fmt: skip
+    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard))  # fmt: skip
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
     defer = key.defer_k1 and next_k1
     k1_key = K1Build(S, fault_site, fault_after, tr, defer)
     ka_key = KAttnBuild(S, QL, fault_site=fault_site, fault_after=fault_after, trace=tr)
     xq = key.xq_pre and S <= 16
-    k2_key = K2Build(S, W, fault_site, fault_after, tr, key.fp8_dense, defer, xq)
+    assert not key.pshard or (W == 8 and not key.fp8_dense), "the sharded pooler: TP 8, bf16"
+    k2_key = K2Build(S, W, fault_site, fault_after, tr, key.fp8_dense, defer, xq, key.pshard)
     ugd = key.ug_dyn and xq and S >= 16  # (S = 8: neutral, 3.3 items a CTA; S = 16: -0.2 ms a step)
     k3_key = K3Build(S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq, ugd)
     k1_layout, ka_layout = k1_scratch_layout(), kattn_scratch_layout(S, QL)

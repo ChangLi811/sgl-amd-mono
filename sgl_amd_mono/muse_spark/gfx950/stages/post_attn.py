@@ -129,6 +129,9 @@ P_NS = 10  # 24 x 10 = 240 row tiles
 P_NC = 2  # 8 x 2 = 16
 assert 24 * P_NS + 8 * P_NC == MOE_HIDDEN // ROWS and P_NS <= P_SUB + 2
 P_PARTS = R_PARTS  # the pooler's K split is the router's: a CTA's two tasks share a K eighth of x
+from sgl_amd_mono.muse_spark.gfx950.stages.ffn import POOL_PARTS  # noqa: E402
+
+assert POOL_PARTS == P_PARTS
 P_STEPS = K_STEPS // WAVES  # 4 MFMA steps a wave a (row tile, token tile): a part's K over the waves
 A_PARTS_MAX = 8  # CTAs a token's attention boundary at most
 A_PAIRS_MAX = HIDDEN // (2 * THREADS)  # 8: a thread's column pairs with the whole row on one CTA
@@ -689,11 +692,18 @@ def stage_passes(c, rt0, part, pool_w, router_w, r_tile, is_router, nsub):
                         rp = (tid % (ROWS // 2)) * 2
                         if tk < nt:
                             prow = (rt0 + ti) * ROWS + rp
-                            put_bf(
-                                pool,
-                                (part * MAX_TOKENS + t0 + tk) * MOE_HIDDEN + prow,
-                                [row_sum(rb, rp, tk) * pool_scale(c, prow), row_sum(rb, rp + 1, tk) * pool_scale(c, prow + 1)],
-                            )
+                            if const_expr(c["pshard"]):
+                                # the rank's rows of the pooled row: every rank's ``poolx``
+                                grow = c["rank"] * (MOE_HIDDEN // c["W"]) + prow
+                                vals = [row_sum(rb, rp, tk), row_sum(rb, rp + 1, tk)]
+                                for pe in range_constexpr(c["W"]):
+                                    put_bf(c["peer_poolx"][pe], (part * MAX_TOKENS + t0 + tk) * MOE_HIDDEN + grow, vals)
+                            else:
+                                put_bf(
+                                    pool,
+                                    (part * MAX_TOKENS + t0 + tk) * MOE_HIDDEN + prow,
+                                    [row_sum(rb, rp, tk) * pool_scale(c, prow), row_sum(rb, rp + 1, tk) * pool_scale(c, prow + 1)],
+                                )
                 else:
                     # the router tile's partial logits: thread (token tk, expert row r)
                     if is_router & (tid < ROWS * TILE):
@@ -802,6 +812,8 @@ def stage_xn(c, t, xin_flag=None):
     thread, the K parts' partial rows summed), weight ``xn_w``, one bf16 rounding
     -> the expert input."""
     tid, poll, put, pool = c["tid"], c["poll"], c["put"], c["pool"]
+    if const_expr(c["pshard"]):
+        pool = c["own_poolx"]  # every rank's row slice, pushed here
     a = c["args"]
     e0 = tid * 8
     # the P_PARTS K-eighths' pooled rows (bf16 pairs), summed in part order, one round
@@ -875,12 +887,18 @@ def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     stamp(c, 3)  # the boundary part done (boundary CTAs)
     # the small pooler job (P_NC row tiles past the stream CTAs' 24 P_NS), K eighth bid % 8
     part = bid % P_PARTS
-    rt0 = 24 * P_NS + P_NC * ((bid - CHAIN0) // P_PARTS)
-    pool_w = pool_w_loads(c, rt0, part, P_NC)
+    if const_expr(c["pshard"]):
+        # the sharded pooler: a rank's 512 rows are 32 tiles a K part, one a CTA (24 stream, 8 chain)
+        nsub = 1
+        rt0 = 24 + (bid - CHAIN0) // P_PARTS
+    else:
+        nsub = P_NC
+        rt0 = 24 * P_NS + P_NC * ((bid - CHAIN0) // P_PARTS)
+    pool_w = pool_w_loads(c, rt0, part, nsub)
     rocdl.sched_barrier(0)
     wait_x(c)
     stamp(c, 4)  # every token's x arrived
-    stage_passes(c, rt0, part, pool_w, None, fx.Int32(0), fx.Int32(0) == fx.Int32(1), P_NC)
+    stage_passes(c, rt0, part, pool_w, None, fx.Int32(0), fx.Int32(0) == fx.Int32(1), nsub)
     stamp(c, 5)  # the pooler passes done
     stamp(c, 6)  # (the pooled rows go out with the passes)
     if tok < S:
@@ -905,8 +923,9 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None):
     stamp(c, 3)  # (the boundary parts run on the chain CTAs)
     # the pooler job: P_NS row tiles of K eighth bid % 8 (the 24 stream CTAs of an eighth)
     part = bid % P_PARTS
-    rt0 = P_NS * (bid // P_PARTS)
-    pool_w = pool_w_loads(c, rt0, part, P_NS)
+    nsub = 1 if c["pshard"] else P_NS
+    rt0 = (bid // P_PARTS) * nsub
+    pool_w = pool_w_loads(c, rt0, part, nsub)
     rocdl.sched_barrier(0)
     wait_x(c)
     stamp(c, 4)  # every token's x arrived
@@ -914,7 +933,7 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None):
     # clamped; they stream while the first token tile's x lands): the same K eighth
     r_tile = fx.min((bid - R0) // R_PARTS, fx.Int32(R_TILES - 1))
     router_w = router_w_loads(c, r_tile, part)
-    stage_passes(c, rt0, part, pool_w, router_w, r_tile, (bid >= R0) & (bid < R0 + R_TASKS), P_NS)
+    stage_passes(c, rt0, part, pool_w, router_w, r_tile, (bid >= R0) & (bid < R0 + R_TASKS), nsub)
     stamp(c, 5)  # the router / pooler passes done
     stamp(c, 6)  # (the pooled rows go out with the passes)
     if bid < S:

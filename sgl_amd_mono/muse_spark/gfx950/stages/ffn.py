@@ -101,6 +101,8 @@ from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import (
     mxfp4_scale,
 )
 
+POOL_PARTS = 8  # the pooler's K parts (post_attn.P_PARTS)
+
 # ---------------------------------------------------------------- the plan
 COLS = MAX_TOKENS  # picking columns an expert can have: a token picks it at most once
 TILE_COLS = 16  # columns an expert item takes: the MFMA's N
@@ -232,6 +234,8 @@ def k3_sym_layout(npes: int) -> dict:
             ("midx", MAX_TOKENS * TOP_K * MID_PAIRS),
             ("vx", MAX_TOKENS * TOP_K * MOE_HIDDEN // 2),
             ("ssx", MAX_TOKENS * TOP_K * DN_T),
+            # the sharded pooler: every rank's partial pooled rows of its row slice, [K part][token][row]
+            ("poolx", POOL_PARTS * MAX_TOKENS * MOE_HIDDEN // 2),
         ],
         align=256,
     )

@@ -118,6 +118,9 @@ DEFER_K1 = os.environ.get("SGLANG_AMD_MONO_MUSE_DEFER_K1", "0") == "1"
 XQ_PRE = os.environ.get("SGLANG_AMD_MONO_MUSE_XQ_PRE", "1") == "1"
 # K3's ug items past the first from a launch-wide queue (with XQ_PRE, at 16 rows: C2 -0.2 ms a step, C1 neutral)
 UG_DYN = os.environ.get("SGLANG_AMD_MONO_MUSE_UG_DYN", "1") == "1"
+# the pooler sharded by rows over the 8 ranks (Kimi-K3's latent projection): 8.4 MB a layer a rank instead of 67;
+# the partial pooled rows go to every rank (=0: the replicated pooler)
+PSHARD = os.environ.get("SGLANG_AMD_MONO_MUSE_PSHARD", "1") == "1"
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -174,6 +177,8 @@ class MuseMonoRunner:
         self.views, self.modules, self.boundaries = list(views), list(modules), list(boundaries)
         self.tpx = TPX and USE_KERNELS
         self.tpx_w = None  # the TP-experts slices: built at bind, after SGLang sized the KV cache
+        self.pshard = PSHARD and self.npes == 8 and not self.fp8_dense
+        self.pool_rows = None  # the sharded pooler's row slices a layer: built at bind
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
         self.use_layer = USE_LAYER
@@ -255,7 +260,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K2 first reached")
             self._k2[rows] = build_k2(
-                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_pool=self.fp8_dense)
+                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_pool=self.fp8_dense, pshard=self.pshard)
             )
         return self._k2[rows]
 
@@ -278,7 +283,7 @@ class MuseMonoRunner:
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
                     fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
-                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE, ug_dyn=UG_DYN,
+                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE, ug_dyn=UG_DYN, pshard=self.pshard,
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]
@@ -302,6 +307,13 @@ class MuseMonoRunner:
         gb = sum(sum(t.numel() for t in w) for w in self.tpx_w if w is not None) / 2**30
         free1 = torch.cuda.mem_get_info(self.device)[0]
         print(f"[muse mono] rank {self.rank}: TP experts slices {gb:.1f} GiB in {time.time() - t0:.1f} s; device free {free0 / 2**30:.1f} -> {free1 / 2**30:.1f} GiB", flush=True)  # fmt: skip
+
+    def _pool_w(self, i: int):
+        """Layer i's pooler for K2: the rank's row slice (sharded), the FP8 copy, or the weight."""
+        L = self.views[i]
+        if self.pshard:
+            return self.pool_rows[i]
+        return L.w_pool_fp8 if self.fp8_dense else L.w_pool
 
     def _experts(self, i: int) -> tuple:
         """Layer ``i``'s w13, s13, w2, s2 pointers: EP's whole local experts, or under TP
@@ -388,6 +400,11 @@ class MuseMonoRunner:
         self.backend, self.pool = backend, pool
         if self.tpx and self.tpx_w is None:
             self._build_tpx()
+        if self.pshard and self.pool_rows is None:
+            n = MOE_HIDDEN // self.npes
+            self.pool_rows = [
+                v.w_pool[self.rank * n : (self.rank + 1) * n].contiguous() if v.kind == "mxfp4" else None for v in self.views
+            ]  # fmt: skip
         if TRACE_DIR:
             # the pinned host buffers before any capture (no host allocation inside
             # one); the save thread is CPU-only, so it may run through the captures
@@ -521,7 +538,7 @@ class MuseMonoRunner:
             self.layer_kernel(rows, q_len, next_k1)(
                 _ptr(self.q), _ptr(self.o), *self._attn_args(i, rows, forward_batch, q_len),
                 _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta), _ptr(L.pre_w),
-                _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool_fp8 if self.fp8_dense else L.w_pool), _ptr(L.xn_w),
+                _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(self._pool_w(i)), _ptr(L.xn_w),
                 _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
                 int(self.modules[i].mlp.local_expert_start), *self._experts(i), _ptr(L.pen_w), _ptr(L.pfw), _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw),
                 _ptr(L.w_unpool_fp8 if self.fp8_dense else L.w_unpool), _ptr(self.attn_in), _ptr(self.scratch_k3),
@@ -540,7 +557,7 @@ class MuseMonoRunner:
         )  # fmt: skip
         self.k2_kernel(rows)(
             _ptr(self.o), _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta),
-            _ptr(L.pre_w), _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(L.w_pool_fp8 if self.fp8_dense else L.w_pool),
+            _ptr(L.pre_w), _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(self._pool_w(i)),
             _ptr(L.xn_w), _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
             self.peers.local, _ptr(self.peers.addresses), self.rank, _ptr(self.epoch), i, stream=cur,
         )  # fmt: skip
