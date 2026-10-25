@@ -870,6 +870,7 @@ def stage_dn(c, n_tiles, first=None):
         if ti != cur_t:
             gpu.barrier()  # every thread is done with the previous tile's columns
             stage_mid_q(c, e, col0, n)
+            stamp(c, 12)  # a tile's mids arrived (the CTA's last tile's survives)
             cur_t = ti
         nxt = dn_pair_loads(c, q0 + fx.min(i + 1, n_items - 1), n_tiles)
         xb = [xq_b(c, n, DN_CHUNKS, kc) for kc in range(DN_CHUNKS)]
@@ -1053,6 +1054,7 @@ def stage_fin_tpx(c, t, part):
         [(vx, (t * TOP_K + sl) * (MOE_HIDDEN // 2) + col // 2, PPT) for sl in range(TOP_K)]
         + [(ssx, (t * TOP_K + wave) * DN_T + 2 * lane, 2)]
     )  # fmt: skip
+    stamp(c, 13)  # the token's v and sums of squares arrived
     tot = got[TOP_K][0].bitcast(fx.Float32) + got[TOP_K][1].bitcast(fx.Float32)
     tot = butterfly(tot, (1, 2, 4, 8, 16, 32))
     if lane == 0:

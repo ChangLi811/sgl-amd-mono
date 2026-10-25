@@ -11,8 +11,8 @@ import torch
 BLOCKS, SLOTS, TRACE_LAYERS = 256, 16, 64
 STAMPS = {
     "attn": ["entry", "tasks done", "merge done", "loop begins", "first chunk", "loop done"],
-    "k2": ["entry", "og", "o done", "a_part", "x arrived", "passes", "pooled", "end"],
-    "k3": ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end", "unp flags", "unp dma", "unp mfma", "unp pushed"],
+    "k2": ["entry", "og", "o done", "a_part", "x arrived", "passes", "pooled", "end", "ar polled", "ss polled"],
+    "k3": ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end", "unp flags", "unp dma", "unp mfma", "unp pushed", "dn mids", "fin polled"],
     "k1": ["entry", "x ready", "gemv done", "head/gate done"],
 }
 WINDOW_US = 600.0  # a launch's stamps lie within this of its latest entry (older ones: the previous step)

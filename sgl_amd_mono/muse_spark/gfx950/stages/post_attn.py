@@ -475,6 +475,7 @@ def stage_a_part(c, t, part):
         [(own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW) for q in range(PAIRS // PW) for src in range(W)],
         batch=max(8, (PAIRS // PW) * W),
     )
+    stamp(c, 8)  # every rank's partial o rows arrived (thread 0's columns)
     v = []
     for j in range_constexpr(PAIRS):
         acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
@@ -499,6 +500,7 @@ def stage_a_part(c, t, part):
         if tid < 4:
             put(ss_mb, (t * A_PARTS_MAX + part) * 4 + tid, (tid == 0).select(ssp, (tid == 1).select(A_, (tid == 2).select(B_, C_))))
         got = poll([(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)] + [(ss_mb, (t * A_PARTS_MAX + q) * 4 + 2, 2) for q in range(A_PARTS)], batch=2 * A_PARTS)  # fmt: skip
+        stamp(c, 9)  # the parts' norm sums arrived
         tot, At, Bt, Ct = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
         for q in range_constexpr(A_PARTS):
             tot = tot + got[q][0].bitcast(fx.Float32)
