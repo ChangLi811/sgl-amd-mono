@@ -73,9 +73,46 @@ def _worker(rank, rows, tpx, port, q):
         torch.cuda.synchronize()
         dist.barrier()
         epoch = _epoch(dev)
-        launch = build_k3(K3Build(tokens=rows, npes=NP, tpx=tpx))
+        trace = os.environ.get("K3_TRACE", "0") == "1"
+        launch = build_k3(K3Build(tokens=rows, npes=NP, tpx=tpx, trace=trace))
         new_ref, attn_ref = _reference_all(xin, ids, scores, dec13, dec2, w, stream)
         got = stream.clone()
+        if trace:
+            # back-to-back launches (the ranks pace each other through the mailboxes), the
+            # mean launch time, and every CTA's stamps of the last launch
+            args = (
+                xin.data_ptr(), ids.data_ptr(), scores.data_ptr(), local_start,
+                kw13.data_ptr(), ks13.data_ptr(), kw2.data_ptr(), ks2.data_ptr(),
+                w["pen_w"].data_ptr(), got.data_ptr(), w["pfw"].data_ptr(),
+                w["alpha"].data_ptr(), w["beta"].data_ptr(), w["npw"].data_ptr(),
+                w["w_unpool"].data_ptr(), attn_out.data_ptr(), scratch.data_ptr(),
+                peers.local, peers.addresses.data_ptr(), rank, epoch.data_ptr(), LAYER, 0,
+            )  # fmt: skip
+            st = torch.cuda.current_stream()
+            for _ in range(5):
+                launch(*args, stream=st)
+                epoch[0] += 1
+            torch.cuda.synchronize()
+            dist.barrier()
+            n = int(os.environ.get("K3_ITERS", "30"))
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            for _ in range(n):
+                launch(*args, stream=st)
+                epoch[0] += 1
+            e1.record()
+            torch.cuda.synchronize()
+            from sgl_amd_mono.common.plan import BLOCKS
+            from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS
+
+            off, nbytes = k3_scratch_layout()["k3_trace"]
+            t = scratch[off : off + nbytes].view(torch.int64)[: TRACE_LAYERS * BLOCKS * TRACE_SLOTS]
+            t = t.reshape(TRACE_LAYERS, BLOCKS, TRACE_SLOTS)[LAYER % TRACE_LAYERS].cpu()
+            out = os.environ.get("K3_TRACE_OUT", "/tmp")
+            torch.save({"stamps": t, "launch_us": e0.elapsed_time(e1) * 1000 / n, "rows": rows, "tpx": tpx, "ids": ids.cpu()}, os.path.join(out, f"k3trace_r{rank}.pt"))
+            q.put((rank, [0, 0, 0], 1.0, 1.0, 0.0))
+            peers.close()
+            return
         for step in range(2):
             got.copy_(stream)
             torch.cuda.synchronize()
@@ -140,7 +177,32 @@ def test_k3_tp8(rows, tpx):
         assert bad == 0.0 and cos >= 0.996 and cos_a >= 0.996, f"rank {rank}: stream cosine {cos:.5f}, attention input {cos_a:.5f}, {bad:.2%} off"  # fmt: skip
 
 
+def report(out, rows):
+    """The traced launches' stage times (median / last CTA, us from the first entry)
+    on rank 0, and the ug / dn ends a die (CTA bid % 8) on every rank."""
+    names = {0: "entry", 2: "plan", 3: "ug done", 4: "dn done", 12: "dn mids", 5: "fin done", 13: "fin polled", 6: "unpool done", 7: "end"}
+    for r in range(NP):
+        d = torch.load(os.path.join(out, f"k3trace_r{r}.pt"))
+        t = d["stamps"].double()
+        base = t[:, 0][t[:, 0] != 0].min()
+        cells = []
+        for i, nm in names.items():
+            v = t[:, i]
+            v = (v[v != 0] - base) / 100.0
+            if v.numel():
+                cells.append(f"{nm} {v.median().item():5.1f}/{v.max().item():5.1f}")
+        ug = (t[:, 3] - base) / 100.0
+        dn = (t[:, 4] - base) / 100.0
+        xu = [round(ug[x::8][t[x::8, 3] != 0].mean().item(), 1) for x in range(8)]
+        xd = [round(dn[x::8][t[x::8, 4] != 0].mean().item(), 1) for x in range(8)]
+        print(f"rank {r}: launch {d['launch_us']:.1f} us | " + " | ".join(cells))
+        print(f"   ug done a die {xu}; dn done a die {xd}")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "report":
+        report(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 8)
+        sys.exit(0)
     rows = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     tpx = (sys.argv[2] if len(sys.argv) > 2 else "tpx") == "tpx"
     for rank, errs, cos, cos_a, bad in run(rows, tpx):
