@@ -109,7 +109,9 @@ TRACE_DIR = os.environ.get("SGLANG_AMD_MONO_MUSE_TRACE", "")
 # SGLANG_AMD_MONO_MUSE_TPX=1: TP experts (ATOM's TP-sharded MoE): every rank works every
 # pick on its slices of every expert (weights.tp_expert_copies, ~0.8 GB a layer), so no
 # rank waits on another's expert load
-TPX = os.environ.get("SGLANG_AMD_MONO_MUSE_TPX", "0") == "1"
+# TP experts (every rank its slices of every expert, ~0.8 GB a layer more): 600 s AgentX C1 P90 +8%, C2 +22%
+# over EP (the EP skew); =0 keeps EP
+TPX = os.environ.get("SGLANG_AMD_MONO_MUSE_TPX", "1") == "1"
 # the merged launch's next K1 folds the FFN boundary's norms itself (no wait on the boundary's x)
 DEFER_K1 = os.environ.get("SGLANG_AMD_MONO_MUSE_DEFER_K1", "0") == "1"
 # K2 hands K3 the expert input pre-quantized, staged once a CTA (S <= 16); =0 restages a tile's columns
