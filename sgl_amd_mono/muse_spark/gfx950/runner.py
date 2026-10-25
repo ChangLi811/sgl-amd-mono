@@ -260,7 +260,7 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K2 first reached")
             self._k2[rows] = build_k2(
-                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_pool=self.fp8_dense, pshard=self.pshard)
+                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_pool=self.fp8_dense, pshard=self._pshard(rows))
             )
         return self._k2[rows]
 
@@ -283,7 +283,7 @@ class MuseMonoRunner:
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
                     fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
-                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE, ug_dyn=UG_DYN, pshard=self.pshard,
+                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE, ug_dyn=UG_DYN, pshard=self._pshard(rows),
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]
@@ -308,10 +308,16 @@ class MuseMonoRunner:
         free1 = torch.cuda.mem_get_info(self.device)[0]
         print(f"[muse mono] rank {self.rank}: TP experts slices {gb:.1f} GiB in {time.time() - t0:.1f} s; device free {free0 / 2**30:.1f} -> {free1 / 2**30:.1f} GiB", flush=True)  # fmt: skip
 
-    def _pool_w(self, i: int):
+    def _pshard(self, rows: int) -> bool:
+        """The sharded pooler at this width: S <= 16 only (with the boundary split, a 64-row
+        launch's waits never complete at TP 8 -- under investigation; 32 / 64 rows keep the
+        replicated pooler)."""
+        return self.pshard and rows <= 16
+
+    def _pool_w(self, i: int, rows: int):
         """Layer i's pooler for K2: the rank's row slice (sharded), the FP8 copy, or the weight."""
         L = self.views[i]
-        if self.pshard:
+        if self._pshard(rows):
             return self.pool_rows[i]
         return L.w_pool_fp8 if self.fp8_dense else L.w_pool
 
@@ -538,7 +544,7 @@ class MuseMonoRunner:
             self.layer_kernel(rows, q_len, next_k1)(
                 _ptr(self.q), _ptr(self.o), *self._attn_args(i, rows, forward_batch, q_len),
                 _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta), _ptr(L.pre_w),
-                _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(self._pool_w(i)), _ptr(L.xn_w),
+                _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(self._pool_w(i, rows)), _ptr(L.xn_w),
                 _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
                 int(self.modules[i].mlp.local_expert_start), *self._experts(i), _ptr(L.pen_w), _ptr(L.pfw), _ptr(L.alpha2), _ptr(L.beta2), _ptr(L.npw),
                 _ptr(L.w_unpool_fp8 if self.fp8_dense else L.w_unpool), _ptr(self.attn_in), _ptr(self.scratch_k3),
@@ -557,7 +563,7 @@ class MuseMonoRunner:
         )  # fmt: skip
         self.k2_kernel(rows)(
             _ptr(self.o), _ptr(self.g), _ptr(stream), _ptr(L.w_o), _ptr(L.alpha), _ptr(L.beta),
-            _ptr(L.pre_w), _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(self._pool_w(i)),
+            _ptr(L.pre_w), _ptr(L.gate_hi), _ptr(L.gate_lo), _ptr(L.bias), _ptr(self._pool_w(i, rows)),
             _ptr(L.xn_w), _ptr(self.ids), _ptr(self.scores), _ptr(self.xin), _ptr(self.scratch_k2),
             self.peers.local, _ptr(self.peers.addresses), self.rank, _ptr(self.epoch), i, stream=cur,
         )  # fmt: skip
