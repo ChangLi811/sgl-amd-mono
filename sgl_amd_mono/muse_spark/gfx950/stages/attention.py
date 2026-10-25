@@ -479,9 +479,21 @@ def run_kattn(c, o_flag=None):
             base = (r == rr).select(starts[rr], base)
         np_r = n_parts_of(r)
         local = job - base
-        p = local % np_r
-        rt0 = ((local // np_r) % TASK_TILES) * NT
-        h = (local // (np_r * TASK_TILES)) % LOCAL_KV_HEADS
+        # a partition's TASK_TILES tasks (its row tiles' groups) sit 8 jobs apart, on
+        # CTAs of one XCD (CTAs go to the XCDs in turn): they stream the same K / V
+        # pages at about the same time, so the later reads hit that XCD's L2 (before,
+        # the tasks were np_r apart, on different XCDs, each reading the pages from
+        # HBM). Groups of 8 partitions x TASK_TILES jobs; the last np_r % 8 partitions
+        # in a tail group.
+        j = local % (TASK_TILES * np_r)
+        h = (local // (TASK_TILES * np_r)) % LOCAL_KV_HEADS
+        full = (np_r // 8) * 8
+        g, w = j // (8 * TASK_TILES), j % (8 * TASK_TILES)
+        jt = j - TASK_TILES * full
+        tail = fx.max(np_r - full, fx.Int32(1))
+        in_full = j < TASK_TILES * full
+        p = in_full.select(g * 8 + w % 8, full + jt % tail)
+        rt0 = in_full.select(w // 8, jt // tail) * NT
         attn_task(r, h, rt0, p)
     stamp(c, 1)  # the attention tasks done
 
