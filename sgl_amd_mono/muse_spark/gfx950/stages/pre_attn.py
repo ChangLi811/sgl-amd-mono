@@ -219,12 +219,13 @@ def stage_gemv_deferred(c, rg, kpart, w):
             r1.append(row_sum(red + ((idx % G_ROWS) // ROWS) * RED_FLOATS, (idx % G_ROWS) % ROWS, idx // G_ROWS))
         gpu.barrier()
         # ---- c2 from the unpooled rows of this lane's token and steps
-        got = d_poll([(d_unp, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2, 4) for kc in range(K_STEPS)])
+        # (two pairs a spec: a poll load is at most four dwords)
+        got = d_poll([(d_unp, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2 + 2 * hf, 2) for kc in range(K_STEPS) for hf in range(2)])
         ub = []
         for kc in range_constexpr(K_STEPS):
             words = []
             for q in range_constexpr(4):
-                lo, hi = bf2_f32(got[kc][q])
+                lo, hi = bf2_f32(got[2 * kc + q // 2][q % 2])
                 vals = []
                 for h, u in ((0, lo), (1, hi)):
                     j = 2 * q + h
