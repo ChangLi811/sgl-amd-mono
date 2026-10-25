@@ -43,6 +43,7 @@ class K3Build(msgspec.Struct, frozen=True):
     trace: bool = False
     fp8_unpool: bool = False  # w_unpool is a packed FP8 copy (codes, then fp32 row scales)
     tpx: bool = False  # TP experts: w13 / s13 / w2 / s2 are the rank's slices of every expert (ffn module notes)
+    defer_k1: bool = False  # the boundary publishes a token's two norm scalars (``k3_nscal``) for the next K1
 
 
 def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict, layer=None) -> dict:
@@ -86,6 +87,7 @@ def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, la
         "peer_ffn": [preg(base, ffn_off, "ffn") for base in bases],
         "peer_unp": [preg(base, unp_off, "unp") for base in bases],
         "tpx": key.tpx,
+        "defer_k1": key.defer_k1,
         "start_of": lds.start_of.ptr,
     }
     if key.tpx:
@@ -116,7 +118,7 @@ def build_k3(key: K3Build):
     last-layer rule, when the build did not compile it in)."""
     S, npes = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= npes <= WAVES, (S, npes)
-    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_unpool), x=int(key.tpx))
+    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_unpool), x=int(key.tpx), d=int(key.defer_k1))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = ffn.k3_scratch_layout()

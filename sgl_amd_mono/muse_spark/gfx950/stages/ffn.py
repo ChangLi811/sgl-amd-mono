@@ -207,6 +207,7 @@ def k3_scratch_layout() -> dict:
             ("k3_fflag", MAX_TOKENS * AR_PARTS_MAX),
             ("k3_ss", MAX_TOKENS * TOP_K * DN_T),
             ("k3_fbuf", MAX_TOKENS * MOE_HIDDEN // 4),
+            ("k3_nscal", MAX_TOKENS * 2),  # a token's (post rstd, pre rstd) for the next K1 (deferred)
             ("k3_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
@@ -1198,6 +1199,10 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
     for k in range_constexpr(1, BND_ELEMS):
         ss2 = ss2 + pre[k] * pre[k]
     rstd2 = hw_rsq(block_sum(c, ss2, 1) / float(HIDDEN) + RMS_EPS)
+    if const_expr(c["defer_k1"]):
+        # the next K1 folds its two operand halves with these (``pre_attn.stage_gemv``)
+        if tid < 2:
+            c["put"](c["nscal"], 2 * t + tid, (tid == 0).select(rstd, rstd2))
     nw = [bf2_f32(fx.Int32(nw_w[k // 8][(k % 8) // 2]))[k % 2] for k in range(BND_ELEMS)]
     for i in range_constexpr(2):
         words = [
@@ -1216,7 +1221,7 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
 
 # ---------------------------------------------------------------- the launch's order
 @flyc.jit
-def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None):
+def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=None):
     """K3's stages on this CTA. ``route_flag`` / ``xin_flag`` (mailbox regions):
     the routing and the expert input were written earlier in this launch, flagged a
     token each. ``x_flag`` / ``x_put``: see ``stage_bnd``."""
@@ -1225,7 +1230,9 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None):
     AP = c["ar_parts"]
     stamp(c, 0)
     if const_expr(route_flag is not None):
-        poll_flags(c, [(route_flag, S), (xin_flag, S)])
+        # (``res_flag`` = (region, count): K2's boundary parts flag their stream columns
+        # after the x halves the routing came from; the boundary below reads them)
+        poll_flags(c, [(route_flag, S), (xin_flag, S)] + ([res_flag] if res_flag is not None else []))
     stamp(c, 1)  # the routing and expert input arrived (a merged launch) / entry
     if const_expr(c["tpx"]):
         n_tiles = stage_plan_tpx(c)

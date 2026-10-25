@@ -110,6 +110,8 @@ TRACE_DIR = os.environ.get("SGLANG_AMD_MONO_MUSE_TRACE", "")
 # pick on its slices of every expert (weights.tp_expert_copies, ~0.8 GB a layer), so no
 # rank waits on another's expert load
 TPX = os.environ.get("SGLANG_AMD_MONO_MUSE_TPX", "0") == "1"
+# the merged launch's next K1 folds the FFN boundary's norms itself (no wait on the boundary's x)
+DEFER_K1 = os.environ.get("SGLANG_AMD_MONO_MUSE_DEFER_K1", "0") == "1"
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -270,7 +272,7 @@ class MuseMonoRunner:
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
                     fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
-                    tpx=self.tpx,
+                    tpx=self.tpx, defer_k1=DEFER_K1,
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]

@@ -238,7 +238,7 @@ def run_merged(K, L, B, epoch, stream):
     )  # fmt: skip
 
 
-def _kernels(S, ql):
+def _kernels(S, ql, defer=False):
     from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, build_k2
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
     from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, KAttnBuild, LayerBuild, build_k1, build_kattn, build_layer
@@ -248,7 +248,7 @@ def _kernels(S, ql):
         "ka": build_kattn(KAttnBuild(tokens=S, q_len=ql)),
         "k2": build_k2(K2Build(tokens=S, npes=1, fp8_pool=FP8_DENSE)),
         "k3": build_k3(K3Build(tokens=S, npes=1, fp8_unpool=FP8_DENSE)),
-        "layer": build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, fp8_dense=FP8_DENSE)),
+        "layer": build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, fp8_dense=FP8_DENSE, defer_k1=defer)),
     }
 
 
@@ -306,6 +306,52 @@ def test_the_merged_launch_matches_the_four(S, ql):
         report.append(f"{name} {_same(b[name], a[name], name, tol=1 / 128):.1%}")
     print("merged vs four, exact share:", ", ".join(report))
     assert (b["K1 cache"].float() != 0).any(), "the next layer's cache rows were not written"
+
+
+@pytest.mark.parametrize("S,ql", [(8, 8), (16, 8), (64, 8)])
+def test_the_deferred_k1_matches_the_four(S, ql):
+    """The merged launch whose next K1 folds the FFN boundary's norms itself (K2's
+    c1 half, the unpooled rows, K3's scalars) against the four launches: the layer's
+    outputs alike (the same code up to the K1), the next layer's q / k / v / gate and
+    cache rows at row cosine 0.999 (the operand roundings moved: x is no longer one
+    bf16 rounding of the normed row)."""
+    from sgl_amd_mono.common import guard
+
+    dev = torch.device("cuda")
+    L = Layer(S, ql, dev, seed=50 + S)
+    stream = torch.cuda.current_stream()
+    epoch = _epoch(dev)
+    outs = {}
+    for merged in (False, True):
+        K = _kernels(S, ql, defer=merged)
+        B = Buffers(S, ql, dev)
+        try:
+            for _ in range(2):
+                _step(K, L, B, epoch, stream, merged)
+            torch.cuda.synchronize()
+            assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all(), f"merged={merged}: a wait failed"
+            rows = L.swa_map[L.slots]
+            outs[merged] = {
+                "res": B.res.clone(), "ids": B.ids[:S].clone(), "xin": B.xin[:S].clone(), "q1": B.q[:S].clone(),
+                "k1": B.k[:S].clone(), "v1": B.v[:S].clone(), "g1": B.g[:S].clone(),
+                "K1 cache": L.k_cache1[rows].float().clone(), "V1 cache": L.v_cache1[rows].float().clone(),
+            }  # fmt: skip
+            L.k_cache1.zero_()
+            L.v_cache1.zero_()
+        finally:
+            B.close()
+    a, b = outs[False], outs[True]
+    assert (a["ids"] == b["ids"]).all(), "the routing differs"
+    _same(b["res"], a["res"], "res", tol=1 / 128)
+    _same(b["xin"], a["xin"], "xin", tol=1 / 32)
+    report = []
+    for name in ("q1", "k1", "v1", "g1", "K1 cache", "V1 cache"):
+        x, y = b[name].float().reshape(S, -1), a[name].float().reshape(S, -1)
+        assert not x.isnan().any(), f"{name}: NaN"
+        cos = torch.nn.functional.cosine_similarity(x, y, dim=-1).min().item()
+        report.append(f"{name} {cos:.5f}")
+        assert cos > (0.99 if "cache" in name else 0.999), f"{name}: row cosine {cos:.5f}"
+    print("deferred K1 vs four, least row cosine:", ", ".join(report))
 
 
 def _time(fn, iters=20):

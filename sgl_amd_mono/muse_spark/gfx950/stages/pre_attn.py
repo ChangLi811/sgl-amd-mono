@@ -35,6 +35,8 @@ from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
+    bf2_f32,
+    bf16_pair,
     bf16_round,
     butterfly,
     fp8_pack4,
@@ -136,6 +138,9 @@ def stage_gemv(c, rg, kpart, first=None):
         w = first
     else:
         w = gemv_w_loads(c, rg, kpart, a["w"])
+    if const_expr(c.get("defer", False)):
+        stage_gemv_deferred(c, rg, kpart, w)
+        return
     # a token tile at a time: the weights stay in registers, the accumulators are a
     # tile's nine; the waves' accumulators sum through a reduction row set a row tile
     for t in range_constexpr(tiles):
@@ -164,6 +169,84 @@ def stage_gemv(c, rg, kpart, first=None):
                 tk = t * TILE + idx // G_ROWS
                 v = row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // G_ROWS)
                 put(part, (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * G_ROWS + r, v)
+        gpu.barrier()  # ``red`` is reused by the next token tile / task
+
+
+def stage_gemv_deferred(c, rg, kpart, w):
+    """The GEMV task of a merged launch's K1 with the boundary's norms deferred: x =
+    bf16(rstd2 npw (alpha st + beta bf16(pp rstd))), pp = bf16(u pfw), is rstd2 (c1 +
+    rstd c2) with c1 = bf16(npw alpha st) (written by K2's boundary: ``x``) and c2 =
+    bf16(npw beta pp) from the unpooled rows u of this part's columns (one rank's,
+    polled from K3's ``unp`` under K3's tag); the c1 half's MFMAs and row sums run
+    first (while u lands), then c2's; the token's two scalars (K3's boundary,
+    ``nscal``) fold the halves into the partial: so the K1 waits for neither the
+    boundary's x nor its flag."""
+    S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    red, put, part = c["red"], c["put"], c["part"]
+    a = c["args"]
+    d_poll, d_unp, d_ns = c["d_poll"], c["d_unp"], c["d_nscal"]
+    tiles = token_tiles(S)
+    r_x = rsrc(a["x"])
+    r_fw, r_be, r_nw = rsrc(a["pfw"]), rsrc(a["beta2"]), rsrc(a["npw"])
+    V8F = fx.Vector.make_type(8, fx.Float32)
+    # this lane's per-k constants (8 values a step)
+    fwv, bev, nwv = [], [], []
+    for kc in range_constexpr(K_STEPS):
+        k = gemv_k(lane, wave, kpart, kc)
+        fwv.append(fx.Vector(bo.buffer_load(r_fw, k // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16).to(fx.Float32))
+        bev.append([fx.Vector(bo.buffer_load(r_be, k + 4 * h, vec_width=4, dtype=T.f32)) for h in range(2)])
+        nwv.append(fx.Vector(bo.buffer_load(r_nw, k // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16).to(fx.Float32))
+    for t in range_constexpr(tiles):
+        tok = fx.min(t * TILE + lane % 16, S - 1)
+        nt = min(TILE, S - t * TILE)
+        n_out = G_ROWS * nt
+        rounds = -(-n_out // THREADS)
+        # ---- c1: the first half's MFMAs and row sums
+        xb = [
+            fx.Vector(bo.buffer_load(r_x, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))  # fmt: skip
+            for kc in range(K_STEPS)
+        ]
+        for it in range_constexpr(G_TILES):
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for kc in range_constexpr(K_STEPS):
+                acc = mfma_bf16(w[it][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), acc)
+            fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
+        gpu.barrier()
+        r1 = []
+        for p in range_constexpr(rounds):
+            idx = fx.min(tid + p * THREADS, n_out - 1)
+            r1.append(row_sum(red + ((idx % G_ROWS) // ROWS) * RED_FLOATS, (idx % G_ROWS) % ROWS, idx // G_ROWS))
+        gpu.barrier()
+        # ---- c2 from the unpooled rows of this lane's token and steps
+        got = d_poll([(d_unp, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2, 4) for kc in range(K_STEPS)])
+        ub = []
+        for kc in range_constexpr(K_STEPS):
+            words = []
+            for q in range_constexpr(4):
+                lo, hi = bf2_f32(got[kc][q])
+                vals = []
+                for h, u in ((0, lo), (1, hi)):
+                    j = 2 * q + h
+                    pp = bf16_round(u * fx.Float32(fwv[kc][j]))
+                    vals.append(fx.Float32(nwv[kc][j]) * fx.Float32(bev[kc][j // 4][j % 4]) * pp)
+                words.append(bf16_pair(vals[0], vals[1]).bitcast(fx.Int32))
+            ub.append(fx.Vector.from_elements(words, fx.Int32))
+        for it in range_constexpr(G_TILES):
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for kc in range_constexpr(K_STEPS):
+                acc = mfma_bf16(w[it][kc].bitcast(fx.BFloat16), ub[kc].bitcast(fx.BFloat16), acc)
+            fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
+        gpu.barrier()
+        # ---- the token's scalars, the fold, the partials
+        for p in range_constexpr(rounds):
+            idx = tid + p * THREADS
+            if idx < n_out:
+                r = idx % G_ROWS
+                tk = t * TILE + idx // G_ROWS
+                r2 = row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // G_ROWS)
+                sc = d_poll([(d_ns, 2 * tk, 2)])
+                rstd, rstd2 = sc[0][0].bitcast(fx.Float32), sc[0][1].bitcast(fx.Float32)
+                put(part, (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * G_ROWS + r, rstd2 * (r1[p] + rstd * r2))
         gpu.barrier()  # ``red`` is reused by the next token tile / task
 
 
@@ -314,7 +397,8 @@ def run_k1(c, bid, x_flag=None):
         first = gemv_w_loads(c, own // K_PARTS, own % K_PARTS, c["args"]["w"])
         extra = gemv_w_loads(c, t2 // K_PARTS, t2 % K_PARTS, c["args"]["w"])
         rocdl.sched_barrier(0)
-        poll_flags(c, [(x_flag, S)])
+        if const_expr(not c.get("defer", False)):
+            poll_flags(c, [(x_flag, S)])  # (deferred: the GEMV polls its unpooled rows itself)
     stamp(c, 1)  # x arrived (a merged launch) / entry
     if const_expr(x_flag is not None):
         if bid >= S:
