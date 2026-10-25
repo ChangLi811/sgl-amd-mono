@@ -177,13 +177,13 @@ class MuseMonoRunner:
         self.views, self.modules, self.boundaries = list(views), list(modules), list(boundaries)
         self.tpx = TPX and USE_KERNELS
         self.tpx_w = None  # the TP-experts slices: built at bind, after SGLang sized the KV cache
-        self.pshard = PSHARD and self.npes == 8 and not self.fp8_dense
         self.pool_rows = None  # the sharded pooler's row slices a layer: built at bind
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         self.use_kernels = USE_KERNELS
         self.use_layer = USE_LAYER
         # the pooler / unpooler as FP8 copies when every kernel layer carries them
         self.fp8_dense = all(v.w_pool_fp8 is not None and v.w_unpool_fp8 is not None for v in views if v.kind == "mxfp4")
+        self.pshard = PSHARD and npes == 8 and not self.fp8_dense
         self._k1_done = -1  # the layer whose K1 the previous merged launch ran
         self._trace_shape = None  # (rows, q_len) of the last launch, for the attention trace region's offset
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
