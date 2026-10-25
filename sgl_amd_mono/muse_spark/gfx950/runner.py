@@ -112,6 +112,8 @@ TRACE_DIR = os.environ.get("SGLANG_AMD_MONO_MUSE_TRACE", "")
 TPX = os.environ.get("SGLANG_AMD_MONO_MUSE_TPX", "0") == "1"
 # the merged launch's next K1 folds the FFN boundary's norms itself (no wait on the boundary's x)
 DEFER_K1 = os.environ.get("SGLANG_AMD_MONO_MUSE_DEFER_K1", "0") == "1"
+# K2 hands K3 the expert input pre-quantized, staged once a CTA (S <= 16); =0 restages a tile's columns
+XQ_PRE = os.environ.get("SGLANG_AMD_MONO_MUSE_XQ_PRE", "1") == "1"
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -272,7 +274,7 @@ class MuseMonoRunner:
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
                     fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
-                    tpx=self.tpx, defer_k1=DEFER_K1,
+                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE,
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]

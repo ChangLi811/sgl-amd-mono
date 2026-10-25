@@ -175,6 +175,9 @@ def k2_scratch_layout() -> dict:
             ("k2_xbuf", MAX_TOKENS * HIDDEN * 2 // PAIR_BYTES),
             ("k2_xbuf2", MAX_TOKENS * HIDDEN * 2 // PAIR_BYTES),
             ("k2_c1", MAX_TOKENS * HIDDEN * 2 // PAIR_BYTES),
+            # the expert input's MXFP4 blocks a token: MOE_HIDDEN / 8 code words, then MOE_HIDDEN / 32
+            # scale words (K3's staged-column layout, ``ffn.stage_xq_all``)
+            ("k2_xinq", MAX_TOKENS * (MOE_HIDDEN // 8 + MOE_HIDDEN // 32) * 4 // PAIR_BYTES),
             ("k2_resflag", MAX_TOKENS * A_PARTS_MAX),
             ("k2_rflag", MAX_TOKENS),
             ("k2_xinflag", MAX_TOKENS),
@@ -820,6 +823,25 @@ def stage_xn(c, t, xin_flag=None):
     xw = ld_bf(a["xn_w"], e0, 8)
     out = [v[j] * rstd * xw[j] for j in range(8)]
     st_bf(a["xin"], t * MOE_HIDDEN + e0, out, CM_DEV)
+    if const_expr(c["xq_pre"]):
+        # the same blocks K3 would quantize from the bf16 row (``ffn.stage_xq_cols``): a
+        # thread's eight values one code word, four threads a 32-value block
+        from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import e2m1_code, mxfp4_scale
+
+        vals = [bf16_round(x) for x in out]
+        amax = abs(vals[0])
+        for k in range_constexpr(1, 8):
+            amax = fx.max(amax, abs(vals[k]))
+        amax = butterfly(amax, (1, 2), fx.max)
+        byte, qs = mxfp4_scale(amax)
+        word = e2m1_code(vals[0], qs)
+        for k in range_constexpr(1, 8):
+            word = word | (e2m1_code(vals[k], qs) << (4 * k))
+        XQW_, XSW_ = MOE_HIDDEN // 8, MOE_HIDDEN // 32
+        base = t * (XQW_ + XSW_)
+        bo.buffer_store(word, rsrc(c["xinq"]), base + tid, cache_modifier=CM_DEV)
+        if tid % 4 == 0:
+            bo.buffer_store(byte, rsrc(c["xinq"]), base + XQW_ + tid // 4, cache_modifier=CM_DEV)
     if const_expr(xin_flag is not None):
         release_stores()
         gpu.barrier()

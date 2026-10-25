@@ -64,6 +64,7 @@ class K2Build(msgspec.Struct, frozen=True):
     trace: bool = False
     fp8_pool: bool = False  # w_pool is a packed FP8 copy (codes, then fp32 row scales)
     defer_k1: bool = False  # the boundary also writes the next K1's first operand half (``k2_c1``)
+    xq_pre: bool = False  # xn also writes the expert input as MXFP4 blocks (``k2_xinq``) for K3
 
 
 def k2_context(key: K2Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, layer=None) -> dict:
@@ -97,9 +98,10 @@ def k2_context(key: K2Build, lds, args: dict, scratch, sym, peers, rank, tag, la
         "layer": layer,
         "fp8_pool": key.fp8_pool,
         "defer_k1": key.defer_k1,
+        "xq_pre": key.xq_pre,
     }
     for region, (off, _) in layout.items():
-        if region in ("k2_xbuf", "k2_xbuf2", "k2_c1"):
+        if region in ("k2_xbuf", "k2_xbuf2", "k2_c1", "k2_xinq"):
             c[region[3:]] = scratch + fx.Int64(off)  # plain bf16 words, not a mailbox region
         else:
             c[region[3:]] = sreg(scratch, off, region)  # "k2_og" -> c["og"]
@@ -111,7 +113,7 @@ def build_k2(key: K2Build):
     of a ``key.npes``-way TP group."""
     S, W = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= W <= guard.FLAG_WORDS
-    name = kernel_symbol("muse_spark_k2", s=S, w=W, f=key.fault_site, t=int(key.trace), p8=int(key.fp8_pool), d=int(key.defer_k1))
+    name = kernel_symbol("muse_spark_k2", s=S, w=W, f=key.fault_site, t=int(key.trace), p8=int(key.fp8_pool), d=int(key.defer_k1), xq=int(key.xq_pre))
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     flags_offset = sym_bytes(W)

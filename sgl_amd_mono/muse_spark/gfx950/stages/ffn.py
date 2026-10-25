@@ -432,6 +432,52 @@ def xq_loads(c, e, col0, n):
     return [x_unit(i) for i in range(tile_cols(S))]
 
 
+def xq_all_loads(c):
+    """Every token's MXFP4 blocks (K2's ``xinq``: XQW code words then XSW scale words
+    a token), 16 B a thread a round, in flight (the staged-column layout with the
+    column = the token; S <= TILE_COLS)."""
+    S, tid = c["S"], c["tid"]
+    W_TOK = XQW + XSW
+    r = rsrc(c["args"]["xinq"])
+    n4 = S * W_TOK // 4
+    return [bo.buffer_load(r, 4 * fx.min(tid + THREADS * i, n4 - 1), vec_width=4, dtype=T.i32, cache_modifier=CM_DEV) for i in range(cdiv(n4, THREADS))]  # fmt: skip
+
+
+def stage_xq_all(c, xv):
+    """The blocks (``xq_all_loads``) into LDS: token t's words at xcol[t XQW ..], its
+    scales at xcol[TILE_COLS XQW + t XSW ..]."""
+    S, tid, xcol = c["S"], c["tid"], c["xcol"]
+    W_TOK = XQW + XSW
+    n4 = S * W_TOK // 4
+    for i in range_constexpr(len(xv)):
+        v = tid + THREADS * i
+        if v < n4:
+            w4 = fx.Vector(xv[i])
+            for j in range_constexpr(4):
+                d = 4 * v + j
+                tk, o = d // W_TOK, d % W_TOK
+                at = (o < XQW).select(tk * XQW + o, TILE_COLS * XQW + tk * XSW + (o - XQW))
+                fx.ptr_store(fx.Int32(w4[j]).bitcast(fx.Float32), xcol + at)
+    gpu.barrier()
+
+
+def xq_b_tok(c, tok, chunks, kc):
+    """This lane's B operand of chunk ``kc`` from token ``tok``'s staged blocks
+    (``stage_xq_all``): its 32 codes of k block g4 and their scale."""
+    lane, wave, xcol = c["lane"], c["wave"], c["xcol"]
+    V4F = fx.Vector.make_type(4, fx.Float32)
+    kb = (wave * chunks + kc) * (CHUNK // MXFP4_GROUP) + lane // 16
+    q = fx.Vector(fx.ptr_load(xcol + (tok * XQW + kb * 4), result_type=V4F)).bitcast(fx.Int32)
+    sc = fx.ptr_load(xcol + (TILE_COLS * XQW + tok * XSW + kb)).bitcast(fx.Int32)
+    return q, sc
+
+
+def lane_token(c, e, col0, n):
+    """The token of this lane's column (lane % 16) of a tile (the last column's past n)."""
+    tk = pick_at(c, e, col0 + fx.min(c["lane"] % 16, n - 1)) // TOP_K
+    return fx.max(fx.min(tk, fx.Int32(c["S"] - 1)), fx.Int32(0))
+
+
 def xq_b(c, n, chunks, kc):
     """This lane's B operand of chunk ``kc``: its column's 32 codes of k block g4
     and their scale, from the staged blocks (a column past n: the last)."""
@@ -792,27 +838,36 @@ def stage_ug(c, n_tiles):
     # order, so x lands (and is quantized) while the weights stream
     t0 = q0 // UGT
     e0, c0, n0 = tile_info(c, t0, n_tiles)
-    xv0 = xq_loads(c, e0, c0, n0)
+    pre = c["xq_pre"]
+    xv0 = xq_all_loads(c) if pre else xq_loads(c, e0, c0, n0)
     # the dn stage's first item: its weights go out as the loop's last prefetch (a
     # duplicate of the last pair went out there before; a CTA without ug items
     # issues them first thing), so they land while the dn stage waits for its mids
     TD = n_tiles * DNT
     dq0 = (bid * TD) // BLOCKS
     cur = ug_or_dn_pair_loads(c, q0, 0, dq0, n_tiles, n_items == 0)
-    stage_xq_cols(c, e0, c0, n0, xv0)
+    if const_expr(pre):
+        stage_xq_all(c, xv0)  # every token's blocks: a tile change is only the lanes' tokens
+    else:
+        stage_xq_cols(c, e0, c0, n0, xv0)
     cur_t = t0
     for i in range(0, n_items):
         q = q0 + i // 2
         pr = i % 2
         ti = q // UGT
         e, col0, n = tile_info(c, ti, n_tiles)
-        if ti != cur_t:
-            gpu.barrier()  # every thread is done with the previous tile's columns
-            stage_xq_cols(c, e, col0, n)
-            cur_t = ti
+        if const_expr(not pre):
+            if ti != cur_t:
+                gpu.barrier()  # every thread is done with the previous tile's columns
+                stage_xq_cols(c, e, col0, n)
+                cur_t = ti
         i1 = fx.min(i + 1, n_items - 1)
         nxt = ug_or_dn_pair_loads(c, q0 + i1 // 2, i1 % 2, dq0, n_tiles, i + 1 >= n_items)
-        xb = [xq_b(c, n, UG_CHUNKS, kc) for kc in range(UG_CHUNKS)]
+        if const_expr(pre):
+            tok = lane_token(c, e, col0, n)
+            xb = [xq_b_tok(c, tok, UG_CHUNKS, kc) for kc in range(UG_CHUNKS)]
+        else:
+            xb = [xq_b(c, n, UG_CHUNKS, kc) for kc in range(UG_CHUNKS)]
         par = (i // 2) % 2
         pbase = par * (4 * RED_SLOT_FLOATS)
         for t in range_constexpr(2):

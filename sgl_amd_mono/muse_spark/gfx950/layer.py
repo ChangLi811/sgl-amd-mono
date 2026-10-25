@@ -286,6 +286,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     fp8_dense: bool = False  # the pooler and unpooler as packed FP8 copies
     tpx: bool = False  # TP experts (``K3Build.tpx``)
     defer_k1: bool = False  # the next K1 folds the FFN boundary's norms itself (needs next_k1)
+    xq_pre: bool = True  # K2's xn hands K3 the expert input as MXFP4 blocks (S <= 16; K3Build.xq_pre)
 
 
 def build_layer(key: LayerBuild):
@@ -310,14 +311,15 @@ def build_layer(key: LayerBuild):
 
     S, QL, W, next_k1, last = key.tokens, key.q_len, key.npes, key.next_k1, key.last
     assert 1 <= S <= MAX_TOKENS and S % QL == 0 and QL in (1, 8) and 1 <= W <= guard.FLAG_WORDS
-    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1))  # fmt: skip
+    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16))  # fmt: skip
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
     defer = key.defer_k1 and next_k1
     k1_key = K1Build(S, fault_site, fault_after, tr, defer)
     ka_key = KAttnBuild(S, QL, fault_site=fault_site, fault_after=fault_after, trace=tr)
-    k2_key = K2Build(S, W, fault_site, fault_after, tr, key.fp8_dense, defer)
-    k3_key = K3Build(S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer)
+    xq = key.xq_pre and S <= 16
+    k2_key = K2Build(S, W, fault_site, fault_after, tr, key.fp8_dense, defer, xq)
+    k3_key = K3Build(S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq)
     k1_layout, ka_layout = k1_scratch_layout(), kattn_scratch_layout(S, QL)
     k2_layout, k3_layout = k2_scratch_layout(), ffn.k3_scratch_layout()
     sy = ffn.k3_sym_layout(W)
@@ -381,6 +383,7 @@ def build_layer(key: LayerBuild):
                 "beta": beta2, "npw": npw, "w_unpool": w_unpool, "attn_out": attn_out, "last": last_in,
             }  # fmt: skip
             c2 = k2_context(k2_key, lds.k2.peek(), k2_args, scratch2, sym, peers, rank, tag, k2_layout, layer=layer)
+            k3_args["xinq"] = c2["xinq"]  # (read by K3 only with xq_pre)
             oflag, rflag, xinflag = c2["oflag"], c2["rflag"], c2["xinflag"]
             ca = kattn_context(ka_key, lds, a_args, scratch_a, tag, ka_layout, layer=layer)
             attention.run_kattn(ca, o_flag=oflag)
