@@ -30,7 +30,8 @@ pytestmark = pytest.mark.skipif(
 LAYER = 5
 # the routing key keeps 24 bits of the biased score: two candidates closer than
 # that (or than the GEMM order's noise) may swap at the top-8 boundary
-TIE_TOL = 1e-4
+TIE_TOL = 1e-3  # a near-tie may flip: the kernel's x is rstd2 (b1 + rstd b2) from two bf16 halves (the
+# boundary's norms folded in by the GEMV CTAs), a few 1e-4 from the ops' one rounding of the normed row
 
 
 def _epoch(device, deadline_s=20.0):

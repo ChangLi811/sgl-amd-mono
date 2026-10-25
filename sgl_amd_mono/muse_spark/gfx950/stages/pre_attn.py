@@ -172,6 +172,7 @@ def stage_gemv(c, rg, kpart, first=None):
         gpu.barrier()  # ``red`` is reused by the next token tile / task
 
 
+@flyc.jit
 def stage_gemv_deferred(c, rg, kpart, w):
     """The GEMV task of a merged launch's K1 with the boundary's norms deferred: x =
     bf16(rstd2 npw (alpha st + beta bf16(pp rstd))), pp = bf16(u pfw), is rstd2 (c1 +

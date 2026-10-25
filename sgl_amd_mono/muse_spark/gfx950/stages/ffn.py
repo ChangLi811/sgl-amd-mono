@@ -444,6 +444,7 @@ def xq_all_loads(c):
     return [bo.buffer_load(r, 4 * fx.min(tid + THREADS * i, n4 - 1), vec_width=4, dtype=T.i32, cache_modifier=CM_DEV) for i in range(cdiv(n4, THREADS))]  # fmt: skip
 
 
+@flyc.jit
 def stage_xq_all(c, xv):
     """The blocks (``xq_all_loads``) into LDS: token t's words at xcol[t XQW ..], its
     scales at xcol[TILE_COLS XQW + t XSW ..]."""
