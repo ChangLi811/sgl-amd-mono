@@ -94,6 +94,9 @@ STAGE = int(os.environ.get("SGLANG_AMD_MONO_DRAFT_STAGE", "2")) if USE_KERNELS e
 # a timing diagnostic: the routed draft forward returns the normed embeddings (no layer runs):
 # the step time's drop is the whole draft forward's cost (the draft tokens are then garbage)
 SKIP_LAYERS = os.environ.get("SGLANG_AMD_MONO_DRAFT_SKIP", "0") == "1"
+# the context projection (``fc``: the target layers' hidden states -> hidden, 671 MB bf16 replicated,
+# one GEMM a step) as each rank's 1 / TP of the output rows and the group's all-gather (0: replicated)
+SHARD_FC = os.environ.get("SGLANG_AMD_MONO_DRAFT_FC_SHARD", "1") == "1"
 
 
 def _mlp_views(layer) -> dict:
@@ -469,6 +472,32 @@ def _log_check(i: int, got, ref) -> None:
         logger.info("monokernel check: draft layer %d %s: rel %.4f, cosine min %.5f mean %.5f", i, name, rel, cos.min().item(), cos.mean().item())  # fmt: skip
 
 
+def _shard_fc(model) -> bool:
+    """Replace ``model.project_target_hidden`` with the TP-sharded projection: the rank's
+    rows of ``fc.weight`` (a view: the loader's storage) against the replicated input,
+    the ranks' parts all-gathered in rank order, then ``hidden_norm`` as the model does.
+    The draft's context rows only (the target's distribution is the verify's); a call
+    that does not match (another TP size or shape) runs the model's own."""
+    fc = getattr(model, "fc", None)
+    w = getattr(fc, "weight", None)
+    if w is None or w.dtype != torch.bfloat16 or w.dim() != 2 or w.shape[0] % TP or getattr(fc, "bias", None) is not None:
+        return False
+    original = model.project_target_hidden
+
+    def project_target_hidden(target_hidden: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_parallel
+
+        p = get_parallel()
+        if p.tp_size != TP or target_hidden.ndim != 2 or target_hidden.shape[-1] != w.shape[1]:
+            return original(target_hidden)
+        n = w.shape[0] // TP
+        part = torch.nn.functional.linear(target_hidden.to(w.dtype), w.narrow(0, p.tp_rank * n, n))
+        return model.hidden_norm(p.tp_group.all_gather(part, dim=-1))
+
+    model.project_target_hidden = project_target_hidden
+    return True
+
+
 def _build(model, hf_config, ctx) -> _Draft:
     original = type(model).forward.__get__(model, type(model))
     if not USE_KERNELS:
@@ -483,6 +512,8 @@ def _build(model, hf_config, ctx) -> _Draft:
     start = len(widths) * p.tp_rank // max(p.tp_size, 1)
     for rows in widths[start:] + widths[:start]:
         runner.precompile(rows)
+    if SHARD_FC and p.tp_size == TP and _shard_fc(model):
+        logger.info("monokernel: muse_spark DFlash2 draft: the context projection TP-sharded (%s rows a rank)", model.fc.weight.shape[0] // TP)  # fmt: skip
     logger.info("monokernel: muse_spark DFlash2 draft attached at stage %d (%s)", STAGE, "the MLP half as D-MLP launches" if STAGE < 2 else "D-pre, D-attn, D-post and D-MLP launches a layer")  # fmt: skip
     return _Draft(model, original, runner)
 
