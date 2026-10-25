@@ -26,6 +26,7 @@ pytestmark = pytest.mark.skipif(
 
 PAGES = 65536  # cache pages of the layer's K / V planes (1M keys: eight 95k requests fit)
 FP8_DENSE = os.environ.get("MUSE_BENCH_FP8", "0") == "1"  # the pooler / unpooler as packed FP8 copies
+UG_DYN = os.environ.get("MUSE_BENCH_UGDYN", "0") == "1"  # K3's ug items from the launch's queue (merged launch)
 MAX_BLOCKS = 65536
 POSITIONS = 4096
 THETA = 500000.0
@@ -248,7 +249,7 @@ def _kernels(S, ql, defer=False):
         "ka": build_kattn(KAttnBuild(tokens=S, q_len=ql)),
         "k2": build_k2(K2Build(tokens=S, npes=1, fp8_pool=FP8_DENSE)),
         "k3": build_k3(K3Build(tokens=S, npes=1, fp8_unpool=FP8_DENSE)),
-        "layer": build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, fp8_dense=FP8_DENSE, defer_k1=defer)),
+        "layer": build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, fp8_dense=FP8_DENSE, defer_k1=defer, ug_dyn=UG_DYN)),
     }
 
 

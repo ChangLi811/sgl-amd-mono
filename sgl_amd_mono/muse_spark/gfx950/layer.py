@@ -14,7 +14,7 @@ from sgl_amd_mono.common.ops import CM_DEV
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
-from sgl_amd_mono.muse_spark.gfx950.device import step_tag
+from sgl_amd_mono.muse_spark.gfx950.device import global_atomic, step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     attn_rows,
     k1_scratch_layout,
@@ -287,6 +287,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     tpx: bool = False  # TP experts (``K3Build.tpx``)
     defer_k1: bool = False  # the next K1 folds the FFN boundary's norms itself (needs next_k1)
     xq_pre: bool = True  # K2's xn hands K3 the expert input as MXFP4 blocks (S <= 16; K3Build.xq_pre)
+    ug_dyn: bool = False  # K3's ug items from a launch-wide queue (with xq_pre; K3Build.ug_dyn)
 
 
 def build_layer(key: LayerBuild):
@@ -311,7 +312,7 @@ def build_layer(key: LayerBuild):
 
     S, QL, W, next_k1, last = key.tokens, key.q_len, key.npes, key.next_k1, key.last
     assert 1 <= S <= MAX_TOKENS and S % QL == 0 and QL in (1, 8) and 1 <= W <= guard.FLAG_WORDS
-    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16))  # fmt: skip
+    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S <= 16))  # fmt: skip
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
     defer = key.defer_k1 and next_k1
@@ -319,7 +320,8 @@ def build_layer(key: LayerBuild):
     ka_key = KAttnBuild(S, QL, fault_site=fault_site, fault_after=fault_after, trace=tr)
     xq = key.xq_pre and S <= 16
     k2_key = K2Build(S, W, fault_site, fault_after, tr, key.fp8_dense, defer, xq)
-    k3_key = K3Build(S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq)
+    ugd = key.ug_dyn and xq
+    k3_key = K3Build(S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq, ugd)
     k1_layout, ka_layout = k1_scratch_layout(), kattn_scratch_layout(S, QL)
     k2_layout, k3_layout = k2_scratch_layout(), ffn.k3_scratch_layout()
     sy = ffn.k3_sym_layout(W)
@@ -365,6 +367,11 @@ def build_layer(key: LayerBuild):
             tag = step_tag(epoch, layer)
             tag1 = step_tag(epoch, layer + 1)
             bid = fx.block_idx.x
+            if const_expr(ugd):
+                # K3's ug queue starts at 0: CTA 0 zeroes it before its xn task (token 0),
+                # whose flag (after a release) every K3 CTA polls before its first ticket
+                if (bid == 0) & (fx.thread_idx.x == 0):
+                    global_atomic(scratch3 + fx.Int64(k3_layout["k3_ugq"][0]), 0, xchg=True)
             # the stages' contexts share the layer's tag; the next K1 takes the next layer's
             a_args = {
                 "q": q, "o": o, "k_cache": k_cache, "v_cache": v_cache, "page_table": page_table,

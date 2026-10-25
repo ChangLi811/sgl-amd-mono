@@ -114,6 +114,8 @@ TPX = os.environ.get("SGLANG_AMD_MONO_MUSE_TPX", "0") == "1"
 DEFER_K1 = os.environ.get("SGLANG_AMD_MONO_MUSE_DEFER_K1", "0") == "1"
 # K2 hands K3 the expert input pre-quantized, staged once a CTA (S <= 16); =0 restages a tile's columns
 XQ_PRE = os.environ.get("SGLANG_AMD_MONO_MUSE_XQ_PRE", "1") == "1"
+# K3's ug items past the first from a launch-wide queue (with XQ_PRE)
+UG_DYN = os.environ.get("SGLANG_AMD_MONO_MUSE_UG_DYN", "0") == "1"
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -274,7 +276,7 @@ class MuseMonoRunner:
                 LayerBuild(
                     tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
                     fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
-                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE,
+                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE, ug_dyn=UG_DYN,
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]

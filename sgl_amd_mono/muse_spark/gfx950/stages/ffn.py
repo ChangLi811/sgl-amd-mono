@@ -94,7 +94,7 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     TOP_K,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, lds_atomic_add, poll_flags, release_stores, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, global_atomic, lds_atomic_add, poll_flags, release_stores, stamp
 from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import (
     e2m1_code,
     lanes_before,
@@ -208,6 +208,7 @@ def k3_scratch_layout() -> dict:
             ("k3_ss", MAX_TOKENS * TOP_K * DN_T),
             ("k3_fbuf", MAX_TOKENS * MOE_HIDDEN // 4),
             ("k3_nscal", MAX_TOKENS * 2),  # a token's (post rstd, pre rstd) for the next K1 (deferred)
+            ("k3_ugq", 2),  # the launch's ug queue: a word (zeroed at the merged launch's entry)
             ("k3_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,
@@ -886,6 +887,68 @@ def stage_ug(c, n_tiles):
 
 
 @flyc.jit
+def stage_ug_dyn(c, n_tiles):
+    """The ug items from a queue (merged launch, pre-quantized x): CTA bid's first
+    item is ``bid``, every later one ``BLOCKS`` + a ticket of the launch's queue
+    word (``k3_ugq``, zeroed at the launch's entry by CTA 0 before its xn task's
+    flag, which every CTA polls first), so a CTA that finishes early takes more
+    (a fixed range left the CTAs ~11 us apart at S = 16). A ticket goes out at an
+    item's head, before its up pair's weights (it returns ahead of them), and
+    reaches the CTA through LDS (``misc``, a slot an item parity) behind the
+    item's barrier. Returns the dn stage's first item's weights, in flight."""
+    S, bid, red, tid, misc = c["S"], c["bid"], c["red"], c["tid"], c["misc"]
+    UGT, DNT = c["ug_t"], c["dn_t"]
+    TU = n_tiles * UGT
+    TD = n_tiles * DNT
+    dq0 = (bid * TD) // BLOCKS
+    ctr = c["ugq"].value
+    no = fx.Int32(0) == fx.Int32(1)
+    xv = xq_all_loads(c)
+    tk = fx.Int32(0)
+    if tid == 0:
+        tk = global_atomic(ctr, 1)  # the second item's
+    q = bid
+    cur = ug_or_dn_pair_loads(c, q, 0, dq0, n_tiles, q >= TU)  # (a CTA without an item: dn's first)
+    stage_xq_all(c, xv)
+    if tid == 0:
+        fx.ptr_store(tk.bitcast(fx.Float32), misc + 2)
+    gpu.barrier()
+    qn = fx.Int32(BLOCKS) + fx.ptr_load(misc + 2).bitcast(fx.Int32)
+    k = fx.Int32(0)
+    while q < TU:
+        par = k % 2
+        t2 = fx.Int32(0)
+        if tid == 0:
+            t2 = global_atomic(ctr, 1)  # the item after next
+        e, col0, n = tile_info(c, q // UGT, n_tiles)
+        tok = lane_token(c, e, col0, n)
+        xb = [xq_b_tok(c, tok, UG_CHUNKS, kc) for kc in range(UG_CHUNKS)]
+        up = ug_or_dn_pair_loads(c, q, 1, dq0, n_tiles, no)
+        pbase = par * (4 * RED_SLOT_FLOATS)
+        for t in range_constexpr(2):
+            tile_store(c, 4 * par + t, tile_mfmas_a4(cur[t][0], cur[t][1], xb))
+        if tid == 0:
+            fx.ptr_store(t2.bitcast(fx.Float32), misc + par)
+        nxt = ug_or_dn_pair_loads(c, qn, 0, dq0, n_tiles, qn >= TU)  # the next item's gate pair, or dn's first
+        for t in range_constexpr(2):
+            tile_store(c, 4 * par + 2 + t, tile_mfmas_a4(up[t][0], up[t][1], xb))
+        gpu.barrier()
+        q_after = fx.Int32(BLOCKS) + fx.ptr_load(misc + par).bitcast(fx.Int32)
+
+        def mid_of(row, j):
+            gate = row_sum(red + pbase + (row // 16) * RED_SLOT_FLOATS, row % 16, j)
+            upv = row_sum(red + pbase + (2 + row // 16) * RED_SLOT_FLOATS, row % 16, j)
+            return gate * sigmoid(gate) * upv
+
+        put_mid_block(c, q % UGT, e, col0, n, mid_of)
+        q = qn
+        qn = q_after
+        cur = nxt
+        k = k + 1
+    return cur
+
+
+@flyc.jit
 def stage_dn(c, n_tiles, first=None):
     """This CTA's contiguous range of the dn items (tile, 32-row block): the tile's
     mid blocks restaged at a tile boundary, the next item's weights issued before
@@ -1294,7 +1357,10 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=
     else:
         n_tiles = stage_plan(c)
     stamp(c, 2)  # the plan built
-    dn_first = stage_ug(c, n_tiles)
+    if const_expr(c["ug_dyn"]):
+        dn_first = stage_ug_dyn(c, n_tiles)
+    else:
+        dn_first = stage_ug(c, n_tiles)
     stamp(c, 3)  # this CTA's ug items done
     stage_dn(c, n_tiles, dn_first)
     stamp(c, 4)  # this CTA's dn items done

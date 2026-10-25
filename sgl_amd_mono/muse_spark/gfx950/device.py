@@ -105,6 +105,17 @@ def lds_dma_16(rsrc_v, lds_ptr, voffset, policy: str = ""):
     )
 
 
+def global_atomic(addr, val, xchg=False):
+    """Device-scope atomic add (or exchange) of ``val`` on the int32 at global
+    address ``addr`` (Int64); the word's previous value."""
+    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
+    op = llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.xchg if xchg else llvm.AtomicBinOp.add, ptr, as_ir_value(fx.Int32(val)),
+        llvm.AtomicOrdering.monotonic, syncscope="agent",
+    )  # fmt: skip
+    return fx.Int32(op.result)
+
+
 def lds_atomic_add(ptr, val):
     """Atomic add of ``val`` to the LDS word at ``ptr`` (workgroup scope); the word's
     previous value."""
