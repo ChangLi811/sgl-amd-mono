@@ -462,12 +462,11 @@ def stage_a_part(c, t, part):
     router operands x = rstd2 (b1 + rstd b2) as its two halves b1 = bf16(pre_w alpha
     st), b2 = bf16(pre_w beta v) (plain bf16 words) and the part's four norm sums
     (``ss``, after the halves: the consumers' flag), so the GEMVs start without
-    the sums' exchange, each consumer folding the scalars in itself; then the
-    exchange, the post norm without weight and the stream updated in place (fp32),
-    its (token, part) flag (``resflag``) once that is out."""
+    the sums' exchange, each consumer folding the scalars in itself. The stream's
+    update is ``stage_a_part_res``, after the CTA's pooler job."""
     S, tid, W = c["S"], c["tid"], c["W"]
     put, poll = c["put"], c["poll"]
-    own, ss_mb, resflag, xbuf, xbuf2 = c["own_attn"], c["ss"], c["resflag"], c["xbuf"], c["xbuf2"]
+    own, ss_mb, xbuf, xbuf2 = c["own_attn"], c["ss"], c["xbuf"], c["xbuf2"]
     a = c["args"]
     A_PARTS = a_parts(S)
     PAIRS = A_PAIRS_MAX // A_PARTS
@@ -478,9 +477,6 @@ def stage_a_part(c, t, part):
     al = ld_f32(a["alpha"], e0, NC)
     be = ld_f32(a["beta"], e0, NC)
     st = ld_f32(a["res"], t * HIDDEN + e0, NC)
-    if const_expr(c["defer_k1"]):
-        npw1 = ld_bf(a["npw"], e0, NC)  # the next layer's pre-attention norm weight
-        al2 = ld_f32(a["alpha2"], e0, NC)  # the FFN boundary's gate on the stream
     rocdl.sched_barrier(0)
     # the all-reduce: this thread's PAIRS pairs from every rank in one poll round (two
     # adjacent pairs a spec), each pair summed in rank order, one bf16 rounding
@@ -520,22 +516,59 @@ def stage_a_part(c, t, part):
     gpu.barrier()  # ... every wave's, before the sums that flag them
     if tid < 4:
         put(ss_mb, (t * A_PARTS_MAX + part) * 4 + tid, (tid == 0).select(ssp, (tid == 1).select(A_, (tid == 2).select(B_, C_))))
+
+
+@flyc.jit
+def stage_a_part_res(c, t, part):
+    """The rest of boundary part ``part`` of token ``t``, after the CTA's pooler job
+    (nothing reads it before K3's boundary): the ranks' partial o rows again (still in
+    the mailbox, this layer's tag), the parts' sums of squares (``ss``), the post norm
+    without weight, the stream updated in place (fp32), the next K1's first half
+    (deferred K1), the (token, part) flag (``resflag``)."""
+    S, tid, W = c["S"], c["tid"], c["W"]
+    put, poll = c["put"], c["poll"]
+    own, ss_mb, resflag = c["own_attn"], c["ss"], c["resflag"]
+    a = c["args"]
+    A_PARTS = a_parts(S)
+    PAIRS = A_PAIRS_MAX // A_PARTS
+    NC = 2 * PAIRS
+    e0 = part * (HIDDEN // A_PARTS) + tid * NC
+    al = ld_f32(a["alpha"], e0, NC)
+    be = ld_f32(a["beta"], e0, NC)
+    st = ld_f32(a["res"], t * HIDDEN + e0, NC)
+    if const_expr(c["defer_k1"]):
+        npw1 = ld_bf(a["npw"], e0, NC)
+        al2 = ld_f32(a["alpha2"], e0, NC)
+    pb = t * (HIDDEN // 2) + e0 // 2
+    PW = 2 if PAIRS % 2 == 0 else 1
+    ws = poll(
+        [(own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW) for q in range(PAIRS // PW) for src in range(W)],
+        batch=max(8, (PAIRS // PW) * W),
+    )
+    v = []
+    for j in range_constexpr(PAIRS):
+        acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
+        for src in range_constexpr(1, W):
+            lo, hi = bf2_f32(ws[(j // PW) * W + src][j % PW])
+            acc0 = acc0 + lo
+            acc1 = acc1 + hi
+        v += [bf16_round(acc0), bf16_round(acc1)]
     if const_expr(A_PARTS > 1):
-        got = poll([(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)] + [(ss_mb, (t * A_PARTS_MAX + q) * 4 + 2, 2) for q in range(A_PARTS)], batch=2 * A_PARTS)  # fmt: skip
+        got = poll([(ss_mb, (t * A_PARTS_MAX + q) * 4, 2) for q in range(A_PARTS)], batch=A_PARTS)
         stamp(c, 9)  # the parts' norm sums arrived
         tot = fx.Float32(0.0)
         for q in range_constexpr(A_PARTS):
             tot = tot + got[q][0].bitcast(fx.Float32)
     else:
-        tot = ssp
+        tot = fx.Float32(0.0)
+        for k in range_constexpr(NC):
+            tot = tot + v[k] * v[k]
+        tot = block_sum4(c, tot, tot, tot, tot)[0]
     rstd = hw_rsq(tot / float(HIDDEN) + POST_EPS)
     n = [bf16_round(v[k] * rstd) for k in range(NC)]
     new = [al[k] * st[k] + be[k] * n[k] for k in range(NC)]
     st_f32(a["res"], t * HIDDEN + e0, new, CM_DEV)
     if const_expr(c["defer_k1"]):
-        # the next layer's K1 input is bf16(rstd2' npw (alpha2 new + beta2 nb')) after the
-        # FFN boundary: its first half c1 = bf16(npw alpha2 new) is this stream (the FFN
-        # boundary's input), out here, the second the K1 forms from the unpooled rows
         c1w = [bf16_pair(npw1[2 * k] * al2[2 * k] * new[2 * k], npw1[2 * k + 1] * al2[2 * k + 1] * new[2 * k + 1]).bitcast(fx.Int32) for k in range(PAIRS)]  # fmt: skip
         st_words(c["c1"], (t * HIDDEN + e0) // 2, c1w, CM_DEV)
     release_stores()
@@ -900,7 +933,9 @@ def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     stamp(c, 4)  # every token's x arrived
     stage_passes(c, rt0, part, pool_w, None, fx.Int32(0), fx.Int32(0) == fx.Int32(1), nsub)
     stamp(c, 5)  # the pooler passes done
-    stamp(c, 6)  # (the pooled rows go out with the passes)
+    if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
+        stage_a_part_res(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
+    stamp(c, 6)  # the boundary's stream update done (boundary CTAs)
     if tok < S:
         stage_route(c, tok, route_flag)  # the xn task runs on stream CTA tok meanwhile
 
