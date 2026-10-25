@@ -77,8 +77,8 @@ def _gstore(addr, value, words=4):
     _store(_gptr(addr), fx.Int32(value) if words == 1 else value, words=words)
 
 
-def _stop_launch():
-    _store(_gptr(0), fx.Int32(1), words=1, volatile=True)
+def _stop_launch(page=0):
+    _store(_gptr(page << 12), fx.Int32(1), words=1, volatile=True)
 
 
 _DONE = None

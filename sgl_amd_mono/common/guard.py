@@ -86,12 +86,18 @@ def fault_injection(rank: int) -> Optional[tuple[int, int]]:
     return (int(site or 0), int(after or 0)) if int(r) == rank else None
 
 
-def stop_launch():
+# a diagnostic: the timed-out wait stops at page (site + 1) instead of 0x0, so the
+# runtime's fault message names it; the trace prints each site's caller
+SITE_FAULT = os.environ.get("SGLANG_AMD_MONO_GUARD_SITE_FAULT", "0") == "1"
+_GUARDS = [0]
+
+
+def stop_launch(page=0):
     """Stop the launch: a volatile store to the null page faults (address 0x0, so a
     deliberate stop is told apart from a real fault), and the runtime tears the
     queue down. Unlike ``llvm.trap`` it asks nothing of the kernel's ABI, so a
     launch that never fails pays nothing for it."""
-    fx.generic_store(global_ptr(0), fx.Int32(1), volatile=True)
+    fx.generic_store(global_ptr(page << 12), fx.Int32(1), volatile=True)
 
 
 class Guard:
@@ -126,6 +132,9 @@ class Guard:
         self.fault_after = fault_after
         self.stop = stop
         self._sites = 0
+        if SITE_FAULT:
+            _GUARDS[0] += 1
+            self._gid = _GUARDS[0]
 
     def armed(self):
         """The fault injection's stall is on: ``fault_after`` launches have run."""
@@ -153,6 +162,11 @@ class Guard:
 
     def next_site(self) -> int:
         self._sites += 1
+        if SITE_FAULT:
+            import traceback
+
+            fr = [f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in traceback.extract_stack()[:-1] if "sgl_amd_mono" in f.filename]
+            print(f"[guard-site] g{self._gid} site {self._sites} (page {self._sites + 1:#x}): {' < '.join(reversed(fr[-4:]))}", flush=True)
         return self._sites
 
     def _word(self, i):
@@ -206,7 +220,7 @@ class Guard:
                 )
         rocdl.s_waitcnt(vmcnt=0)
         if const_expr(self.stop):
-            stop_launch()
+            stop_launch(site + 1 if SITE_FAULT else 0)
 
     def note_peer(self):
         """A wait saw a failure elsewhere: stop the launch (the failed rank flagged
