@@ -168,3 +168,23 @@ def test_an_mla_layer_without_the_output_gate_is_refused(monkeypatch):
     # so it cannot carry this: for MLA the split rides on the gate's wrapper.
     reasons = _reasons(monkeypatch, _fake_layer(gate=False))
     assert any("output gate" in r for r in reasons), reasons
+
+
+def test_the_guard_flags_sit_past_every_width(monkeypatch):
+    """Every width reads the guard flags at the same offset.
+
+    The runner allocates one peer buffer for all the widths and puts the flags
+    after the data. A launch that derived the offset from its own width wrote
+    its flags inside the data region of a wider launch. Two widths in one run
+    then disagreed on where the flags are, and the narrower one read live data
+    as an error word.
+    """
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
+    from sgl_amd_mono.kimi_k3.gfx950.stages import moe
+
+    off = layer.flags_offset()
+    for width in range(1, MAX_ROWS + 1):
+        assert layer.peer_bytes(width) <= off, width
+        assert moe.peer_bytes(width) <= off, width
+    # the widest launch ends exactly there: a larger offset wastes a peer page
+    assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))

@@ -72,7 +72,6 @@ def main():
     peers = PeerBuffer(k2b.peer_bytes(ROWS), cpu, rank, TP, dev)
     peers.bytes.zero_()
     epoch = torch.zeros(1, dtype=torch.int32, device=dev)
-    gx = torch.Generator(device=dev).manual_seed(11)
 
     fails, outs = [], {}
     # aiter's fused_moe reads the plain layout, so it is the reference for that

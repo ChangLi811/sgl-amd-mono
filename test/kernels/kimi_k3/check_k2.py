@@ -150,7 +150,11 @@ def main():
     # The launch runs under the guard, so the peer buffer carries the flag word
     # a rank and the epoch buffer carries the guard block. Without a deadline
     # every wait reads garbage, decides it is late and faults the GPU at 0x0.
-    peers = PeerBuffer(k2.peer_bytes(ROWS) + guard.FLAG_BYTES, cpu, rank, TP, dev)
+    #
+    # Size this from flags_offset(), the same way the runner does. A buffer
+    # sized for this check's own width puts the flags where the launch does not
+    # read them, and the check then passes on a layout no server uses.
+    peers = PeerBuffer(k2.flags_offset() + guard.FLAG_BYTES, cpu, rank, TP, dev)
     peers.bytes.zero_()
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
     ticks = guard.deadline_ticks(DEADLINE_S)
