@@ -41,6 +41,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
+from sgl_amd_mono.kimi_k3 import MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
@@ -137,6 +138,21 @@ def peer_layout(s):
 def peer_bytes(s):
     lay = peer_layout(s)
     return 2 * max(o + n for o, n in lay.values())
+
+
+def flags_offset() -> int:
+    """Where every launch reads the guard flags in a rank's peer buffer.
+
+    The runner allocates one peer buffer for all the widths. The flags follow
+    the data, so they start after the widest data region of either launch.
+
+    Both the runner and the kernel must use this function. A launch that
+    computes the offset from its own width puts the flags inside the data
+    region at every width below the widest one. The widths then disagree on
+    where the flags are. A launch reads the bytes another width wrote, takes
+    live data for an error word, and stops every rank.
+    """
+    return max(peer_bytes(MAX_ROWS), k2b.peer_bytes(MAX_ROWS))
 
 
 def scratch_layout(key: K2Build) -> dict:
@@ -269,7 +285,9 @@ def build(key: K2Build):
                 peers=peers,
                 rank=rank,
                 npes=TP_,
-                flags_offset=peer_bytes(key.tokens),
+                # Not key.tokens: the offset is the same at every width. See
+                # flags_offset().
+                flags_offset=flags_offset(),
                 fault_site=key.fault_site or None,
                 fault_after=key.fault_after,
             )

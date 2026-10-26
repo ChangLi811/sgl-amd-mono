@@ -45,8 +45,9 @@ class K3MonoRunner:
         # The MoE launch's task queue. The layer launch takes none -- its ABI
         # has no queue -- and this is here for the kernel checks' MoE launch.
         self.queue = torch.zeros(moe.QUEUE_BYTES // 4, dtype=torch.int32, device=device)
-        nbytes = max(moe.peer_bytes(MAX_ROWS), layer.peer_bytes(MAX_ROWS))
-        # past the two parity halves, the guard's flag word a rank
+        # past the two parity halves, the guard's flag word a rank. The kernel
+        # reads the flags at the same offset, from the same function.
+        nbytes = layer.flags_offset()
         self.peer = PeerBuffer(nbytes + guard.FLAG_BYTES, group, rank, tp, device)
         self.peer.bytes.zero_()
         # One prefix buffer, not one a layer: the layers run in sequence.
