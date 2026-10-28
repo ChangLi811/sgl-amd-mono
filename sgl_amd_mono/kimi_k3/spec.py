@@ -45,14 +45,25 @@ from typing import Any
 
 import msgspec
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.kimi_k3 import (
@@ -68,7 +79,7 @@ TP_SIZE = 8
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``:
 # a parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "MONOKERNEL_API_VERSION",
         "DeviceLimits",
         "Feature",
