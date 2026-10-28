@@ -4,8 +4,9 @@ path, and requests join and leave a running batch that steps past 8 rows and bac
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); with MTP, verify steps of 1 and 2 requests
 (4 and 8 rows) on the kernels (GSM8K and the draft's accept length); each covered
-layer against the normal one, in decode and verify steps; and a fault on one rank
-that stops the server before any token of the failed step is sent."""
+layer against the normal one, in decode and verify steps, and in verify steps on the
+E4M3 MLA cache; and a fault on one rank that stops the server before any token of
+the failed step is sent."""
 
 import os
 import re
@@ -28,6 +29,7 @@ from sglang.test.test_utils import (
 )
 
 from sgl_amd_mono import BACKEND
+from sgl_amd_mono.glm53.gfx950 import layout
 
 LAUNCH_TIMEOUT = 3600
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
@@ -142,10 +144,34 @@ class TestMonokernelCheck(CustomTestCase):
         # a row's earlier drafts from the cache misses some of them (layer.topk_own)
         self._check_layers(MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
 
-    def _check_layers(self, extra_args, batches, new_tokens, rows):
+    def test_each_covered_verify_layer_within_its_numerics_with_fp8_kv(self):
+        # The E4M3 MLA cache (SGLang's HIP DSA rows: 576 values, no scales): the
+        # launches write the rows SGLang writes and attend the values it reads back
+        self._check_layers(
+            [*MTP, "--kv-cache-dtype", "fp8_e4m3"],
+            ((1, 200), (2, 200)),
+            new_tokens=16,
+            rows=(4, 8),
+        )
+
+    def test_each_covered_layer_past_the_parallel_top_k(self):
+        # rows of about 108k keys (27 chunks: 14 slices, 13 of two chunks) at widths 2
+        # and 4, and of about 36k keys (9 one-chunk slices) at width 8. Past 98304
+        # keys each wave's score walk refills its buffers and looks blocks ahead.
+        past = 98304
+        self.assertGreaterEqual(past, layout.INDEX_SEL_SLICES * layout.INDEX_SEL_CHUNK)
+        self._check_layers(
+            [],
+            ((1, 9000), (3, 9000), (8, 3000)),
+            new_tokens=4,
+            rows=(1, 3, 8),
+            past=past,
+        )
+
+    def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048):
         """SGLANG_AMD_MONO_CHECK (eager) on one server, each (requests, repeats)
         batch of a record prompt in turn: both kinds of layer checked at every
-        count in ``rows``, an indexer layer past 2048 keys, and no violation."""
+        count in ``rows``, an indexer layer past ``past`` keys, and no violation."""
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -196,8 +222,9 @@ class TestMonokernelCheck(CustomTestCase):
         seen = {(kind, int(n)) for kind, n, _, _ in checks}
         want = {(kind, n) for kind in ("indexer", "shared") for n in rows}
         self.assertTrue(want <= seen, seen)
+        self.assertIn("layer.topk_exact.max_abs", values)
         self.assertTrue(
-            any(k == "indexer" and int(hi) >= 2048 for k, _, hi, _ in checks)
+            any(k == "indexer" and int(hi) >= past for k, _, hi, _ in checks)
         )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
@@ -212,7 +239,14 @@ class TestMonokernelFault(CustomTestCase):
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
         ):
             process = _launch(
-                extra_env={"SGLANG_AMD_MONO_FAULT_INJECT": "1:1:20"},
+                extra_env={
+                    "SGLANG_AMD_MONO_FAULT_INJECT": "1:1:20",
+                    # the crash dumps (each rank's VRAM, py-spy of each scheduler with
+                    # no timeout, a 60 s wait) can outlast the wait for the stop below
+                    "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
+                    "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "0",
+                    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
+                },
                 extra_args=["--watchdog-timeout", "20"],
                 log=(out, err),
             )

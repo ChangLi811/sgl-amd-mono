@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import os
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -31,8 +32,8 @@ KV_ROW = KV_LORA + PE_DIM
 class Glm53Build(msgspec.Struct, frozen=True):
     """One compiled launch: the row width, TP size, the kind's layers per step,
     whether it runs the indexer (scoring up to ``index_max_seq`` keys a row),
-    whether SGLang's FP8 weights are in AITER's (16, 16) layout, and the guard's
-    test fault injection."""
+    whether SGLang's FP8 weights are in AITER's (16, 16) layout, whether the MLA
+    cache holds E4M3 (``kv_fp8``), and the guard's test fault injection."""
 
     rows: int
     tp: int
@@ -40,6 +41,7 @@ class Glm53Build(msgspec.Struct, frozen=True):
     with_indexer: bool
     index_max_seq: int
     fp8_shuffled: bool
+    kv_fp8: bool = False
     fault_site: int = 0
     fault_after: int = 0
     stop: bool = True
@@ -86,9 +88,9 @@ class Glm53Weights(msgspec.Struct, frozen=True):
 
 
 class Glm53Caches(msgspec.Struct, frozen=True):
-    """One layer's SGLang caches: the bf16 MLA cache [slots, 576] (latent, then
-    rope) and, on a layer that runs the indexer, the uint8 index cache [pages, 64,
-    132]."""
+    """One layer's SGLang caches: the MLA cache [slots, 576] (latent, then rope),
+    bf16 or, as SGLang's HIP DSA backends keep it, E4M3 without scales, and, on a
+    layer that runs the indexer, the uint8 index cache [pages, 64, 132]."""
 
     kv: torch.Tensor
     idx: Optional[torch.Tensor] = None
@@ -110,21 +112,12 @@ class Glm53Step(msgspec.Struct, frozen=True):
 
 
 def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
+    """Build the launcher without dispatching its kernels."""
+    # AITER probes the GPU when imported; test/unit imports this module on CPU
+    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
 
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def ensure_writable_flydsl_cache() -> None:
@@ -143,6 +136,8 @@ class Glm53Runtime:
     is the step epoch (``advance_step``)."""
 
     def __init__(self, key: Glm53Build, rank: int, group, device: torch.device):
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
         from sgl_amd_mono.common import guard
         from sgl_amd_mono.common.peer import PeerBuffer
 
@@ -150,6 +145,7 @@ class Glm53Runtime:
 
         ensure_writable_flydsl_cache()
         self.key, self.width, self.rank = key, key.rows, rank
+        self.kv_dtype = torch.float8_e4m3fn if key.kv_fp8 else torch.bfloat16
         self.sc, self.sy = layout(
             key.rows,
             key.heads,
@@ -170,7 +166,7 @@ class Glm53Runtime:
             index_max_seq=key.index_max_seq,
             attention_weight="fp8_block128",
             kv_cache_layout="atom",
-            kv_cache_dtype="bf16",
+            kv_cache_dtype="fp8" if key.kv_fp8 else "bf16",
             inter=key.inter,
             output_heads=key.heads,
             uv_scale_rows=128,
@@ -184,6 +180,7 @@ class Glm53Runtime:
             fault_after=key.fault_after,
             stop=key.stop,
         )
+        self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
         self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
@@ -257,8 +254,8 @@ class Glm53LayerOp:
         if pt.dtype != torch.int32 or pt.dim() != 2 or pt.stride(1) != 1:
             raise ValueError("needs an int32 page table with contiguous rows")
         kv, idx = caches.kv, caches.idx
-        if kv.dtype != torch.bfloat16 or kv.dim() != 2 or kv.stride() != (KV_ROW, 1):
-            raise ValueError(f"needs the MLA cache as bf16 [slots, {KV_ROW}]")
+        if kv.dtype != rt.kv_dtype or kv.dim() != 2 or kv.stride() != (KV_ROW, 1):
+            raise ValueError(f"needs the MLA cache as {rt.kv_dtype} [slots, {KV_ROW}]")
         if rt.key.with_indexer and (
             idx is None
             or idx.dtype != torch.uint8
@@ -271,7 +268,7 @@ class Glm53LayerOp:
             )
         x_out = rt.outs[self.layer % 2]
         p = lambda t: t.data_ptr()  # noqa: E731
-        rt.launch(
+        rt.dispatch(
             p(h),
             p(x_out),
             p(step.positions),
@@ -314,6 +311,6 @@ class Glm53LayerOp:
             rt.rank,
             self.layer,
             pt.stride(0),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return x_out

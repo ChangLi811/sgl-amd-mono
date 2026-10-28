@@ -75,6 +75,7 @@ SGLANG_READS = {
         "page_size",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
+        "kv_cache_dtype",
         "speculative_algorithm",
         "speculative_eagle_topk",
         "speculative_num_steps",
@@ -138,6 +139,7 @@ SGLANG_READS = {
         "copies",
     ),
     "srt/runtime_context.py": (
+        "get_model",
         "get_parallel",
         "process_model_config",
         '"tp_rank"',
@@ -157,6 +159,8 @@ NUMERICS = Numerics(
         "layer.index.cosine": 0.999,
         # an indexer layer selects every key of a row's own draft chain SGLang selects
         "layer.topk_own.max_abs": 0.0,
+        # and exactly the top-k of its own scores (score descending, then position)
+        "layer.topk_exact.max_abs": 0.0,
     },
 )
 
@@ -386,7 +390,7 @@ class _Built:
                 self._take_topk(topk_indices, step, S, W)
         else:
             h = hidden
-        self._bind(L)
+        self._bind(L, kv_dtype=L.ops[W].rt.kv_dtype)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
             from sgl_amd_mono.glm53 import check
@@ -399,7 +403,12 @@ class _Built:
                 plan.state["ref_topk"] = ref["topk"]
         out = L.ops[W].launch(h, L.caches, self.cos, self.sin, step)
         if checking:
-            check.compare(L, ref, out[:S], positions, forward_batch, S, step=step)
+            scores = None
+            if L.w.index is not None:
+                scores = check.launch_scores(L.ops[W].rt, S)
+            check.compare(
+                L, ref, out[:S], positions, forward_batch, S, step=step, scores=scores
+            )
         if L.i != self.last:
             return out
         for (w, _), rt in self.runtimes.items():
@@ -420,7 +429,7 @@ class _Built:
         )
 
     @staticmethod
-    def _bind(L: _Layer) -> None:
+    def _bind(L: _Layer, kv_dtype: torch.dtype) -> None:
         from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
         from sgl_amd_mono.glm53.gfx950.runner import (
@@ -439,14 +448,11 @@ class _Built:
             and (idx is None or L.caches.idx.data_ptr() == idx.data_ptr())
         ):
             return
-        if (
-            kv.dtype != torch.bfloat16
-            or kv.shape[-1] != KV_ROW
-            or not kv.is_contiguous()
-        ):
+        # an E4M3 row is SGLang's HIP DSA layout: 576 values, no block scales
+        if kv.dtype != kv_dtype or kv.shape[-1] != KV_ROW or not kv.is_contiguous():
             raise RuntimeError(
                 f"GLM-5.3 monokernel: layer {L.i}: MLA cache {kv.dtype} "
-                f"{tuple(kv.shape)}; needs contiguous bf16 [slots, 1, {KV_ROW}]"
+                f"{tuple(kv.shape)}; needs contiguous {kv_dtype} [slots, 1, {KV_ROW}]"
             )
         if idx is not None and (idx.dtype != torch.uint8 or not idx.is_contiguous()):
             raise RuntimeError(
@@ -491,7 +497,7 @@ class _Built:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.srt.runtime_context import get_parallel, process_model_config
+    from sglang.srt.runtime_context import get_model, get_parallel, process_model_config
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.glm53.gfx950.layout import INDEX_KEYS_PER_TASK
@@ -525,6 +531,7 @@ def _build(model, hf_config, ctx) -> _Built:
         "shared": [i for i in covered if layers[i].w.index is None],
     }
     fault_site, fault_after = guard.fault_injection(rank) or (0, 0)
+    kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
     context_len = process_model_config().context_len
     # the copied table is SGLang's at build; a longer served context reads past it
     if cos.shape[0] < context_len:
@@ -554,6 +561,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 # an unpaged launch keeps index_max_seq words in LDS
                 index_max_seq=max_seq if kind == "index" else 0,
                 fp8_shuffled=fp8_shuffled,
+                kv_fp8=kv_fp8,
                 fault_site=fault_site,
                 fault_after=fault_after,
             )
@@ -583,7 +591,7 @@ SPEC = MonoSpec(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),
         server_args={
-            "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
+            "kv_cache_dtype": frozenset({"auto", "bfloat16", "fp8_e4m3"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
             # MTP: the NextN draft's verify steps (NEXTN resolves to EAGLE)
             "speculative_algorithm": frozenset({None, "EAGLE"}),

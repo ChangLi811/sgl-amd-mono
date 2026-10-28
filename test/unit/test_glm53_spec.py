@@ -1,7 +1,8 @@
 """The GLM-5.3 gfx950 monokernel spec on CPU (RFC #43949): the layers its forward
 covers on the GLM-5.3 layer structure, its row routing and TP4 row cap, the keys
-each row of a decode or MTP verify step attends, its registry entry, its config and
-model refusal reasons, and the layer check's top-k metric and cache poisoning.
+each row of a decode or MTP verify step attends, the MLA cache layout an FP8 launch
+binds, its registry entry, its config and model refusal reasons, and the layer
+check's top-k metric and cache poisoning.
 SGLang checks its declared requirements, the same way for every spec."""
 
 from types import SimpleNamespace
@@ -155,6 +156,37 @@ def test_verify_lookahead_past_the_context_stays_in_the_tables():
     )
     assert positions == [10, 11, 11, 11]
     assert indptr == [0, 11, 23, 35, 47]
+
+
+@pytest.mark.parametrize(
+    "dtype, row, bound",
+    [
+        # SGLang's HIP DSA E4M3 cache: 576 values a row, no block scales
+        (torch.float8_e4m3fn, 576, True),
+        # the scaled E4M3 row of the other DSA backends: 512 values, 4 f32 scales,
+        # then the bf16 rope
+        (torch.float8_e4m3fn, 656, False),
+        (torch.bfloat16, 576, False),
+    ],
+    ids=["raw E4M3", "scaled E4M3", "bf16"],
+)
+def test_an_fp8_launch_binds_only_the_raw_e4m3_mla_cache(dtype, row, bound):
+    """The kernels address 576-byte E4M3 rows: another row or dtype would be read
+    as wrong keys without an error."""
+    kv = torch.zeros(130, 1, row, dtype=dtype)
+    pool = SimpleNamespace(get_key_buffer=lambda i: kv)
+    layer = glm53._Layer(5, None, SimpleNamespace(index=None))
+    with mock.patch(
+        "sglang.srt.model_executor.forward_context.get_token_to_kv_pool",
+        return_value=pool,
+    ):
+        if bound:
+            glm53._Built._bind(layer, kv_dtype=torch.float8_e4m3fn)
+            assert layer.caches.kv.dtype == torch.float8_e4m3fn
+            assert layer.caches.kv.shape == (130, 576)
+        else:
+            with pytest.raises(RuntimeError, match="MLA cache"):
+                glm53._Built._bind(layer, kv_dtype=torch.float8_e4m3fn)
 
 
 @pytest.mark.parametrize(
