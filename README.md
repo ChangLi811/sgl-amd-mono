@@ -59,9 +59,7 @@ SGLANG_USE_AITER=1 AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
   --monokernel-backend amd
 ```
 
-On gfx950 the decode graph capture fails in AITER's MoE without
-`AITER_BF16_FP8_MOE_BOUND=0`. The flags are those of the serving tests
-(`test/e2e/deepseek_v41_server.py`).
+The flags are those of the serving tests (`test/e2e/deepseek_v41_server.py`).
 
 GLM-5.3, with MTP (its NextN layer drafts one chain; a verify step of 4 rows a
 request runs the kernels at batch sizes 1 and 2 at TP8):
@@ -130,7 +128,8 @@ MXFP8 activations, as the kernels do.
 For MoRI PD, enable monokernels only on the decode server
 (`--disaggregation-mode decode --disaggregation-transfer-backend mori`): TP8 for
 DeepSeek-V4-Pro, TP2 or TP4 for DeepSeek-V4.1-Flash. Leave the flag off on prefill;
-both peers must use the same KV layout.
+both peers must use the same KV layout, `SGLANG_HIP_DSV41_INDEX_K_PAGE8` included
+(SGLang's PD handshake does not compare it).
 
 If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
 
